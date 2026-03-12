@@ -798,45 +798,52 @@ static void write_index(const std::string& output_dir) {
 // --- Main ---
 
 int main(int argc, char* argv[]) {
-    if (argc < 2 || argc > 3) {
-        std::cerr << "Usage: build-index <input.osm.pbf> [output-dir]" << std::endl;
+    if (argc < 3) {
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...]" << std::endl;
         return 1;
     }
 
-    std::string input_file = argv[1];
-    std::string output_dir = argc >= 3 ? argv[2] : ".";
-
-    // --- Pass 1: collect relation members for multipolygon assembly ---
-    std::cerr << "Pass 1: scanning relations..." << std::endl;
-
-    osmium::area::Assembler::config_type assembler_config;
-    osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
-
-    {
-        osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
-        osmium::apply(reader1, mp_manager);
-        reader1.close();
-        mp_manager.prepare_for_lookup();
-        std::cerr << "  Relations prepared." << std::endl;
+    std::string output_dir = argv[1];
+    std::vector<std::string> input_files;
+    for (int i = 2; i < argc; i++) {
+        input_files.push_back(argv[i]);
     }
 
-    // --- Pass 2: process all data ---
-    std::cerr << "Pass 2: processing nodes, ways, and areas..." << std::endl;
-
-    using index_type = osmium::index::map::SparseMemArray<
-        osmium::unsigned_object_id_type, osmium::Location>;
-    using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
-
-    index_type index;
-    location_handler_type location_handler{index};
-
-    osmium::io::Reader reader2{input_file};
-
     BuildHandler handler;
-    osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
-        osmium::apply(buffer, handler);
-    }));
-    reader2.close();
+
+    for (const auto& input_file : input_files) {
+        std::cerr << "Processing " << input_file << "..." << std::endl;
+
+        // --- Pass 1: collect relation members for multipolygon assembly ---
+        std::cerr << "  Pass 1: scanning relations..." << std::endl;
+
+        osmium::area::Assembler::config_type assembler_config;
+        osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
+
+        {
+            osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
+            osmium::apply(reader1, mp_manager);
+            reader1.close();
+            mp_manager.prepare_for_lookup();
+        }
+
+        // --- Pass 2: process all data ---
+        std::cerr << "  Pass 2: processing nodes, ways, and areas..." << std::endl;
+
+        using index_type = osmium::index::map::SparseMemArray<
+            osmium::unsigned_object_id_type, osmium::Location>;
+        using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
+
+        index_type index;
+        location_handler_type location_handler{index};
+
+        osmium::io::Reader reader2{input_file};
+
+        osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
+            osmium::apply(buffer, handler);
+        }));
+        reader2.close();
+    }
 
     std::cerr << "Done reading:" << std::endl;
     std::cerr << "  " << handler.way_count() << " street ways" << std::endl;
