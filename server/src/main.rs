@@ -17,6 +17,7 @@ use std::sync::{Arc, RwLock};
 
 const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
 const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
+const DEFAULT_SEARCH_DISTANCE: f64 = 75.0;
 
 fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
@@ -95,6 +96,7 @@ struct Index {
     strings: Mmap,
     street_cell_level: u64,
     admin_cell_level: u64,
+    max_distance_sq: f64,
 }
 
 const NO_DATA: u32 = 0xFFFFFFFF;
@@ -111,7 +113,9 @@ fn mmap_file(path: &str) -> Result<Mmap, String> {
 }
 
 impl Index {
-    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64) -> Result<Self, String> {
+    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
+        let meters_to_rad = search_distance / 111_320.0;
+        let max_distance_sq = meters_to_rad * meters_to_rad;
         Ok(Index {
             geo_cells: mmap_file(&format!("{}/geo_cells.bin", dir))?,
             street_entries: mmap_file(&format!("{}/street_entries.bin", dir))?,
@@ -129,6 +133,7 @@ impl Index {
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
+            max_distance_sq,
         })
     }
 
@@ -455,8 +460,7 @@ impl Index {
     // --- Combined query ---
 
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
-        let max_addr_dist = 0.0005 * 0.0005; // ~50m, squared
-        let max_street_dist = 0.0007 * 0.0007; // ~75m, squared
+        let max_dist = self.max_distance_sq;
 
         let admin = self.find_admin(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
@@ -466,14 +470,14 @@ impl Index {
         let mut road: Option<&str> = None;
 
         if let Some((dist, point)) = addr {
-            if dist < max_addr_dist {
+            if dist < max_dist {
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
                 road = Some(self.get_string(point.street_id));
             }
         }
         if road.is_none() {
             if let Some((dist, street_name, number)) = interp {
-                if dist < max_addr_dist {
+                if dist < max_dist {
                     house_number = Some(Cow::Owned(number.to_string()));
                     road = Some(street_name);
                 }
@@ -481,7 +485,7 @@ impl Index {
         }
         if road.is_none() {
             if let Some((dist, way)) = street {
-                if dist < max_street_dist {
+                if dist < max_dist {
                     road = Some(self.get_string(way.name_id));
                 }
             }
@@ -734,20 +738,18 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map(|s| s.as_str()).unwrap_or(".");
 
-    let parse_arg = |flag: &str, default: u64| -> u64 {
-        args.iter().position(|a| a == flag)
-            .and_then(|p| args.get(p + 1))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
+    let arg_value = |flag: &str| -> Option<&String> {
+        args.iter().position(|a| a == flag).and_then(|p| args.get(p + 1))
     };
-    let street_cell_level = parse_arg("--street-level", DEFAULT_STREET_CELL_LEVEL);
-    let admin_cell_level = parse_arg("--admin-level", DEFAULT_ADMIN_CELL_LEVEL);
+    let street_cell_level = arg_value("--street-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_STREET_CELL_LEVEL);
+    let admin_cell_level = arg_value("--admin-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_ADMIN_CELL_LEVEL);
+    let search_distance = arg_value("--search-distance").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SEARCH_DISTANCE);
 
     let db_path = format!("{}/geocoder.json", data_dir);
     let db = auth::Db::load(&db_path);
 
     eprintln!("Loading index from {}...", data_dir);
-    let index = match Index::load(data_dir, street_cell_level, admin_cell_level) {
+    let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
         Ok(idx) => Arc::new(idx),
         Err(e) => {
             eprintln!("Error: {}", e);

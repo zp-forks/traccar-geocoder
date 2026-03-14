@@ -46,6 +46,7 @@ serve() {
     fi
     [ -n "$STREET_LEVEL" ] && args="$args --street-level $STREET_LEVEL"
     [ -n "$ADMIN_LEVEL" ] && args="$args --admin-level $ADMIN_LEVEL"
+    [ -n "$SEARCH_DISTANCE" ] && args="$args --search-distance $SEARCH_DISTANCE"
     echo "Starting server..."
     exec query-server $args
 }
