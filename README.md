@@ -2,6 +2,8 @@
 
 A fast, self-hosted reverse geocoding service built from OpenStreetMap data. Given latitude and longitude coordinates, it returns the nearest street address including house number, street name, city, state, county, postcode, and country.
 
+Part of the [Traccar](https://www.traccar.org) open source GPS tracking platform. Also available as a [hosted service](https://www.traccar.org/product/geocoder/).
+
 ## Features
 
 - Street-level reverse geocoding from OSM data
@@ -163,4 +165,16 @@ cargo build --release --manifest-path server/Cargo.toml
 
 ## License
 
-Apache License 2.0
+    Apache License, Version 2.0
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
