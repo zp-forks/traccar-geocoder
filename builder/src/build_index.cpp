@@ -1544,7 +1544,7 @@ int main(int argc, char* argv[]) {
             osmium::unsigned_object_id_type, osmium::Location>;
 
         // Sharded node location index for parallel writes
-        static const int NUM_SHARDS = 64;
+        static const int NUM_SHARDS = 16;
         struct ShardedIndex {
             index_type shards[NUM_SHARDS];
             std::mutex mutexes[NUM_SHARDS];
@@ -1723,32 +1723,31 @@ int main(int argc, char* argv[]) {
                 };
 
                 // Read buffers and dispatch to thread pool
-                std::vector<osmium::memory::Buffer> buffer_queue;
-                osmium::memory::Buffer buf = reader_ways.read();
-                while (buf) {
-                    buffer_queue.push_back(std::move(buf));
-                    buf = reader_ways.read();
-                }
-                reader_ways.close();
+                // Streaming producer-consumer for way blocks
+                std::mutex way_queue_mutex;
+                std::condition_variable way_queue_cv;
+                std::deque<osmium::memory::Buffer> way_block_queue;
+                bool way_reader_done = false;
+                const size_t WAY_MAX_QUEUE = 64;
 
-                std::cerr << "  Read " << buffer_queue.size() << " PBF blocks, processing in parallel..." << std::endl;
-
-                // Process way buffers in parallel
-                // Note: area/multipolygon processing must remain sequential due to mp_manager state
                 std::vector<ThreadLocalData> tld(num_threads);
-                std::atomic<size_t> block_idx{0};
                 std::atomic<uint64_t> blocks_done{0};
-                size_t total_blocks = buffer_queue.size();
 
                 std::vector<std::thread> workers;
                 for (unsigned int t = 0; t < num_threads; t++) {
                     workers.emplace_back([&, t]() {
                         auto& local = tld[t];
                         while (true) {
-                            size_t i = block_idx.fetch_add(1);
-                            if (i >= total_blocks) break;
+                            osmium::memory::Buffer block;
+                            {
+                                std::unique_lock<std::mutex> lock(way_queue_mutex);
+                                way_queue_cv.wait(lock, [&]{ return !way_block_queue.empty() || way_reader_done; });
+                                if (way_block_queue.empty() && way_reader_done) break;
+                                block = std::move(way_block_queue.front());
+                                way_block_queue.pop_front();
+                            }
+                            way_queue_cv.notify_one();
 
-                            auto& block = buffer_queue[i];
                             for (const auto& item : block) {
                                 if (item.type() == osmium::item_type::way) {
                                     const auto& way = static_cast<const osmium::Way&>(item);
@@ -1876,11 +1875,30 @@ int main(int argc, char* argv[]) {
 
                             uint64_t done = blocks_done.fetch_add(1) + 1;
                             if (done % 1000 == 0) {
-                                std::cerr << "  Processed " << done << "/" << total_blocks << " blocks..." << std::endl;
+                                std::cerr << "  Processed " << done << " way blocks..." << std::endl;
                             }
                         }
                     });
                 }
+
+                // Way reader (producer)
+                {
+                    while (auto buf = reader_ways.read()) {
+                        {
+                            std::unique_lock<std::mutex> lock(way_queue_mutex);
+                            way_queue_cv.wait(lock, [&]{ return way_block_queue.size() < WAY_MAX_QUEUE; });
+                            way_block_queue.push_back(std::move(buf));
+                        }
+                        way_queue_cv.notify_one();
+                    }
+                    reader_ways.close();
+                    {
+                        std::lock_guard<std::mutex> lock(way_queue_mutex);
+                        way_reader_done = true;
+                    }
+                    way_queue_cv.notify_all();
+                }
+
                 for (auto& w : workers) w.join();
                 std::cerr << "  Parallel way processing complete." << std::endl;
 
