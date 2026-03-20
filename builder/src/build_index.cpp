@@ -22,8 +22,9 @@
 #include <osmium/handler/node_locations_for_ways.hpp>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
-#include <osmium/index/map/flex_mem.hpp>
+// FlexMem no longer used — replaced by DenseIndex mmap
 #include <osmium/area/assembler.hpp>
 #include <osmium/area/multipolygon_manager.hpp>
 
@@ -1540,32 +1541,44 @@ int main(int argc, char* argv[]) {
         AdminCoverPool admin_pool(num_threads);
         BuildHandler handler(data, &admin_pool);
 
-        using index_type = osmium::index::map::FlexMem<
-            osmium::unsigned_object_id_type, osmium::Location>;
+        // Dense array node location index — lockless parallel writes
+        // Planet OSM node IDs max ~12.5 billion. 8 bytes per Location = 100GB virtual.
+        // MAP_NORESERVE means OS only allocates pages on write (~80GB for 10B nodes).
+        static const size_t MAX_NODE_ID = 13000000000ULL;
+        struct DenseIndex {
+            osmium::Location* data;
+            size_t capacity;
 
-        // Sharded node location index for parallel writes
-        static const int NUM_SHARDS = 16;
-        struct ShardedIndex {
-            index_type shards[NUM_SHARDS];
-            std::mutex mutexes[NUM_SHARDS];
+            DenseIndex() : capacity(MAX_NODE_ID) {
+                void* ptr = mmap(nullptr, capacity * sizeof(osmium::Location),
+                    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                    -1, 0);
+                if (ptr == MAP_FAILED) {
+                    std::cerr << "Error: failed to mmap dense node index ("
+                              << (capacity * sizeof(osmium::Location) / (1024*1024*1024)) << "GB virtual)" << std::endl;
+                    std::exit(1);
+                }
+                data = static_cast<osmium::Location*>(ptr);
+                std::cerr << "Allocated dense node index: " << (capacity * sizeof(osmium::Location) / (1024*1024*1024))
+                          << "GB virtual address space" << std::endl;
+            }
 
+            ~DenseIndex() {
+                munmap(data, capacity * sizeof(osmium::Location));
+            }
+
+            // Lockless — each node ID maps to a unique array slot
             void set(osmium::unsigned_object_id_type id, osmium::Location loc) {
-                int shard = id % NUM_SHARDS;
-                std::lock_guard<std::mutex> lock(mutexes[shard]);
-                shards[shard].set(id, loc);
+                data[id] = loc;
             }
 
             osmium::Location get(osmium::unsigned_object_id_type id) const {
-                return shards[id % NUM_SHARDS].get(id);
+                return data[id];
             }
 
-            // Batch set — caller holds no lock, we lock per-shard
             void set_batch(const std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>>& batch) {
-                // Sort by shard to minimize lock switches
                 for (const auto& [id, loc] : batch) {
-                    int shard = id % NUM_SHARDS;
-                    std::lock_guard<std::mutex> lock(mutexes[shard]);
-                    shards[shard].set(id, loc);
+                    data[id] = loc;
                 }
             }
         } index;
@@ -1907,9 +1920,9 @@ int main(int argc, char* argv[]) {
                 std::cerr << "  Processing multipolygon areas..." << std::endl;
                 {
                     // Create a wrapper handler that resolves locations from sharded index
-                    struct ShardedLocationHandler : public osmium::handler::Handler {
-                        ShardedIndex& idx;
-                        explicit ShardedLocationHandler(ShardedIndex& i) : idx(i) {}
+                    struct DenseLocationHandler : public osmium::handler::Handler {
+                        DenseIndex& idx;
+                        explicit DenseLocationHandler(DenseIndex& i) : idx(i) {}
                         void node(osmium::Node& node) {
                             node.set_location(idx.get(node.positive_id()));
                         }
@@ -1918,10 +1931,10 @@ int main(int argc, char* argv[]) {
                                 nr.set_location(idx.get(nr.positive_ref()));
                             }
                         }
-                    } sharded_loc_handler{index};
+                    } dense_loc_handler{index};
 
                     osmium::io::Reader reader_rels{input_file};
-                    osmium::apply(reader_rels, sharded_loc_handler,
+                    osmium::apply(reader_rels, dense_loc_handler,
                         mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
                             osmium::apply(buffer, handler);
                         }));
