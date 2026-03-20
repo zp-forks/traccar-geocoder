@@ -21,21 +21,52 @@ build_index() {
     for f in "$DATA_DIR"/pbf/*.osm.pbf; do
         [ -f "$f" ] && files="$files $f"
     done
-    if [ -z "$files" ]; then
-        echo "Error: no PBF files found in $DATA_DIR/pbf/"
+
+    build_args=""
+    [ -n "$STREET_LEVEL" ] && build_args="$build_args --street-level $STREET_LEVEL"
+    [ -n "$ADMIN_LEVEL" ] && build_args="$build_args --admin-level $ADMIN_LEVEL"
+    [ -n "$MAX_ADMIN_LEVEL" ] && build_args="$build_args --max-admin-level $MAX_ADMIN_LEVEL"
+
+    # Cache support
+    if [ -n "$LOAD_CACHE" ] && [ -f "$LOAD_CACHE" ]; then
+        echo "Loading from cache: $LOAD_CACHE"
+        build_args="$build_args --load-cache $LOAD_CACHE"
+    elif [ -z "$files" ]; then
+        echo "Error: no PBF files found in $DATA_DIR/pbf/ and no cache file"
         exit 1
     fi
+
+    [ -n "$SAVE_CACHE" ] && build_args="$build_args --save-cache $SAVE_CACHE"
+
+    # Output mode
+    if [ -n "$MULTI_OUTPUT" ]; then
+        build_args="$build_args --multi-output"
+    elif [ -n "$INDEX_MODE" ]; then
+        build_args="$build_args --mode $INDEX_MODE"
+    fi
+
+    # Continent generation
+    [ -n "$CONTINENTS" ] && build_args="$build_args --continents"
+
     mkdir -p "$DATA_DIR/index"
-    level_args=""
-    [ -n "$STREET_LEVEL" ] && level_args="$level_args --street-level $STREET_LEVEL"
-    [ -n "$ADMIN_LEVEL" ] && level_args="$level_args --admin-level $ADMIN_LEVEL"
     echo "Building index..."
-    build-index "$DATA_DIR/index" $files $level_args
+    if [ -n "$LOAD_CACHE" ] && [ -f "$LOAD_CACHE" ]; then
+        build-index "$DATA_DIR/index" $build_args
+    else
+        build-index "$DATA_DIR/index" $files $build_args
+    fi
     echo "Index built."
 }
 
 serve() {
-    args="$DATA_DIR/index"
+    # Determine which index dir to serve
+    index_dir="$DATA_DIR/index"
+    if [ -n "$MULTI_OUTPUT" ]; then
+        # Default to full when multi-output was used
+        index_dir="$DATA_DIR/index/${SERVE_MODE:-full}"
+    fi
+
+    args="$index_dir"
     if [ -n "$DOMAIN" ]; then
         args="$args --domain $DOMAIN"
         if [ -n "$CACHE_DIR" ]; then

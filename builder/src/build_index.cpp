@@ -1,11 +1,17 @@
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -16,7 +22,8 @@
 #include <osmium/handler/node_locations_for_ways.hpp>
 #include <fcntl.h>
 #include <unistd.h>
-#include <osmium/index/map/sparse_file_array.hpp>
+#include <sys/stat.h>
+#include <osmium/index/map/flex_mem.hpp>
 #include <osmium/area/assembler.hpp>
 #include <osmium/area/multipolygon_manager.hpp>
 
@@ -27,6 +34,12 @@
 #include <s2/s2polygon.h>
 #include <s2/s2loop.h>
 #include <s2/s2builder.h>
+
+// --- Directory creation ---
+
+static void ensure_dir(const std::string& path) {
+    mkdir(path.c_str(), 0755);
+}
 
 // --- Binary format structs ---
 
@@ -69,6 +82,10 @@ struct NodeCoord {
 static const uint32_t INTERIOR_FLAG = 0x80000000u;
 static const uint32_t ID_MASK = 0x7FFFFFFFu;
 
+// --- Index mode ---
+
+enum class IndexMode { Full, NoAddresses, AdminOnly };
+
 // --- String interning ---
 
 class StringPool {
@@ -86,42 +103,153 @@ public:
     }
 
     const std::vector<char>& data() const { return data_; }
+    std::vector<char>& mutable_data() { return data_; }
 
 private:
     std::unordered_map<std::string, uint32_t> index_;
     std::vector<char> data_;
 };
 
-// --- Collected data ---
+// --- Deferred S2 work items (computed in parallel after PBF read) ---
 
-static StringPool string_pool;
+struct DeferredWay {
+    uint32_t way_id;
+    uint32_t node_offset;
+    uint8_t node_count;
+};
 
-// Streets
-static std::vector<WayHeader> ways;
-static std::vector<NodeCoord> street_nodes;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
+struct DeferredInterp {
+    uint32_t interp_id;
+    uint32_t node_offset;
+    uint8_t node_count;
+};
 
-// Addresses
-static std::vector<AddrPoint> addr_points;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_addrs;
+// Forward declaration
+static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices);
 
-// Interpolation
-static std::vector<InterpWay> interp_ways;
-static std::vector<NodeCoord> interp_nodes;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
+// --- Thread pool for concurrent admin polygon S2 covering ---
 
-// Admin boundaries
-static std::vector<AdminPolygon> admin_polygons;
-static std::vector<NodeCoord> admin_vertices;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
+class AdminCoverPool {
+public:
+    struct WorkItem {
+        uint32_t poly_id;
+        std::vector<std::pair<double,double>> vertices;
+    };
+
+    explicit AdminCoverPool(size_t num_threads) : stop_(false) {
+        for (size_t i = 0; i < num_threads; i++) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~AdminCoverPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+
+    void submit(uint32_t poly_id, std::vector<std::pair<double,double>>&& vertices) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_back({poly_id, std::move(vertices)});
+        }
+        cv_.notify_one();
+    }
+
+    // Wait for all pending work to complete, then return merged results
+    std::unordered_map<uint64_t, std::vector<uint32_t>> drain() {
+        // Wait until queue is empty and all workers are idle
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            done_cv_.wait(lock, [this]() { return queue_.empty() && active_workers_ == 0; });
+        }
+
+        // Merge all thread-local results
+        std::unordered_map<uint64_t, std::vector<uint32_t>> merged;
+        for (auto& local : thread_results_) {
+            for (auto& [cell_id, ids] : local) {
+                auto& target = merged[cell_id];
+                target.insert(target.end(), ids.begin(), ids.end());
+            }
+        }
+        return merged;
+    }
+
+private:
+    void worker_loop() {
+        size_t my_idx;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            my_idx = thread_results_.size();
+            thread_results_.emplace_back();
+        }
+
+        while (true) {
+            WorkItem item;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) return;
+                item = std::move(queue_.front());
+                queue_.pop_front();
+                active_workers_++;
+            }
+
+            // Compute S2 covering (no locks needed — pure computation)
+            auto cell_ids = cover_polygon(item.vertices);
+            auto& local = thread_results_[my_idx];
+            for (const auto& [cell_id, is_interior] : cell_ids) {
+                uint32_t entry = is_interior ? (item.poly_id | INTERIOR_FLAG) : item.poly_id;
+                local[cell_id.id()].push_back(entry);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                active_workers_--;
+            }
+            done_cv_.notify_all();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::deque<WorkItem> queue_;
+    std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> thread_results_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::condition_variable done_cv_;
+    size_t active_workers_ = 0;
+    bool stop_;
+};
+
+// --- Parsed data container ---
+
+struct ParsedData {
+    StringPool string_pool;
+    std::vector<WayHeader> ways;
+    std::vector<NodeCoord> street_nodes;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
+    std::vector<AddrPoint> addr_points;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_addrs;
+    std::vector<InterpWay> interp_ways;
+    std::vector<NodeCoord> interp_nodes;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
+    std::vector<AdminPolygon> admin_polygons;
+    std::vector<NodeCoord> admin_vertices;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
+
+    // Deferred work for parallel S2 computation (ways + interps)
+    std::vector<DeferredWay> deferred_ways;
+    std::vector<DeferredInterp> deferred_interps;
+};
 
 // --- S2 helpers ---
 
 static int kStreetCellLevel = 17;
 static int kAdminCellLevel = 10;
-static bool kAdminOnly = false;
 static int kMaxAdminLevel = 0;  // 0 means no filtering
-static bool kNoAddresses = false;
 
 static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
     S2Point p1 = S2LatLng::FromDegrees(lat1, lng1).ToPoint();
@@ -144,6 +272,18 @@ static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, d
 
 static S2CellId point_to_cell(double lat, double lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel);
+}
+
+// Approximate polygon area in square degrees
+static float polygon_area(const std::vector<std::pair<double,double>>& vertices) {
+    double area = 0;
+    size_t n = vertices.size();
+    for (size_t i = 0; i < n; i++) {
+        size_t j = (i + 1) % n;
+        area += vertices[i].first * vertices[j].second;
+        area -= vertices[j].first * vertices[i].second;
+    }
+    return static_cast<float>(std::fabs(area) / 2.0);
 }
 
 // Returns pairs of (cell_id, is_interior)
@@ -228,19 +368,8 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<st
     return result;
 }
 
-// Approximate polygon area in square degrees
-static float polygon_area(const std::vector<std::pair<double,double>>& vertices) {
-    double area = 0;
-    size_t n = vertices.size();
-    for (size_t i = 0; i < n; i++) {
-        size_t j = (i + 1) % n;
-        area += vertices[i].first * vertices[j].second;
-        area -= vertices[j].first * vertices[i].second;
-    }
-    return static_cast<float>(std::fabs(area) / 2.0);
-}
+// --- Douglas-Peucker simplification ---
 
-// Douglas-Peucker simplification
 static void dp_simplify(const std::vector<std::pair<double,double>>& pts,
                         size_t start, size_t end, double epsilon,
                         std::vector<bool>& keep) {
@@ -342,19 +471,19 @@ static uint32_t parse_house_number(const char* s) {
 
 // --- Add an address point ---
 
-static uint64_t addr_count_total = 0;
-
-static void add_addr_point(double lat, double lng, const char* housenumber, const char* street) {
-    uint32_t addr_id = static_cast<uint32_t>(addr_points.size());
-    addr_points.push_back({
+static void add_addr_point(ParsedData& data, double lat, double lng,
+                           const char* housenumber, const char* street,
+                           uint64_t& addr_count_total) {
+    uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
+    data.addr_points.push_back({
         static_cast<float>(lat),
         static_cast<float>(lng),
-        string_pool.intern(housenumber),
-        string_pool.intern(street)
+        data.string_pool.intern(housenumber),
+        data.string_pool.intern(street)
     });
 
     S2CellId cell = point_to_cell(lat, lng);
-    cell_to_addrs[cell.id()].push_back(addr_id);
+    data.cell_to_addrs[cell.id()].push_back(addr_id);
 
     addr_count_total++;
     if (addr_count_total % 1000000 == 0) {
@@ -364,72 +493,71 @@ static void add_addr_point(double lat, double lng, const char* housenumber, cons
 
 // --- Add an admin polygon ---
 
-static void add_admin_polygon(const std::vector<std::pair<double,double>>& vertices,
+static void add_admin_polygon(ParsedData& data,
+                               const std::vector<std::pair<double,double>>& vertices,
                                const char* name, uint8_t admin_level,
-                               const char* country_code) {
+                               const char* country_code,
+                               AdminCoverPool* admin_pool = nullptr) {
     // Simplify large polygons
     auto simplified = simplify_polygon(vertices, 500);
     if (simplified.size() < 3) return;
 
-    uint32_t poly_id = static_cast<uint32_t>(admin_polygons.size());
-    uint32_t vertex_offset = static_cast<uint32_t>(admin_vertices.size());
+    uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());
+    uint32_t vertex_offset = static_cast<uint32_t>(data.admin_vertices.size());
 
     for (const auto& [lat, lng] : simplified) {
-        admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+        data.admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
     }
 
     AdminPolygon poly{};
     poly.vertex_offset = vertex_offset;
     poly.vertex_count = static_cast<uint16_t>(std::min(simplified.size(), size_t(65535)));
-    poly.name_id = string_pool.intern(name);
+    poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.area = polygon_area(simplified);
     poly.country_code = (country_code && country_code[0] && country_code[1])
         ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
         : 0;
-    admin_polygons.push_back(poly);
+    data.admin_polygons.push_back(poly);
 
-    // S2 cell coverage (high bit marks interior cells)
-    auto cell_ids = cover_polygon(simplified);
-    for (const auto& [cell_id, is_interior] : cell_ids) {
-        uint32_t entry = is_interior ? (poly_id | INTERIOR_FLAG) : poly_id;
-        cell_to_admin[cell_id.id()].push_back(entry);
+    // Submit S2 cell coverage to thread pool (runs concurrently with PBF reading)
+    if (admin_pool) {
+        admin_pool->submit(poly_id, std::move(simplified));
     }
 }
 
-// --- OSM handler (pass 2) ---
+// --- OSM handler ---
 
 class BuildHandler : public osmium::handler::Handler {
 public:
+    explicit BuildHandler(ParsedData& data, AdminCoverPool* admin_pool = nullptr)
+        : data_(data), admin_pool_(admin_pool) {}
+
     void node(const osmium::Node& node) {
-        if (kAdminOnly || kNoAddresses) return;
         const char* housenumber = node.tags()["addr:housenumber"];
         if (!housenumber) return;
         const char* street = node.tags()["addr:street"];
         if (!street) return;
         if (!node.location().valid()) return;
 
-        add_addr_point(node.location().lat(), node.location().lon(), housenumber, street);
+        add_addr_point(data_, node.location().lat(), node.location().lon(),
+                       housenumber, street, addr_count_total_);
     }
 
     void way(const osmium::Way& way) {
-        if (kAdminOnly) return;
+        // Address interpolation
+        const char* interpolation = way.tags()["addr:interpolation"];
+        if (interpolation) {
+            process_interpolation_way(way, interpolation);
+            return;
+        }
 
-        if (!kNoAddresses) {
-            // Address interpolation
-            const char* interpolation = way.tags()["addr:interpolation"];
-            if (interpolation) {
-                process_interpolation_way(way, interpolation);
-                return;
-            }
-
-            // Building addresses
-            const char* housenumber = way.tags()["addr:housenumber"];
-            if (housenumber) {
-                const char* street = way.tags()["addr:street"];
-                if (street) {
-                    process_building_address(way, housenumber, street);
-                }
+        // Building addresses
+        const char* housenumber = way.tags()["addr:housenumber"];
+        if (housenumber) {
+            const char* street = way.tags()["addr:street"];
+            if (street) {
+                process_building_address(way, housenumber, street);
             }
         }
 
@@ -489,7 +617,7 @@ public:
                 }
             }
             if (vertices.size() >= 3) {
-                add_admin_polygon(vertices, name_str.c_str(), admin_level, country_code);
+                add_admin_polygon(data_, vertices, name_str.c_str(), admin_level, country_code, admin_pool_);
             }
         }
 
@@ -503,12 +631,16 @@ public:
     uint64_t building_addr_count() const { return building_addr_count_; }
     uint64_t interp_count() const { return interp_count_; }
     uint64_t admin_count() const { return admin_count_; }
+    uint64_t addr_count_total() const { return addr_count_total_; }
 
 private:
+    ParsedData& data_;
+    AdminCoverPool* admin_pool_ = nullptr;
     uint64_t way_count_ = 0;
     uint64_t building_addr_count_ = 0;
     uint64_t interp_count_ = 0;
     uint64_t admin_count_ = 0;
+    uint64_t addr_count_total_ = 0;
 
     void process_building_address(const osmium::Way& way, const char* housenumber, const char* street) {
         const auto& wnodes = way.nodes();
@@ -524,7 +656,8 @@ private:
         }
         if (valid == 0) return;
 
-        add_addr_point(sum_lat / valid, sum_lng / valid, housenumber, street);
+        add_addr_point(data_, sum_lat / valid, sum_lng / valid,
+                       housenumber, street, addr_count_total_);
         building_addr_count_++;
     }
 
@@ -543,11 +676,11 @@ private:
         if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
         else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
 
-        uint32_t interp_id = static_cast<uint32_t>(interp_ways.size());
-        uint32_t node_offset = static_cast<uint32_t>(interp_nodes.size());
+        uint32_t interp_id = static_cast<uint32_t>(data_.interp_ways.size());
+        uint32_t node_offset = static_cast<uint32_t>(data_.interp_nodes.size());
 
         for (const auto& nr : wnodes) {
-            interp_nodes.push_back({
+            data_.interp_nodes.push_back({
                 static_cast<float>(nr.location().lat()),
                 static_cast<float>(nr.location().lon())
             });
@@ -556,27 +689,15 @@ private:
         InterpWay iw{};
         iw.node_offset = node_offset;
         iw.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-        iw.street_id = string_pool.intern(street);
+        iw.street_id = data_.string_pool.intern(street);
         iw.start_number = 0;
         iw.end_number = 0;
         iw.interpolation = interp_type;
-        interp_ways.push_back(iw);
+        data_.interp_ways.push_back(iw);
 
-        std::unordered_set<uint64_t> interp_cells;
-        for (size_t i = 0; i + 1 < wnodes.size(); i++) {
-            double lat1 = wnodes[i].location().lat();
-            double lng1 = wnodes[i].location().lon();
-            double lat2 = wnodes[i + 1].location().lat();
-            double lng2 = wnodes[i + 1].location().lon();
-
-            auto cell_ids = cover_edge(lat1, lng1, lat2, lng2);
-            for (const auto& cell_id : cell_ids) {
-                interp_cells.insert(cell_id.id());
-            }
-        }
-        for (uint64_t cell_id : interp_cells) {
-            cell_to_interps[cell_id].push_back(interp_id);
-        }
+        // Defer S2 cell computation to parallel phase
+        data_.deferred_interps.push_back({interp_id, node_offset,
+            static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)))});
 
         interp_count_++;
     }
@@ -589,11 +710,11 @@ private:
             if (!nr.location().valid()) return;
         }
 
-        uint32_t way_id = static_cast<uint32_t>(ways.size());
-        uint32_t node_offset = static_cast<uint32_t>(street_nodes.size());
+        uint32_t way_id = static_cast<uint32_t>(data_.ways.size());
+        uint32_t node_offset = static_cast<uint32_t>(data_.street_nodes.size());
 
         for (const auto& nr : wnodes) {
-            street_nodes.push_back({
+            data_.street_nodes.push_back({
                 static_cast<float>(nr.location().lat()),
                 static_cast<float>(nr.location().lon())
             });
@@ -602,35 +723,22 @@ private:
         WayHeader header{};
         header.node_offset = node_offset;
         header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-        header.name_id = string_pool.intern(name);
-        ways.push_back(header);
+        header.name_id = data_.string_pool.intern(name);
+        data_.ways.push_back(header);
 
-        std::unordered_set<uint64_t> way_cells;
-        for (size_t i = 0; i + 1 < wnodes.size(); i++) {
-            double lat1 = wnodes[i].location().lat();
-            double lng1 = wnodes[i].location().lon();
-            double lat2 = wnodes[i + 1].location().lat();
-            double lng2 = wnodes[i + 1].location().lon();
-
-            auto cell_ids = cover_edge(lat1, lng1, lat2, lng2);
-            for (const auto& cell_id : cell_ids) {
-                way_cells.insert(cell_id.id());
-            }
-        }
-        for (uint64_t cell_id : way_cells) {
-            cell_to_ways[cell_id].push_back(way_id);
-        }
+        // Defer S2 cell computation to parallel phase
+        data_.deferred_ways.push_back({way_id, node_offset, header.node_count});
 
         way_count_++;
         if (way_count_ % 1000000 == 0) {
-            std::cerr << "Processed " << way_count_ / 1000000 << "M street ways..." << std::endl;
+            std::cerr << "Collected " << way_count_ / 1000000 << "M street ways..." << std::endl;
         }
     }
 };
 
 // --- Resolve interpolation way endpoint house numbers ---
 
-static void resolve_interpolation_endpoints() {
+static void resolve_interpolation_endpoints(ParsedData& data) {
     struct CoordKey {
         int32_t lat;
         int32_t lng;
@@ -643,26 +751,26 @@ static void resolve_interpolation_endpoints() {
     };
 
     std::unordered_map<CoordKey, uint32_t, CoordHash> addr_by_coord;
-    for (uint32_t i = 0; i < addr_points.size(); i++) {
+    for (uint32_t i = 0; i < data.addr_points.size(); i++) {
         CoordKey key{
-            static_cast<int32_t>(addr_points[i].lat * 100000),
-            static_cast<int32_t>(addr_points[i].lng * 100000)
+            static_cast<int32_t>(data.addr_points[i].lat * 100000),
+            static_cast<int32_t>(data.addr_points[i].lng * 100000)
         };
         addr_by_coord[key] = i;
     }
 
     uint32_t resolved = 0;
-    for (auto& iw : interp_ways) {
+    for (auto& iw : data.interp_ways) {
         if (iw.node_count < 2) continue;
 
-        const auto& start = interp_nodes[iw.node_offset];
+        const auto& start = data.interp_nodes[iw.node_offset];
         CoordKey start_key{
             static_cast<int32_t>(start.lat * 100000),
             static_cast<int32_t>(start.lng * 100000)
         };
         auto it_start = addr_by_coord.find(start_key);
 
-        const auto& end = interp_nodes[iw.node_offset + iw.node_count - 1];
+        const auto& end = data.interp_nodes[iw.node_offset + iw.node_count - 1];
         CoordKey end_key{
             static_cast<int32_t>(end.lat * 100000),
             static_cast<int32_t>(end.lng * 100000)
@@ -670,18 +778,18 @@ static void resolve_interpolation_endpoints() {
         auto it_end = addr_by_coord.find(end_key);
 
         if (it_start != addr_by_coord.end()) {
-            const char* hn = string_pool.data().data() + addr_points[it_start->second].housenumber_id;
+            const char* hn = data.string_pool.data().data() + data.addr_points[it_start->second].housenumber_id;
             iw.start_number = parse_house_number(hn);
         }
         if (it_end != addr_by_coord.end()) {
-            const char* hn = string_pool.data().data() + addr_points[it_end->second].housenumber_id;
+            const char* hn = data.string_pool.data().data() + data.addr_points[it_end->second].housenumber_id;
             iw.end_number = parse_house_number(hn);
         }
 
         if (iw.start_number > 0 && iw.end_number > 0) resolved++;
     }
 
-    std::cerr << "Resolved " << resolved << "/" << interp_ways.size()
+    std::cerr << "Resolved " << resolved << "/" << data.interp_ways.size()
               << " interpolation ways" << std::endl;
 }
 
@@ -693,6 +801,497 @@ static void deduplicate(Map& cell_map) {
         std::sort(ids.begin(), ids.end());
         ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     }
+}
+
+// --- Cache serialization ---
+
+enum class SectionType : uint32_t {
+    STRING_POOL = 0,
+    WAYS = 1,
+    STREET_NODES = 2,
+    CELL_TO_WAYS = 3,
+    ADDR_POINTS = 4,
+    CELL_TO_ADDRS = 5,
+    INTERP_WAYS = 6,
+    INTERP_NODES = 7,
+    CELL_TO_INTERPS = 8,
+    ADMIN_POLYGONS = 9,
+    ADMIN_VERTICES = 10,
+    CELL_TO_ADMIN = 11,
+};
+
+static const char CACHE_MAGIC[8] = {'T','G','C','A','C','H','E','\0'};
+static const uint32_t CACHE_VERSION = 1;
+static const uint32_t CACHE_SECTION_COUNT = 12;
+
+// Serialize a vector of structs to a binary blob
+template<typename T>
+static std::vector<char> serialize_vector(const std::vector<T>& vec) {
+    std::vector<char> buf;
+    uint64_t count = vec.size();
+    buf.resize(sizeof(uint64_t) + count * sizeof(T));
+    std::memcpy(buf.data(), &count, sizeof(uint64_t));
+    if (count > 0) {
+        std::memcpy(buf.data() + sizeof(uint64_t), vec.data(), count * sizeof(T));
+    }
+    return buf;
+}
+
+// Deserialize a vector of structs from a binary blob
+template<typename T>
+static bool deserialize_vector(const char* data, uint64_t length, std::vector<T>& vec) {
+    if (length < sizeof(uint64_t)) return false;
+    uint64_t count;
+    std::memcpy(&count, data, sizeof(uint64_t));
+    if (length < sizeof(uint64_t) + count * sizeof(T)) return false;
+    vec.resize(count);
+    if (count > 0) {
+        std::memcpy(vec.data(), data + sizeof(uint64_t), count * sizeof(T));
+    }
+    return true;
+}
+
+// Serialize a cell map (uint64_t -> vector<uint32_t>)
+static std::vector<char> serialize_cell_map(const std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
+    // Calculate total size
+    size_t total = sizeof(uint64_t); // entry count
+    for (const auto& [cell_id, ids] : map) {
+        total += sizeof(uint64_t) + sizeof(uint32_t) + ids.size() * sizeof(uint32_t);
+    }
+    std::vector<char> buf(total);
+    char* ptr = buf.data();
+
+    uint64_t entry_count = map.size();
+    std::memcpy(ptr, &entry_count, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
+
+    for (const auto& [cell_id, ids] : map) {
+        std::memcpy(ptr, &cell_id, sizeof(uint64_t));
+        ptr += sizeof(uint64_t);
+        uint32_t id_count = static_cast<uint32_t>(ids.size());
+        std::memcpy(ptr, &id_count, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+        if (id_count > 0) {
+            std::memcpy(ptr, ids.data(), id_count * sizeof(uint32_t));
+            ptr += id_count * sizeof(uint32_t);
+        }
+    }
+    return buf;
+}
+
+// Deserialize a cell map
+static bool deserialize_cell_map(const char* data, uint64_t length,
+                                  std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
+    if (length < sizeof(uint64_t)) return false;
+    const char* ptr = data;
+    const char* end = data + length;
+
+    uint64_t entry_count;
+    std::memcpy(&entry_count, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
+
+    map.reserve(entry_count);
+    for (uint64_t i = 0; i < entry_count; i++) {
+        if (ptr + sizeof(uint64_t) + sizeof(uint32_t) > end) return false;
+        uint64_t cell_id;
+        std::memcpy(&cell_id, ptr, sizeof(uint64_t));
+        ptr += sizeof(uint64_t);
+        uint32_t id_count;
+        std::memcpy(&id_count, ptr, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+        if (ptr + id_count * sizeof(uint32_t) > end) return false;
+        std::vector<uint32_t> ids(id_count);
+        if (id_count > 0) {
+            std::memcpy(ids.data(), ptr, id_count * sizeof(uint32_t));
+            ptr += id_count * sizeof(uint32_t);
+        }
+        map[cell_id] = std::move(ids);
+    }
+    return true;
+}
+
+static void serialize_cache(const ParsedData& data, const std::string& path) {
+    std::cerr << "Saving cache to " << path << "..." << std::endl;
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        std::cerr << "Error: could not open cache file for writing: " << path << std::endl;
+        return;
+    }
+
+    f.write(CACHE_MAGIC, 8);
+    f.write(reinterpret_cast<const char*>(&CACHE_VERSION), sizeof(uint32_t));
+    f.write(reinterpret_cast<const char*>(&CACHE_SECTION_COUNT), sizeof(uint32_t));
+
+    // Helper to write a section
+    auto write_section = [&](SectionType type, const std::vector<char>& blob) {
+        uint32_t t = static_cast<uint32_t>(type);
+        uint64_t len = blob.size();
+        f.write(reinterpret_cast<const char*>(&t), sizeof(uint32_t));
+        f.write(reinterpret_cast<const char*>(&len), sizeof(uint64_t));
+        f.write(blob.data(), len);
+    };
+
+    // STRING_POOL: raw char vector
+    {
+        const auto& sp = data.string_pool.data();
+        std::vector<char> blob(sizeof(uint64_t) + sp.size());
+        uint64_t sz = sp.size();
+        std::memcpy(blob.data(), &sz, sizeof(uint64_t));
+        if (sz > 0) std::memcpy(blob.data() + sizeof(uint64_t), sp.data(), sz);
+        write_section(SectionType::STRING_POOL, blob);
+    }
+
+    write_section(SectionType::WAYS, serialize_vector(data.ways));
+    write_section(SectionType::STREET_NODES, serialize_vector(data.street_nodes));
+    write_section(SectionType::CELL_TO_WAYS, serialize_cell_map(data.cell_to_ways));
+    write_section(SectionType::ADDR_POINTS, serialize_vector(data.addr_points));
+    write_section(SectionType::CELL_TO_ADDRS, serialize_cell_map(data.cell_to_addrs));
+    write_section(SectionType::INTERP_WAYS, serialize_vector(data.interp_ways));
+    write_section(SectionType::INTERP_NODES, serialize_vector(data.interp_nodes));
+    write_section(SectionType::CELL_TO_INTERPS, serialize_cell_map(data.cell_to_interps));
+    write_section(SectionType::ADMIN_POLYGONS, serialize_vector(data.admin_polygons));
+    write_section(SectionType::ADMIN_VERTICES, serialize_vector(data.admin_vertices));
+    write_section(SectionType::CELL_TO_ADMIN, serialize_cell_map(data.cell_to_admin));
+
+    std::cerr << "Cache saved." << std::endl;
+}
+
+static bool deserialize_cache(ParsedData& data, const std::string& path) {
+    std::cerr << "Loading cache from " << path << "..." << std::endl;
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        std::cerr << "Error: could not open cache file: " << path << std::endl;
+        return false;
+    }
+
+    char magic[8];
+    f.read(magic, 8);
+    if (std::memcmp(magic, CACHE_MAGIC, 8) != 0) {
+        std::cerr << "Error: invalid cache magic" << std::endl;
+        return false;
+    }
+
+    uint32_t version;
+    f.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+    if (version != CACHE_VERSION) {
+        std::cerr << "Error: unsupported cache version " << version << std::endl;
+        return false;
+    }
+
+    uint32_t section_count;
+    f.read(reinterpret_cast<char*>(&section_count), sizeof(uint32_t));
+
+    for (uint32_t s = 0; s < section_count; s++) {
+        uint32_t type;
+        uint64_t length;
+        f.read(reinterpret_cast<char*>(&type), sizeof(uint32_t));
+        f.read(reinterpret_cast<char*>(&length), sizeof(uint64_t));
+
+        std::vector<char> blob(length);
+        f.read(blob.data(), length);
+
+        switch (static_cast<SectionType>(type)) {
+        case SectionType::STRING_POOL: {
+            if (length < sizeof(uint64_t)) return false;
+            uint64_t sz;
+            std::memcpy(&sz, blob.data(), sizeof(uint64_t));
+            auto& sp = data.string_pool.mutable_data();
+            sp.resize(sz);
+            if (sz > 0) std::memcpy(sp.data(), blob.data() + sizeof(uint64_t), sz);
+            break;
+        }
+        case SectionType::WAYS:
+            if (!deserialize_vector(blob.data(), length, data.ways)) return false;
+            break;
+        case SectionType::STREET_NODES:
+            if (!deserialize_vector(blob.data(), length, data.street_nodes)) return false;
+            break;
+        case SectionType::CELL_TO_WAYS:
+            if (!deserialize_cell_map(blob.data(), length, data.cell_to_ways)) return false;
+            break;
+        case SectionType::ADDR_POINTS:
+            if (!deserialize_vector(blob.data(), length, data.addr_points)) return false;
+            break;
+        case SectionType::CELL_TO_ADDRS:
+            if (!deserialize_cell_map(blob.data(), length, data.cell_to_addrs)) return false;
+            break;
+        case SectionType::INTERP_WAYS:
+            if (!deserialize_vector(blob.data(), length, data.interp_ways)) return false;
+            break;
+        case SectionType::INTERP_NODES:
+            if (!deserialize_vector(blob.data(), length, data.interp_nodes)) return false;
+            break;
+        case SectionType::CELL_TO_INTERPS:
+            if (!deserialize_cell_map(blob.data(), length, data.cell_to_interps)) return false;
+            break;
+        case SectionType::ADMIN_POLYGONS:
+            if (!deserialize_vector(blob.data(), length, data.admin_polygons)) return false;
+            break;
+        case SectionType::ADMIN_VERTICES:
+            if (!deserialize_vector(blob.data(), length, data.admin_vertices)) return false;
+            break;
+        case SectionType::CELL_TO_ADMIN:
+            if (!deserialize_cell_map(blob.data(), length, data.cell_to_admin)) return false;
+            break;
+        default:
+            std::cerr << "Warning: unknown cache section type " << type << ", skipping" << std::endl;
+            break;
+        }
+    }
+
+    std::cerr << "Cache loaded: " << data.ways.size() << " ways, "
+              << data.addr_points.size() << " addrs, "
+              << data.interp_ways.size() << " interps, "
+              << data.admin_polygons.size() << " admin polygons" << std::endl;
+    return true;
+}
+
+// --- Continent bounding box filtering ---
+
+struct ContinentBBox {
+    const char* name;
+    double min_lat, max_lat, min_lng, max_lng;
+};
+
+static const ContinentBBox kContinents[] = {
+    {"africa",            -35.0,  37.5,  -25.0,  55.0},
+    {"asia",              -12.0,  82.0,   25.0, 180.0},
+    {"europe",             35.0,  72.0,  -25.0,  45.0},
+    {"north-america",       7.0,  84.0, -170.0, -50.0},
+    {"south-america",     -56.0,  13.0,  -82.0, -34.0},
+    {"oceania",           -50.0,   0.0,  110.0, 180.0},
+    {"central-america",     7.0,  23.5, -120.0, -57.0},
+    {"antarctica",        -90.0, -60.0, -180.0, 180.0},
+};
+
+static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
+    S2CellId cell(cell_id);
+    S2LatLng center = cell.ToLatLng();
+    double lat = center.lat().degrees();
+    double lng = center.lng().degrees();
+    return lat >= bbox.min_lat && lat <= bbox.max_lat &&
+           lng >= bbox.min_lng && lng <= bbox.max_lng;
+}
+
+static ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
+    ParsedData out;
+
+    // --- Filter cell_to_ways and collect referenced way IDs ---
+    std::unordered_set<uint32_t> used_way_ids;
+    for (const auto& [cell_id, ids] : full.cell_to_ways) {
+        if (cell_in_bbox(cell_id, bbox)) {
+            for (uint32_t id : ids) {
+                used_way_ids.insert(id);
+            }
+        }
+    }
+
+    // --- Filter cell_to_addrs and collect referenced addr IDs ---
+    std::unordered_set<uint32_t> used_addr_ids;
+    for (const auto& [cell_id, ids] : full.cell_to_addrs) {
+        if (cell_in_bbox(cell_id, bbox)) {
+            for (uint32_t id : ids) {
+                used_addr_ids.insert(id);
+            }
+        }
+    }
+
+    // --- Filter cell_to_interps and collect referenced interp IDs ---
+    std::unordered_set<uint32_t> used_interp_ids;
+    for (const auto& [cell_id, ids] : full.cell_to_interps) {
+        if (cell_in_bbox(cell_id, bbox)) {
+            for (uint32_t id : ids) {
+                used_interp_ids.insert(id);
+            }
+        }
+    }
+
+    // --- Filter cell_to_admin and collect referenced admin IDs ---
+    std::unordered_set<uint32_t> used_admin_ids;
+    for (const auto& [cell_id, ids] : full.cell_to_admin) {
+        if (cell_in_bbox(cell_id, bbox)) {
+            for (uint32_t id : ids) {
+                used_admin_ids.insert(id & ID_MASK);
+            }
+        }
+    }
+
+    // --- Build remapped ways ---
+    std::unordered_map<uint32_t, uint32_t> way_remap; // old_id -> new_id
+    {
+        std::vector<uint32_t> sorted_ids(used_way_ids.begin(), used_way_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        for (uint32_t old_id : sorted_ids) {
+            uint32_t new_id = static_cast<uint32_t>(out.ways.size());
+            way_remap[old_id] = new_id;
+            const auto& w = full.ways[old_id];
+            WayHeader nw = w;
+            nw.node_offset = static_cast<uint32_t>(out.street_nodes.size());
+            out.ways.push_back(nw);
+            for (uint8_t n = 0; n < w.node_count; n++) {
+                out.street_nodes.push_back(full.street_nodes[w.node_offset + n]);
+            }
+        }
+    }
+
+    // --- Build remapped addr points ---
+    std::unordered_map<uint32_t, uint32_t> addr_remap;
+    {
+        std::vector<uint32_t> sorted_ids(used_addr_ids.begin(), used_addr_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        for (uint32_t old_id : sorted_ids) {
+            uint32_t new_id = static_cast<uint32_t>(out.addr_points.size());
+            addr_remap[old_id] = new_id;
+            out.addr_points.push_back(full.addr_points[old_id]);
+        }
+    }
+
+    // --- Build remapped interp ways ---
+    std::unordered_map<uint32_t, uint32_t> interp_remap;
+    {
+        std::vector<uint32_t> sorted_ids(used_interp_ids.begin(), used_interp_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        for (uint32_t old_id : sorted_ids) {
+            uint32_t new_id = static_cast<uint32_t>(out.interp_ways.size());
+            interp_remap[old_id] = new_id;
+            const auto& iw = full.interp_ways[old_id];
+            InterpWay niw = iw;
+            niw.node_offset = static_cast<uint32_t>(out.interp_nodes.size());
+            out.interp_ways.push_back(niw);
+            for (uint8_t n = 0; n < iw.node_count; n++) {
+                out.interp_nodes.push_back(full.interp_nodes[iw.node_offset + n]);
+            }
+        }
+    }
+
+    // --- Build remapped admin polygons ---
+    std::unordered_map<uint32_t, uint32_t> admin_remap;
+    {
+        std::vector<uint32_t> sorted_ids(used_admin_ids.begin(), used_admin_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        for (uint32_t old_id : sorted_ids) {
+            uint32_t new_id = static_cast<uint32_t>(out.admin_polygons.size());
+            admin_remap[old_id] = new_id;
+            const auto& ap = full.admin_polygons[old_id];
+            AdminPolygon nap = ap;
+            nap.vertex_offset = static_cast<uint32_t>(out.admin_vertices.size());
+            out.admin_polygons.push_back(nap);
+            for (uint16_t v = 0; v < ap.vertex_count; v++) {
+                out.admin_vertices.push_back(full.admin_vertices[ap.vertex_offset + v]);
+            }
+        }
+    }
+
+    // --- Build remapped cell maps ---
+    for (const auto& [cell_id, ids] : full.cell_to_ways) {
+        if (!cell_in_bbox(cell_id, bbox)) continue;
+        std::vector<uint32_t> new_ids;
+        for (uint32_t id : ids) {
+            auto it = way_remap.find(id);
+            if (it != way_remap.end()) {
+                new_ids.push_back(it->second);
+            }
+        }
+        if (!new_ids.empty()) {
+            out.cell_to_ways[cell_id] = std::move(new_ids);
+        }
+    }
+
+    for (const auto& [cell_id, ids] : full.cell_to_addrs) {
+        if (!cell_in_bbox(cell_id, bbox)) continue;
+        std::vector<uint32_t> new_ids;
+        for (uint32_t id : ids) {
+            auto it = addr_remap.find(id);
+            if (it != addr_remap.end()) {
+                new_ids.push_back(it->second);
+            }
+        }
+        if (!new_ids.empty()) {
+            out.cell_to_addrs[cell_id] = std::move(new_ids);
+        }
+    }
+
+    for (const auto& [cell_id, ids] : full.cell_to_interps) {
+        if (!cell_in_bbox(cell_id, bbox)) continue;
+        std::vector<uint32_t> new_ids;
+        for (uint32_t id : ids) {
+            auto it = interp_remap.find(id);
+            if (it != interp_remap.end()) {
+                new_ids.push_back(it->second);
+            }
+        }
+        if (!new_ids.empty()) {
+            out.cell_to_interps[cell_id] = std::move(new_ids);
+        }
+    }
+
+    for (const auto& [cell_id, ids] : full.cell_to_admin) {
+        if (!cell_in_bbox(cell_id, bbox)) continue;
+        std::vector<uint32_t> new_ids;
+        for (uint32_t id : ids) {
+            uint32_t raw_id = id & ID_MASK;
+            uint32_t flags = id & INTERIOR_FLAG;
+            auto it = admin_remap.find(raw_id);
+            if (it != admin_remap.end()) {
+                new_ids.push_back(it->second | flags);
+            }
+        }
+        if (!new_ids.empty()) {
+            out.cell_to_admin[cell_id] = std::move(new_ids);
+        }
+    }
+
+    // --- Rebuild compact string pool with only referenced strings ---
+    // Collect all referenced string offsets
+    std::unordered_set<uint32_t> used_offsets;
+    for (const auto& w : out.ways) {
+        used_offsets.insert(w.name_id);
+    }
+    for (const auto& a : out.addr_points) {
+        used_offsets.insert(a.housenumber_id);
+        used_offsets.insert(a.street_id);
+    }
+    for (const auto& iw : out.interp_ways) {
+        used_offsets.insert(iw.street_id);
+    }
+    for (const auto& ap : out.admin_polygons) {
+        used_offsets.insert(ap.name_id);
+    }
+
+    // Build remap: old offset -> new offset
+    const auto& old_sp = full.string_pool.data();
+    std::unordered_map<uint32_t, uint32_t> string_remap;
+    auto& new_sp = out.string_pool.mutable_data();
+    new_sp.clear();
+
+    std::vector<uint32_t> sorted_offsets(used_offsets.begin(), used_offsets.end());
+    std::sort(sorted_offsets.begin(), sorted_offsets.end());
+
+    for (uint32_t old_off : sorted_offsets) {
+        uint32_t new_off = static_cast<uint32_t>(new_sp.size());
+        string_remap[old_off] = new_off;
+        // Copy the null-terminated string
+        const char* str = old_sp.data() + old_off;
+        size_t len = std::strlen(str);
+        new_sp.insert(new_sp.end(), str, str + len + 1);
+    }
+
+    // Remap all string IDs in the output data
+    for (auto& w : out.ways) {
+        w.name_id = string_remap[w.name_id];
+    }
+    for (auto& a : out.addr_points) {
+        a.housenumber_id = string_remap[a.housenumber_id];
+        a.street_id = string_remap[a.street_id];
+    }
+    for (auto& iw : out.interp_ways) {
+        iw.street_id = string_remap[iw.street_id];
+    }
+    for (auto& ap : out.admin_polygons) {
+        ap.name_id = string_remap[ap.name_id];
+    }
+
+    return out;
 }
 
 // --- Write cell index ---
@@ -751,24 +1350,29 @@ static void write_cell_index(
 
 // --- Write all index files ---
 
-static void write_index(const std::string& output_dir) {
-    if (!kAdminOnly) {
+static void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
+    ensure_dir(output_dir);
+
+    bool write_streets = (mode != IndexMode::AdminOnly);
+    bool write_addresses = (mode == IndexMode::Full);
+
+    if (write_streets) {
         // Merged geo cell index for streets, addresses, and interpolation
         std::set<uint64_t> all_geo_cells;
-        for (const auto& [id, _] : cell_to_ways) all_geo_cells.insert(id);
-        if (!kNoAddresses) {
-            for (const auto& [id, _] : cell_to_addrs) all_geo_cells.insert(id);
-            for (const auto& [id, _] : cell_to_interps) all_geo_cells.insert(id);
+        for (const auto& [id, _] : data.cell_to_ways) all_geo_cells.insert(id);
+        if (write_addresses) {
+            for (const auto& [id, _] : data.cell_to_addrs) all_geo_cells.insert(id);
+            for (const auto& [id, _] : data.cell_to_interps) all_geo_cells.insert(id);
         }
         std::vector<uint64_t> sorted_geo_cells(all_geo_cells.begin(), all_geo_cells.end());
 
-        auto street_offsets = write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, cell_to_ways);
+        auto street_offsets = write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, data.cell_to_ways);
 
         std::unordered_map<uint64_t, uint32_t> addr_offsets;
         std::unordered_map<uint64_t, uint32_t> interp_offsets;
-        if (!kNoAddresses) {
-            addr_offsets = write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, cell_to_addrs);
-            interp_offsets = write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, cell_to_interps);
+        if (write_addresses) {
+            addr_offsets = write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, data.cell_to_addrs);
+            interp_offsets = write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, data.cell_to_interps);
         }
 
         {
@@ -787,44 +1391,44 @@ static void write_index(const std::string& output_dir) {
         }
 
         std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
-                  << ways.size() << " ways, "
-                  << addr_points.size() << " addrs, "
-                  << interp_ways.size() << " interps)" << std::endl;
+                  << data.ways.size() << " ways, "
+                  << data.addr_points.size() << " addrs, "
+                  << data.interp_ways.size() << " interps)" << std::endl;
     }
 
-    write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
-    std::cerr << "admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
+    write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
+    std::cerr << "admin index: " << data.cell_to_admin.size() << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
 
-    if (!kAdminOnly) {
+    if (write_streets) {
         // Street ways
         {
             std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
-            f.write(reinterpret_cast<const char*>(ways.data()), ways.size() * sizeof(WayHeader));
+            f.write(reinterpret_cast<const char*>(data.ways.data()), data.ways.size() * sizeof(WayHeader));
         }
 
         // Street nodes
         {
             std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
-            f.write(reinterpret_cast<const char*>(street_nodes.data()), street_nodes.size() * sizeof(NodeCoord));
+            f.write(reinterpret_cast<const char*>(data.street_nodes.data()), data.street_nodes.size() * sizeof(NodeCoord));
         }
 
-        if (!kNoAddresses) {
+        if (write_addresses) {
             // Address points
             {
                 std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(addr_points.data()), addr_points.size() * sizeof(AddrPoint));
+                f.write(reinterpret_cast<const char*>(data.addr_points.data()), data.addr_points.size() * sizeof(AddrPoint));
             }
 
             // Interpolation ways
             {
                 std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(interp_ways.data()), interp_ways.size() * sizeof(InterpWay));
+                f.write(reinterpret_cast<const char*>(data.interp_ways.data()), data.interp_ways.size() * sizeof(InterpWay));
             }
 
             // Interpolation nodes
             {
                 std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(interp_nodes.data()), interp_nodes.size() * sizeof(NodeCoord));
+                f.write(reinterpret_cast<const char*>(data.interp_nodes.data()), data.interp_nodes.size() * sizeof(NodeCoord));
             }
         }
     }
@@ -832,35 +1436,52 @@ static void write_index(const std::string& output_dir) {
     // Admin polygons
     {
         std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(admin_polygons.data()), admin_polygons.size() * sizeof(AdminPolygon));
+        f.write(reinterpret_cast<const char*>(data.admin_polygons.data()), data.admin_polygons.size() * sizeof(AdminPolygon));
     }
 
     // Admin vertices
     {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(admin_vertices.data()), admin_vertices.size() * sizeof(NodeCoord));
+        f.write(reinterpret_cast<const char*>(data.admin_vertices.data()), data.admin_vertices.size() * sizeof(NodeCoord));
     }
 
     // Strings
     {
         std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
-        f.write(string_pool.data().data(), string_pool.data().size());
-        std::cerr << "strings.bin: " << string_pool.data().size() << " bytes" << std::endl;
+        f.write(data.string_pool.data().data(), data.string_pool.data().size());
+        std::cerr << "strings.bin: " << data.string_pool.data().size() << " bytes" << std::endl;
     }
-
-
 }
 
 // --- Main ---
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--admin-only] [--no-addresses] [--max-admin-level N]" << std::endl;
+    if (argc < 2) {
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
+        std::cerr << "       build-index <output-dir> --load-cache <path> [options]" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Options:" << std::endl;
+        std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
+        std::cerr << "  --admin-level N        S2 cell level for admin (default: 10)" << std::endl;
+        std::cerr << "  --max-admin-level N    Only include admin levels <= N" << std::endl;
+        std::cerr << "  --save-cache <path>    Save parsed data to cache file" << std::endl;
+        std::cerr << "  --load-cache <path>    Load from cache instead of PBF" << std::endl;
+        std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes" << std::endl;
+        std::cerr << "  --continents           Also generate per-continent indexes" << std::endl;
+        std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
+        std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
+        std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
         return 1;
     }
 
     std::string output_dir = argv[1];
     std::vector<std::string> input_files;
+    std::string save_cache_path;
+    std::string load_cache_path;
+    bool multi_output = false;
+    bool generate_continents = false;
+    IndexMode mode = IndexMode::Full;
+
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--street-level" && i + 1 < argc) {
@@ -868,88 +1489,669 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--admin-level" && i + 1 < argc) {
             kAdminCellLevel = std::atoi(argv[++i]);
         } else if (arg == "--admin-only") {
-            kAdminOnly = true;
+            mode = IndexMode::AdminOnly;
         } else if (arg == "--no-addresses") {
-            kNoAddresses = true;
+            mode = IndexMode::NoAddresses;
         } else if (arg == "--max-admin-level" && i + 1 < argc) {
             kMaxAdminLevel = std::atoi(argv[++i]);
+        } else if (arg == "--save-cache" && i + 1 < argc) {
+            save_cache_path = argv[++i];
+        } else if (arg == "--load-cache" && i + 1 < argc) {
+            load_cache_path = argv[++i];
+        } else if (arg == "--multi-output") {
+            multi_output = true;
+        } else if (arg == "--continents") {
+            generate_continents = true;
+        } else if (arg == "--mode" && i + 1 < argc) {
+            std::string mode_str = argv[++i];
+            if (mode_str == "full") {
+                mode = IndexMode::Full;
+            } else if (mode_str == "no-addresses") {
+                mode = IndexMode::NoAddresses;
+            } else if (mode_str == "admin-only") {
+                mode = IndexMode::AdminOnly;
+            } else {
+                std::cerr << "Error: unknown mode '" << mode_str << "'" << std::endl;
+                return 1;
+            }
         } else {
             input_files.push_back(arg);
         }
     }
 
-    BuildHandler handler;
+    ParsedData data;
 
-    for (const auto& input_file : input_files) {
-        std::cerr << "Processing " << input_file << "..." << std::endl;
-
-        // --- Pass 1: collect relation members for multipolygon assembly ---
-        std::cerr << "  Pass 1: scanning relations..." << std::endl;
-
-        osmium::area::Assembler::config_type assembler_config;
-        osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
-
-        {
-            osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
-            osmium::apply(reader1, mp_manager);
-            reader1.close();
-            mp_manager.prepare_for_lookup();
+    if (!load_cache_path.empty()) {
+        // Load from cache
+        if (!deserialize_cache(data, load_cache_path)) {
+            std::cerr << "Error: failed to load cache" << std::endl;
+            return 1;
+        }
+    } else {
+        // Parse PBF files (always collect everything)
+        if (input_files.empty()) {
+            std::cerr << "Error: no input files specified and no --load-cache" << std::endl;
+            return 1;
         }
 
-        // --- Pass 2: process all data ---
-        std::cerr << "  Pass 2: processing nodes, ways, and areas..." << std::endl;
+        // Create thread pool for concurrent admin polygon S2 covering
+        unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() > 4 ? std::thread::hardware_concurrency() - 4 : 1u);
+        std::cerr << "Using " << num_threads << " worker threads." << std::endl;
+        AdminCoverPool admin_pool(num_threads);
+        BuildHandler handler(data, &admin_pool);
 
-        using index_type = osmium::index::map::SparseFileArray<
+        using index_type = osmium::index::map::FlexMem<
             osmium::unsigned_object_id_type, osmium::Location>;
-        using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
-        std::string tmp_path = output_dir + "/node_locations.tmp";
-        int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-        index_type index{fd};
-        location_handler_type location_handler{index};
+        // Sharded node location index for parallel writes
+        static const int NUM_SHARDS = 64;
+        struct ShardedIndex {
+            index_type shards[NUM_SHARDS];
+            std::mutex mutexes[NUM_SHARDS];
 
-        osmium::io::Reader reader2{input_file};
+            void set(osmium::unsigned_object_id_type id, osmium::Location loc) {
+                int shard = id % NUM_SHARDS;
+                std::lock_guard<std::mutex> lock(mutexes[shard]);
+                shards[shard].set(id, loc);
+            }
 
-        osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
-            osmium::apply(buffer, handler);
-        }));
-        reader2.close();
-        close(fd);
-        std::remove(tmp_path.c_str());
-    }
+            osmium::Location get(osmium::unsigned_object_id_type id) const {
+                return shards[id % NUM_SHARDS].get(id);
+            }
 
-    std::cerr << "Done reading:" << std::endl;
-    std::cerr << "  " << handler.way_count() << " street ways" << std::endl;
-    std::cerr << "  " << addr_count_total << " address points ("
-              << handler.building_addr_count() << " from buildings)" << std::endl;
-    std::cerr << "  " << handler.interp_count() << " interpolation ways" << std::endl;
-    std::cerr << "  " << handler.admin_count() << " admin/postcode boundaries ("
-              << admin_polygons.size() << " polygon rings)" << std::endl;
+            // Batch set — caller holds no lock, we lock per-shard
+            void set_batch(const std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>>& batch) {
+                // Sort by shard to minimize lock switches
+                for (const auto& [id, loc] : batch) {
+                    int shard = id % NUM_SHARDS;
+                    std::lock_guard<std::mutex> lock(mutexes[shard]);
+                    shards[shard].set(id, loc);
+                }
+            }
+        } index;
 
-    if (kAdminOnly) {
-        std::cerr << "Admin-only mode: skipped streets, addresses, and interpolation" << std::endl;
-    }
-    if (kNoAddresses) {
-        std::cerr << "No-addresses mode: skipped address points and interpolation" << std::endl;
-    }
+        for (const auto& input_file : input_files) {
+            std::cerr << "Processing " << input_file << "..." << std::endl;
 
-    if (!kAdminOnly && !kNoAddresses) {
+            // --- Pass 1: collect relation members for multipolygon assembly ---
+            std::cerr << "  Pass 1: scanning relations..." << std::endl;
+
+            osmium::area::Assembler::config_type assembler_config;
+            osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
+
+            {
+                osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
+                osmium::apply(reader1, mp_manager);
+                reader1.close();
+                mp_manager.prepare_for_lookup();
+            }
+
+            // --- Pass 2: nodes (streaming parallel block processing) ---
+            std::cerr << "  Pass 2: processing nodes in parallel..." << std::endl;
+
+            {
+                // Producer-consumer: reader feeds blocks, workers process them
+                // Bounded queue prevents memory blowup
+                std::mutex queue_mutex;
+                std::condition_variable queue_cv;
+                std::deque<osmium::memory::Buffer> block_queue;
+                bool reader_done = false;
+                const size_t MAX_QUEUE = 64; // limit buffered blocks
+
+                struct NodeThreadLocal {
+                    std::vector<std::pair<double,double>> addr_coords;
+                    std::vector<std::pair<std::string,std::string>> addr_strings;
+                    uint64_t count = 0;
+                };
+                std::vector<NodeThreadLocal> ntld(num_threads);
+                std::atomic<uint64_t> blocks_done{0};
+
+                // Worker threads
+                std::vector<std::thread> node_workers;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    node_workers.emplace_back([&, t]() {
+                        auto& local = ntld[t];
+                        std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>> loc_batch;
+                        loc_batch.reserve(8192);
+
+                        while (true) {
+                            osmium::memory::Buffer block;
+                            {
+                                std::unique_lock<std::mutex> lock(queue_mutex);
+                                queue_cv.wait(lock, [&]{ return !block_queue.empty() || reader_done; });
+                                if (block_queue.empty() && reader_done) break;
+                                block = std::move(block_queue.front());
+                                block_queue.pop_front();
+                            }
+                            queue_cv.notify_one(); // wake reader if it was waiting
+
+                            for (const auto& item : block) {
+                                if (item.type() == osmium::item_type::node) {
+                                    const auto& node = static_cast<const osmium::Node&>(item);
+                                    if (!node.location().valid()) continue;
+                                    loc_batch.push_back({node.positive_id(), node.location()});
+
+                                    const char* housenumber = node.tags()["addr:housenumber"];
+                                    if (housenumber) {
+                                        const char* street = node.tags()["addr:street"];
+                                        if (street) {
+                                            local.addr_coords.push_back({node.location().lat(), node.location().lon()});
+                                            local.addr_strings.push_back({housenumber, street});
+                                            local.count++;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Flush location batch (sharded index handles its own locking)
+                            if (!loc_batch.empty()) {
+                                index.set_batch(loc_batch);
+                                loc_batch.clear();
+                            }
+
+                            uint64_t n = blocks_done.fetch_add(1) + 1;
+                            if (n % 1000 == 0) {
+                                std::cerr << "  Processed " << n << " node blocks..." << std::endl;
+                            }
+                        }
+
+                        // Flush remaining
+                        if (!loc_batch.empty()) {
+                            index.set_batch(loc_batch);
+                        }
+                    });
+                }
+
+                // Reader thread (producer)
+                {
+                    osmium::io::Reader reader_nodes{input_file, osmium::osm_entity_bits::node};
+                    while (auto buf = reader_nodes.read()) {
+                        {
+                            std::unique_lock<std::mutex> lock(queue_mutex);
+                            queue_cv.wait(lock, [&]{ return block_queue.size() < MAX_QUEUE; });
+                            block_queue.push_back(std::move(buf));
+                        }
+                        queue_cv.notify_one();
+                    }
+                    reader_nodes.close();
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        reader_done = true;
+                    }
+                    queue_cv.notify_all();
+                }
+
+                for (auto& w : node_workers) w.join();
+
+                // Merge address points
+                uint64_t total_addrs = 0;
+                for (auto& local : ntld) {
+                    for (size_t j = 0; j < local.addr_coords.size(); j++) {
+                        uint64_t dummy = 0;
+                        add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
+                                       local.addr_strings[j].first.c_str(),
+                                       local.addr_strings[j].second.c_str(), dummy);
+                    }
+                    total_addrs += local.count;
+                }
+                std::cerr << "  Node processing complete: " << total_addrs
+                          << " address points collected." << std::endl;
+            }
+
+            // --- Pass 3: ways + relations (parallel way processing) ---
+            std::cerr << "  Pass 3: processing ways and areas with " << num_threads
+                      << " threads..." << std::endl;
+
+            {
+                osmium::io::Reader reader_ways{input_file,
+                    osmium::osm_entity_bits::way | osmium::osm_entity_bits::relation};
+
+                // Thread-local data for parallel way processing
+                struct ThreadLocalData {
+                    std::vector<WayHeader> ways;
+                    std::vector<NodeCoord> street_nodes;
+                    std::vector<DeferredWay> deferred_ways;
+                    std::vector<InterpWay> interp_ways;
+                    std::vector<NodeCoord> interp_nodes;
+                    std::vector<DeferredInterp> deferred_interps;
+                    std::vector<AddrPoint> building_addrs;
+                    std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
+                    std::vector<std::string> interned_strings; // strings to intern later
+                    uint64_t way_count = 0;
+                    uint64_t building_addr_count = 0;
+                    uint64_t interp_count = 0;
+                };
+
+                // Read buffers and dispatch to thread pool
+                std::vector<osmium::memory::Buffer> buffer_queue;
+                osmium::memory::Buffer buf = reader_ways.read();
+                while (buf) {
+                    buffer_queue.push_back(std::move(buf));
+                    buf = reader_ways.read();
+                }
+                reader_ways.close();
+
+                std::cerr << "  Read " << buffer_queue.size() << " PBF blocks, processing in parallel..." << std::endl;
+
+                // Process way buffers in parallel
+                // Note: area/multipolygon processing must remain sequential due to mp_manager state
+                std::vector<ThreadLocalData> tld(num_threads);
+                std::atomic<size_t> block_idx{0};
+                std::atomic<uint64_t> blocks_done{0};
+                size_t total_blocks = buffer_queue.size();
+
+                std::vector<std::thread> workers;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    workers.emplace_back([&, t]() {
+                        auto& local = tld[t];
+                        while (true) {
+                            size_t i = block_idx.fetch_add(1);
+                            if (i >= total_blocks) break;
+
+                            auto& block = buffer_queue[i];
+                            for (const auto& item : block) {
+                                if (item.type() == osmium::item_type::way) {
+                                    const auto& way = static_cast<const osmium::Way&>(item);
+
+                                    // Resolve node locations (read-only from shared index)
+                                    // We need to check if nodes have valid locations
+                                    const auto& wnodes = way.nodes();
+
+                                    // Address interpolation
+                                    const char* interpolation = way.tags()["addr:interpolation"];
+                                    if (interpolation) {
+                                        if (wnodes.size() >= 2) {
+                                            bool all_valid = true;
+                                            for (const auto& nr : wnodes) {
+                                                try {
+                                                    auto loc = index.get(nr.positive_ref());
+                                                    if (!loc.valid()) { all_valid = false; break; }
+                                                } catch (...) { all_valid = false; break; }
+                                            }
+                                            if (all_valid) {
+                                                const char* street = way.tags()["addr:street"];
+                                                if (street) {
+                                                    uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
+                                                    uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
+
+                                                    for (const auto& nr : wnodes) {
+                                                        auto loc = index.get(nr.positive_ref());
+                                                        local.interp_nodes.push_back({
+                                                            static_cast<float>(loc.lat()),
+                                                            static_cast<float>(loc.lon())
+                                                        });
+                                                    }
+
+                                                    uint8_t interp_type = 0;
+                                                    if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
+                                                    else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
+
+                                                    InterpWay iw{};
+                                                    iw.node_offset = node_offset;
+                                                    iw.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
+                                                    iw.street_id = 0; // placeholder, intern later
+                                                    iw.start_number = 0;
+                                                    iw.end_number = 0;
+                                                    iw.interpolation = interp_type;
+                                                    local.interp_ways.push_back(iw);
+                                                    local.interned_strings.push_back(street);
+                                                    local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
+                                                    local.interp_count++;
+                                                }
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    // Building addresses
+                                    const char* housenumber = way.tags()["addr:housenumber"];
+                                    if (housenumber) {
+                                        const char* street = way.tags()["addr:street"];
+                                        if (street && !wnodes.empty()) {
+                                            double sum_lat = 0, sum_lng = 0;
+                                            int valid = 0;
+                                            for (const auto& nr : wnodes) {
+                                                try {
+                                                    auto loc = index.get(nr.positive_ref());
+                                                    if (loc.valid()) {
+                                                        sum_lat += loc.lat();
+                                                        sum_lng += loc.lon();
+                                                        valid++;
+                                                    }
+                                                } catch (...) {}
+                                            }
+                                            if (valid > 0) {
+                                                // Store coords for later S2 cell computation
+                                                local.building_addr_coords.push_back({sum_lat / valid, sum_lng / valid});
+                                                // Placeholder addr point — string IDs filled in during merge
+                                                local.building_addrs.push_back({
+                                                    static_cast<float>(sum_lat / valid),
+                                                    static_cast<float>(sum_lng / valid),
+                                                    0, 0 // placeholder string IDs
+                                                });
+                                                // Store strings for later interning
+                                                local.interned_strings.push_back(std::string(housenumber) + "\0" + std::string(street));
+                                                local.building_addr_count++;
+                                            }
+                                        }
+                                    }
+
+                                    // Highway ways
+                                    const char* highway = way.tags()["highway"];
+                                    if (highway && is_included_highway(highway)) {
+                                        const char* name = way.tags()["name"];
+                                        if (name && wnodes.size() >= 2) {
+                                            bool all_valid = true;
+                                            for (const auto& nr : wnodes) {
+                                                try {
+                                                    auto loc = index.get(nr.positive_ref());
+                                                    if (!loc.valid()) { all_valid = false; break; }
+                                                } catch (...) { all_valid = false; break; }
+                                            }
+                                            if (all_valid) {
+                                                uint32_t way_id = static_cast<uint32_t>(local.ways.size());
+                                                uint32_t node_offset = static_cast<uint32_t>(local.street_nodes.size());
+
+                                                for (const auto& nr : wnodes) {
+                                                    auto loc = index.get(nr.positive_ref());
+                                                    local.street_nodes.push_back({
+                                                        static_cast<float>(loc.lat()),
+                                                        static_cast<float>(loc.lon())
+                                                    });
+                                                }
+
+                                                WayHeader header{};
+                                                header.node_offset = node_offset;
+                                                header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
+                                                header.name_id = 0; // placeholder, intern later
+                                                local.ways.push_back(header);
+                                                local.interned_strings.push_back(name);
+                                                local.deferred_ways.push_back({way_id, node_offset, header.node_count});
+                                                local.way_count++;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            uint64_t done = blocks_done.fetch_add(1) + 1;
+                            if (done % 1000 == 0) {
+                                std::cerr << "  Processed " << done << "/" << total_blocks << " blocks..." << std::endl;
+                            }
+                        }
+                    });
+                }
+                for (auto& w : workers) w.join();
+                std::cerr << "  Parallel way processing complete." << std::endl;
+
+                // Process areas/multipolygons sequentially (mp_manager requires it)
+                // Use a custom location handler that reads from our sharded index
+                std::cerr << "  Processing multipolygon areas..." << std::endl;
+                {
+                    // Create a wrapper handler that resolves locations from sharded index
+                    struct ShardedLocationHandler : public osmium::handler::Handler {
+                        ShardedIndex& idx;
+                        explicit ShardedLocationHandler(ShardedIndex& i) : idx(i) {}
+                        void node(osmium::Node& node) {
+                            node.set_location(idx.get(node.positive_id()));
+                        }
+                        void way(osmium::Way& way) {
+                            for (auto& nr : way.nodes()) {
+                                nr.set_location(idx.get(nr.positive_ref()));
+                            }
+                        }
+                    } sharded_loc_handler{index};
+
+                    osmium::io::Reader reader_rels{input_file};
+                    osmium::apply(reader_rels, sharded_loc_handler,
+                        mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
+                            osmium::apply(buffer, handler);
+                        }));
+                    reader_rels.close();
+                }
+
+                // Merge thread-local way/interp data into main ParsedData
+                std::cerr << "  Merging thread-local data..." << std::endl;
+                uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
+                for (auto& local : tld) {
+                    uint32_t way_base = static_cast<uint32_t>(data.ways.size());
+                    uint32_t node_base = static_cast<uint32_t>(data.street_nodes.size());
+                    uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());
+                    uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
+
+                    // String interning index for this thread's data
+                    size_t str_idx = 0;
+
+                    // Merge street ways
+                    for (size_t i = 0; i < local.ways.size(); i++) {
+                        auto h = local.ways[i];
+                        h.node_offset += node_base;
+                        h.name_id = data.string_pool.intern(local.interned_strings[str_idx++]);
+                        data.ways.push_back(h);
+                    }
+                    data.street_nodes.insert(data.street_nodes.end(),
+                        local.street_nodes.begin(), local.street_nodes.end());
+
+                    // Remap deferred ways
+                    for (auto dw : local.deferred_ways) {
+                        dw.way_id += way_base;
+                        dw.node_offset += node_base;
+                        data.deferred_ways.push_back(dw);
+                    }
+
+                    // Merge building addresses
+                    for (size_t i = 0; i < local.building_addrs.size(); i++) {
+                        auto& s = local.interned_strings[str_idx++];
+                        auto sep = s.find('\0');
+                        std::string hn = s.substr(0, sep);
+                        std::string st = s.substr(sep + 1);
+                        uint64_t dummy = 0;
+                        add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
+                                       hn.c_str(), st.c_str(), dummy);
+                    }
+
+                    // Merge interpolation ways
+                    for (size_t i = 0; i < local.interp_ways.size(); i++) {
+                        auto iw = local.interp_ways[i];
+                        iw.node_offset += interp_node_base;
+                        iw.street_id = data.string_pool.intern(local.interned_strings[str_idx++]);
+                        data.interp_ways.push_back(iw);
+                    }
+                    data.interp_nodes.insert(data.interp_nodes.end(),
+                        local.interp_nodes.begin(), local.interp_nodes.end());
+
+                    // Remap deferred interps
+                    for (auto di : local.deferred_interps) {
+                        di.interp_id += interp_base;
+                        di.node_offset += interp_node_base;
+                        data.deferred_interps.push_back(di);
+                    }
+
+                    total_ways += local.way_count;
+                    total_building_addrs += local.building_addr_count;
+                    total_interps += local.interp_count;
+                }
+                std::cerr << "  Merged: " << total_ways << " ways, "
+                          << total_building_addrs << " building addrs, "
+                          << total_interps << " interps from parallel processing." << std::endl;
+            }
+        }
+
+        std::cerr << "Done reading:" << std::endl;
+        std::cerr << "  " << data.ways.size() << " street ways" << std::endl;
+        std::cerr << "  " << data.addr_points.size() << " address points" << std::endl;
+        std::cerr << "  " << data.interp_ways.size() << " interpolation ways" << std::endl;
+        std::cerr << "  " << data.admin_polygons.size() << " admin polygon rings" << std::endl;
+
+        // Drain admin polygon thread pool (may still be processing)
+        std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
+        auto admin_results = admin_pool.drain();
+        for (auto& [cell_id, ids] : admin_results) {
+            auto& target = data.cell_to_admin[cell_id];
+            target.insert(target.end(), ids.begin(), ids.end());
+        }
+        std::cerr << "Admin polygon S2 covering complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
+
+        // --- Parallel S2 cell computation for ways and interpolation ---
+        {
+            std::cerr << "Computing S2 cells for ways with " << num_threads << " threads..." << std::endl;
+
+            // Each thread builds its own local cell maps, then we merge
+            struct ThreadLocalMaps {
+                std::unordered_map<uint64_t, std::vector<uint32_t>> ways;
+                std::unordered_map<uint64_t, std::vector<uint32_t>> interps;
+            };
+            std::vector<ThreadLocalMaps> thread_maps(num_threads);
+
+            // Process streets in parallel
+            std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
+            {
+                std::atomic<size_t> way_idx{0};
+                std::vector<std::thread> threads;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    threads.emplace_back([&, t]() {
+                        auto& local = thread_maps[t].ways;
+                        while (true) {
+                            size_t i = way_idx.fetch_add(1);
+                            if (i >= data.deferred_ways.size()) break;
+                            const auto& dw = data.deferred_ways[i];
+                            std::unordered_set<uint64_t> cells;
+                            for (uint8_t j = 0; j + 1 < dw.node_count; j++) {
+                                const auto& n1 = data.street_nodes[dw.node_offset + j];
+                                const auto& n2 = data.street_nodes[dw.node_offset + j + 1];
+                                auto edge_cells = cover_edge(n1.lat, n1.lng, n2.lat, n2.lng);
+                                for (const auto& c : edge_cells) {
+                                    cells.insert(c.id());
+                                }
+                            }
+                            for (uint64_t cell_id : cells) {
+                                local[cell_id].push_back(dw.way_id);
+                            }
+                        }
+                    });
+                }
+                for (auto& t : threads) t.join();
+            }
+            std::cerr << "  Street ways done." << std::endl;
+
+            // Process interpolations in parallel
+            std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
+            {
+                std::atomic<size_t> interp_idx{0};
+                std::vector<std::thread> threads;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    threads.emplace_back([&, t]() {
+                        auto& local = thread_maps[t].interps;
+                        while (true) {
+                            size_t i = interp_idx.fetch_add(1);
+                            if (i >= data.deferred_interps.size()) break;
+                            const auto& di = data.deferred_interps[i];
+                            std::unordered_set<uint64_t> cells;
+                            for (uint8_t j = 0; j + 1 < di.node_count; j++) {
+                                const auto& n1 = data.interp_nodes[di.node_offset + j];
+                                const auto& n2 = data.interp_nodes[di.node_offset + j + 1];
+                                auto edge_cells = cover_edge(n1.lat, n1.lng, n2.lat, n2.lng);
+                                for (const auto& c : edge_cells) {
+                                    cells.insert(c.id());
+                                }
+                            }
+                            for (uint64_t cell_id : cells) {
+                                local[cell_id].push_back(di.interp_id);
+                            }
+                        }
+                    });
+                }
+                for (auto& t : threads) t.join();
+            }
+            std::cerr << "  Interpolation ways done." << std::endl;
+
+            // Merge thread-local maps into data
+            std::cerr << "  Merging thread-local results..." << std::endl;
+            for (auto& tm : thread_maps) {
+                for (auto& [cell_id, ids] : tm.ways) {
+                    auto& target = data.cell_to_ways[cell_id];
+                    target.insert(target.end(), ids.begin(), ids.end());
+                }
+                for (auto& [cell_id, ids] : tm.interps) {
+                    auto& target = data.cell_to_interps[cell_id];
+                    target.insert(target.end(), ids.begin(), ids.end());
+                }
+            }
+
+            // Free deferred work items
+            data.deferred_ways.clear();
+            data.deferred_ways.shrink_to_fit();
+            data.deferred_interps.clear();
+            data.deferred_interps.shrink_to_fit();
+
+            std::cerr << "S2 cell computation complete." << std::endl;
+        }
+
+        // Resolve interpolation endpoints
         std::cerr << "Resolving interpolation endpoints..." << std::endl;
-        resolve_interpolation_endpoints();
-    }
+        resolve_interpolation_endpoints(data);
 
-    std::cerr << "Deduplicating..." << std::endl;
-    if (!kAdminOnly) {
-        deduplicate(cell_to_ways);
-        if (!kNoAddresses) {
-            deduplicate(cell_to_addrs);
-            deduplicate(cell_to_interps);
+        // Deduplicate all cell maps (in parallel)
+        std::cerr << "Deduplicating..." << std::endl;
+        {
+            auto f1 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_ways); });
+            auto f2 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_addrs); });
+            auto f3 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_interps); });
+            auto f4 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_admin); });
+            f1.get(); f2.get(); f3.get(); f4.get();
+        }
+
+        // Save cache if requested
+        if (!save_cache_path.empty()) {
+            serialize_cache(data, save_cache_path);
         }
     }
-    deduplicate(cell_to_admin);
 
+    // --- Write index files ---
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
-    write_index(output_dir);
+
+    if (multi_output) {
+        // Write all 3 index modes in parallel (they read shared data, write to separate dirs)
+        auto wf1 = std::async(std::launch::async, [&]{ write_index(data, output_dir + "/full", IndexMode::Full); });
+        auto wf2 = std::async(std::launch::async, [&]{ write_index(data, output_dir + "/no-addresses", IndexMode::NoAddresses); });
+        auto wf3 = std::async(std::launch::async, [&]{ write_index(data, output_dir + "/admin-only", IndexMode::AdminOnly); });
+        wf1.get(); wf2.get(); wf3.get();
+    } else {
+        write_index(data, output_dir, mode);
+    }
+
+    if (generate_continents) {
+        // Process continents in parallel (each filters independently from shared data)
+        std::vector<std::future<void>> continent_futures;
+        std::mutex cerr_mutex;
+        for (const auto& continent : kContinents) {
+            continent_futures.push_back(std::async(std::launch::async, [&, continent]() {
+                {
+                    std::lock_guard<std::mutex> lock(cerr_mutex);
+                    std::cerr << "Filtering for continent: " << continent.name << "..." << std::endl;
+                }
+                auto subset = filter_by_bbox(data, continent);
+                std::string base = output_dir + "/" + continent.name;
+                ensure_dir(base);
+                if (multi_output) {
+                    // Write modes in parallel within each continent
+                    auto cf1 = std::async(std::launch::async, [&]{ write_index(subset, base + "/full", IndexMode::Full); });
+                    auto cf2 = std::async(std::launch::async, [&]{ write_index(subset, base + "/no-addresses", IndexMode::NoAddresses); });
+                    auto cf3 = std::async(std::launch::async, [&]{ write_index(subset, base + "/admin-only", IndexMode::AdminOnly); });
+                    cf1.get(); cf2.get(); cf3.get();
+                } else {
+                    write_index(subset, base, mode);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(cerr_mutex);
+                    std::cerr << "Done continent: " << continent.name << std::endl;
+                }
+            }));
+        }
+        for (auto& f : continent_futures) {
+            f.get();
+        }
+    }
 
     std::cerr << "Done." << std::endl;
     return 0;
