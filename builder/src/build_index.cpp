@@ -1544,7 +1544,7 @@ int main(int argc, char* argv[]) {
         // Dense array node location index — lockless parallel writes
         // Planet OSM node IDs max ~12.5 billion. 8 bytes per Location = 100GB virtual.
         // MAP_NORESERVE means OS only allocates pages on write (~80GB for 10B nodes).
-        static const size_t MAX_NODE_ID = 13000000000ULL;
+        static const size_t MAX_NODE_ID = 15000000000ULL;
         struct DenseIndex {
             osmium::Location* data;
             size_t capacity;
@@ -1569,15 +1569,24 @@ int main(int argc, char* argv[]) {
 
             // Lockless — each node ID maps to a unique array slot
             void set(osmium::unsigned_object_id_type id, osmium::Location loc) {
+                if (id >= capacity) {
+                    std::cerr << "FATAL: node ID " << id << " exceeds dense index capacity " << capacity << std::endl;
+                    std::exit(1);
+                }
                 data[id] = loc;
             }
 
             osmium::Location get(osmium::unsigned_object_id_type id) const {
+                if (id >= capacity) return osmium::Location{};
                 return data[id];
             }
 
             void set_batch(const std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>>& batch) {
                 for (const auto& [id, loc] : batch) {
+                    if (id >= capacity) {
+                        std::cerr << "FATAL: node ID " << id << " exceeds dense index capacity " << capacity << std::endl;
+                        std::exit(1);
+                    }
                     data[id] = loc;
                 }
             }
