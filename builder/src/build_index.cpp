@@ -94,7 +94,7 @@ private:
 
 // --- Collected data ---
 
-static StringPool strings;
+static StringPool string_pool;
 
 // Streets
 static std::vector<WayHeader> ways;
@@ -119,6 +119,9 @@ static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
 static int kStreetCellLevel = 17;
 static int kAdminCellLevel = 10;
+static bool kAdminOnly = false;
+static int kMaxAdminLevel = 0;  // 0 means no filtering
+static bool kNoAddresses = false;
 
 static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
     S2Point p1 = S2LatLng::FromDegrees(lat1, lng1).ToPoint();
@@ -346,8 +349,8 @@ static void add_addr_point(double lat, double lng, const char* housenumber, cons
     addr_points.push_back({
         static_cast<float>(lat),
         static_cast<float>(lng),
-        strings.intern(housenumber),
-        strings.intern(street)
+        string_pool.intern(housenumber),
+        string_pool.intern(street)
     });
 
     S2CellId cell = point_to_cell(lat, lng);
@@ -378,7 +381,7 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
     AdminPolygon poly{};
     poly.vertex_offset = vertex_offset;
     poly.vertex_count = static_cast<uint16_t>(std::min(simplified.size(), size_t(65535)));
-    poly.name_id = strings.intern(name);
+    poly.name_id = string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.area = polygon_area(simplified);
     poly.country_code = (country_code && country_code[0] && country_code[1])
@@ -399,6 +402,7 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
 class BuildHandler : public osmium::handler::Handler {
 public:
     void node(const osmium::Node& node) {
+        if (kAdminOnly || kNoAddresses) return;
         const char* housenumber = node.tags()["addr:housenumber"];
         if (!housenumber) return;
         const char* street = node.tags()["addr:street"];
@@ -409,19 +413,23 @@ public:
     }
 
     void way(const osmium::Way& way) {
-        // Address interpolation
-        const char* interpolation = way.tags()["addr:interpolation"];
-        if (interpolation) {
-            process_interpolation_way(way, interpolation);
-            return;
-        }
+        if (kAdminOnly) return;
 
-        // Building addresses
-        const char* housenumber = way.tags()["addr:housenumber"];
-        if (housenumber) {
-            const char* street = way.tags()["addr:street"];
-            if (street) {
-                process_building_address(way, housenumber, street);
+        if (!kNoAddresses) {
+            // Address interpolation
+            const char* interpolation = way.tags()["addr:interpolation"];
+            if (interpolation) {
+                process_interpolation_way(way, interpolation);
+                return;
+            }
+
+            // Building addresses
+            const char* housenumber = way.tags()["addr:housenumber"];
+            if (housenumber) {
+                const char* street = way.tags()["addr:street"];
+                if (street) {
+                    process_building_address(way, housenumber, street);
+                }
             }
         }
 
@@ -452,6 +460,7 @@ public:
         } else {
             admin_level = 11; // use 11 for postal codes
         }
+        if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) return;
 
         const char* name = area.tags()["name"];
         if (!name && is_admin) return;
@@ -547,7 +556,7 @@ private:
         InterpWay iw{};
         iw.node_offset = node_offset;
         iw.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-        iw.street_id = strings.intern(street);
+        iw.street_id = string_pool.intern(street);
         iw.start_number = 0;
         iw.end_number = 0;
         iw.interpolation = interp_type;
@@ -593,7 +602,7 @@ private:
         WayHeader header{};
         header.node_offset = node_offset;
         header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-        header.name_id = strings.intern(name);
+        header.name_id = string_pool.intern(name);
         ways.push_back(header);
 
         std::unordered_set<uint64_t> way_cells;
@@ -661,11 +670,11 @@ static void resolve_interpolation_endpoints() {
         auto it_end = addr_by_coord.find(end_key);
 
         if (it_start != addr_by_coord.end()) {
-            const char* hn = strings.data().data() + addr_points[it_start->second].housenumber_id;
+            const char* hn = string_pool.data().data() + addr_points[it_start->second].housenumber_id;
             iw.start_number = parse_house_number(hn);
         }
         if (it_end != addr_by_coord.end()) {
-            const char* hn = strings.data().data() + addr_points[it_end->second].housenumber_id;
+            const char* hn = string_pool.data().data() + addr_points[it_end->second].housenumber_id;
             iw.end_number = parse_house_number(hn);
         }
 
@@ -743,68 +752,81 @@ static void write_cell_index(
 // --- Write all index files ---
 
 static void write_index(const std::string& output_dir) {
-    // Merged geo cell index for streets, addresses, and interpolation
-    std::set<uint64_t> all_geo_cells;
-    for (const auto& [id, _] : cell_to_ways) all_geo_cells.insert(id);
-    for (const auto& [id, _] : cell_to_addrs) all_geo_cells.insert(id);
-    for (const auto& [id, _] : cell_to_interps) all_geo_cells.insert(id);
-    std::vector<uint64_t> sorted_geo_cells(all_geo_cells.begin(), all_geo_cells.end());
-
-    auto street_offsets = write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, cell_to_ways);
-    auto addr_offsets = write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, cell_to_addrs);
-    auto interp_offsets = write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, cell_to_interps);
-
-    {
-        std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
-        for (uint64_t cell_id : sorted_geo_cells) {
-            f.write(reinterpret_cast<const char*>(&cell_id), sizeof(cell_id));
-            auto write_offset = [&](const std::unordered_map<uint64_t, uint32_t>& offsets) {
-                auto it = offsets.find(cell_id);
-                uint32_t offset = (it != offsets.end()) ? it->second : NO_DATA;
-                f.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
-            };
-            write_offset(street_offsets);
-            write_offset(addr_offsets);
-            write_offset(interp_offsets);
+    if (!kAdminOnly) {
+        // Merged geo cell index for streets, addresses, and interpolation
+        std::set<uint64_t> all_geo_cells;
+        for (const auto& [id, _] : cell_to_ways) all_geo_cells.insert(id);
+        if (!kNoAddresses) {
+            for (const auto& [id, _] : cell_to_addrs) all_geo_cells.insert(id);
+            for (const auto& [id, _] : cell_to_interps) all_geo_cells.insert(id);
         }
-    }
+        std::vector<uint64_t> sorted_geo_cells(all_geo_cells.begin(), all_geo_cells.end());
 
-    std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
-              << ways.size() << " ways, "
-              << addr_points.size() << " addrs, "
-              << interp_ways.size() << " interps)" << std::endl;
+        auto street_offsets = write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, cell_to_ways);
+
+        std::unordered_map<uint64_t, uint32_t> addr_offsets;
+        std::unordered_map<uint64_t, uint32_t> interp_offsets;
+        if (!kNoAddresses) {
+            addr_offsets = write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, cell_to_addrs);
+            interp_offsets = write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, cell_to_interps);
+        }
+
+        {
+            std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
+            for (uint64_t cell_id : sorted_geo_cells) {
+                f.write(reinterpret_cast<const char*>(&cell_id), sizeof(cell_id));
+                auto write_offset = [&](const std::unordered_map<uint64_t, uint32_t>& offsets) {
+                    auto it = offsets.find(cell_id);
+                    uint32_t offset = (it != offsets.end()) ? it->second : NO_DATA;
+                    f.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
+                };
+                write_offset(street_offsets);
+                write_offset(addr_offsets);
+                write_offset(interp_offsets);
+            }
+        }
+
+        std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
+                  << ways.size() << " ways, "
+                  << addr_points.size() << " addrs, "
+                  << interp_ways.size() << " interps)" << std::endl;
+    }
 
     write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
     std::cerr << "admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
 
-    // Street ways
-    {
-        std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(ways.data()), ways.size() * sizeof(WayHeader));
-    }
+    if (!kAdminOnly) {
+        // Street ways
+        {
+            std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(ways.data()), ways.size() * sizeof(WayHeader));
+        }
 
-    // Street nodes
-    {
-        std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(street_nodes.data()), street_nodes.size() * sizeof(NodeCoord));
-    }
+        // Street nodes
+        {
+            std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(street_nodes.data()), street_nodes.size() * sizeof(NodeCoord));
+        }
 
-    // Address points
-    {
-        std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(addr_points.data()), addr_points.size() * sizeof(AddrPoint));
-    }
+        if (!kNoAddresses) {
+            // Address points
+            {
+                std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(addr_points.data()), addr_points.size() * sizeof(AddrPoint));
+            }
 
-    // Interpolation ways
-    {
-        std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(interp_ways.data()), interp_ways.size() * sizeof(InterpWay));
-    }
+            // Interpolation ways
+            {
+                std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(interp_ways.data()), interp_ways.size() * sizeof(InterpWay));
+            }
 
-    // Interpolation nodes
-    {
-        std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(interp_nodes.data()), interp_nodes.size() * sizeof(NodeCoord));
+            // Interpolation nodes
+            {
+                std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(interp_nodes.data()), interp_nodes.size() * sizeof(NodeCoord));
+            }
+        }
     }
 
     // Admin polygons
@@ -822,8 +844,8 @@ static void write_index(const std::string& output_dir) {
     // Strings
     {
         std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
-        f.write(strings.data().data(), strings.data().size());
-        std::cerr << "strings.bin: " << strings.data().size() << " bytes" << std::endl;
+        f.write(string_pool.data().data(), string_pool.data().size());
+        std::cerr << "strings.bin: " << string_pool.data().size() << " bytes" << std::endl;
     }
 
 
@@ -833,7 +855,7 @@ static void write_index(const std::string& output_dir) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N]" << std::endl;
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--admin-only] [--no-addresses] [--max-admin-level N]" << std::endl;
         return 1;
     }
 
@@ -845,6 +867,12 @@ int main(int argc, char* argv[]) {
             kStreetCellLevel = std::atoi(argv[++i]);
         } else if (arg == "--admin-level" && i + 1 < argc) {
             kAdminCellLevel = std::atoi(argv[++i]);
+        } else if (arg == "--admin-only") {
+            kAdminOnly = true;
+        } else if (arg == "--no-addresses") {
+            kNoAddresses = true;
+        } else if (arg == "--max-admin-level" && i + 1 < argc) {
+            kMaxAdminLevel = std::atoi(argv[++i]);
         } else {
             input_files.push_back(arg);
         }
@@ -898,13 +926,26 @@ int main(int argc, char* argv[]) {
     std::cerr << "  " << handler.admin_count() << " admin/postcode boundaries ("
               << admin_polygons.size() << " polygon rings)" << std::endl;
 
-    std::cerr << "Resolving interpolation endpoints..." << std::endl;
-    resolve_interpolation_endpoints();
+    if (kAdminOnly) {
+        std::cerr << "Admin-only mode: skipped streets, addresses, and interpolation" << std::endl;
+    }
+    if (kNoAddresses) {
+        std::cerr << "No-addresses mode: skipped address points and interpolation" << std::endl;
+    }
+
+    if (!kAdminOnly && !kNoAddresses) {
+        std::cerr << "Resolving interpolation endpoints..." << std::endl;
+        resolve_interpolation_endpoints();
+    }
 
     std::cerr << "Deduplicating..." << std::endl;
-    deduplicate(cell_to_ways);
-    deduplicate(cell_to_addrs);
-    deduplicate(cell_to_interps);
+    if (!kAdminOnly) {
+        deduplicate(cell_to_ways);
+        if (!kNoAddresses) {
+            deduplicate(cell_to_addrs);
+            deduplicate(cell_to_interps);
+        }
+    }
     deduplicate(cell_to_admin);
 
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
