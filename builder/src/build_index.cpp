@@ -125,6 +125,16 @@ struct DeferredInterp {
     uint8_t node_count;
 };
 
+// Collected relation data for parallel admin assembly
+struct CollectedRelation {
+    int64_t id;
+    uint8_t admin_level;
+    std::string name;
+    std::string country_code;
+    bool is_postal;
+    std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
+};
+
 // Forward declaration
 static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices);
 
@@ -244,6 +254,10 @@ struct ParsedData {
     // Deferred work for parallel S2 computation (ways + interps)
     std::vector<DeferredWay> deferred_ways;
     std::vector<DeferredInterp> deferred_interps;
+
+    // Collected data for parallel admin assembly
+    std::vector<CollectedRelation> collected_relations;
+    std::unordered_map<int64_t, std::vector<std::pair<double,double>>> way_geometries;
 };
 
 // --- S2 helpers ---
@@ -442,6 +456,93 @@ static std::vector<std::pair<double,double>> simplify_polygon(
         if (keep[i]) result.push_back(pts[i]);
     }
     return result;
+}
+
+// --- Parallel admin: assemble outer rings from collected way geometries ---
+
+static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
+    const std::vector<std::pair<int64_t, std::string>>& members,
+    const std::unordered_map<int64_t, std::vector<std::pair<double,double>>>& way_geoms)
+{
+    static constexpr double COORD_TOLERANCE = 1e-7;
+
+    auto coords_equal = [](const std::pair<double,double>& a,
+                           const std::pair<double,double>& b) {
+        return std::fabs(a.first - b.first) < COORD_TOLERANCE &&
+               std::fabs(a.second - b.second) < COORD_TOLERANCE;
+    };
+
+    // Collect indices of members with role "outer" or empty role
+    struct WayRef {
+        int64_t way_id;
+        const std::vector<std::pair<double,double>>* geom;
+        bool used;
+    };
+    std::vector<WayRef> outer_ways;
+    for (const auto& [way_id, role] : members) {
+        if (role == "outer" || role.empty()) {
+            auto it = way_geoms.find(way_id);
+            if (it != way_geoms.end() && !it->second.empty()) {
+                outer_ways.push_back({way_id, &it->second, false});
+            }
+        }
+    }
+
+    std::vector<std::vector<std::pair<double,double>>> rings;
+
+    for (size_t start_idx = 0; start_idx < outer_ways.size(); start_idx++) {
+        if (outer_ways[start_idx].used) continue;
+
+        // Start a new ring with this way
+        outer_ways[start_idx].used = true;
+        std::vector<std::pair<double,double>> ring = *outer_ways[start_idx].geom;
+
+        // Try to extend the ring until it closes or we can't find a match
+        bool extended = true;
+        while (extended) {
+            extended = false;
+
+            // Check if ring is closed
+            if (ring.size() >= 4 && coords_equal(ring.front(), ring.back())) {
+                break; // Ring is closed
+            }
+
+            const auto& ring_end = ring.back();
+
+            for (size_t ci = 0; ci < outer_ways.size(); ci++) {
+                if (outer_ways[ci].used) continue;
+                const auto& candidate = *outer_ways[ci].geom;
+                if (candidate.empty()) continue;
+
+                // Try forward: candidate's first node matches ring's last node
+                if (coords_equal(candidate.front(), ring_end)) {
+                    outer_ways[ci].used = true;
+                    // Append candidate (skip first node to avoid duplicate)
+                    ring.insert(ring.end(), candidate.begin() + 1, candidate.end());
+                    extended = true;
+                    break;
+                }
+
+                // Try reversed: candidate's last node matches ring's last node
+                if (coords_equal(candidate.back(), ring_end)) {
+                    outer_ways[ci].used = true;
+                    // Append candidate in reverse (skip first = last of reversed to avoid duplicate)
+                    for (auto rit = candidate.rbegin() + 1; rit != candidate.rend(); ++rit) {
+                        ring.push_back(*rit);
+                    }
+                    extended = true;
+                    break;
+                }
+            }
+        }
+
+        // Only keep closed rings with at least 3 unique vertices
+        if (ring.size() >= 4 && coords_equal(ring.front(), ring.back())) {
+            rings.push_back(std::move(ring));
+        }
+    }
+
+    return rings;
 }
 
 // --- Highway filter ---
@@ -733,6 +834,73 @@ private:
         way_count_++;
         if (way_count_ % 1000000 == 0) {
             std::cerr << "Collected " << way_count_ / 1000000 << "M street ways..." << std::endl;
+        }
+    }
+};
+
+// --- Relation collector for parallel admin assembly (runs during pass 1) ---
+
+struct RelationCollector : public osmium::handler::Handler {
+    std::vector<CollectedRelation>& relations;
+
+    explicit RelationCollector(std::vector<CollectedRelation>& r) : relations(r) {}
+
+    void relation(const osmium::Relation& rel) {
+        const char* boundary = rel.tags()["boundary"];
+        if (!boundary) return;
+
+        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
+        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
+        if (!is_admin && !is_postal) return;
+
+        uint8_t admin_level = 0;
+        if (is_admin) {
+            const char* level_str = rel.tags()["admin_level"];
+            if (!level_str) return;
+            admin_level = static_cast<uint8_t>(std::atoi(level_str));
+            if (admin_level < 2 || admin_level > 10) return;
+        } else {
+            admin_level = 11; // use 11 for postal codes
+        }
+        if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) return;
+
+        const char* name = rel.tags()["name"];
+        if (!name && is_admin) return;
+
+        // For postal codes, use postal_code tag as name
+        std::string name_str;
+        if (is_postal) {
+            const char* postal_code = rel.tags()["postal_code"];
+            if (!postal_code) postal_code = name;
+            if (!postal_code) return;
+            name_str = postal_code;
+        } else {
+            name_str = name;
+        }
+
+        // Extract country code for level 2 boundaries
+        std::string country_code;
+        if (admin_level == 2) {
+            const char* cc = rel.tags()["ISO3166-1:alpha2"];
+            if (cc) country_code = cc;
+        }
+
+        // Collect member way IDs and roles
+        CollectedRelation cr;
+        cr.id = rel.id();
+        cr.admin_level = admin_level;
+        cr.name = std::move(name_str);
+        cr.country_code = std::move(country_code);
+        cr.is_postal = is_postal;
+
+        for (const auto& member : rel.members()) {
+            if (member.type() == osmium::item_type::way) {
+                cr.members.emplace_back(member.ref(), member.role());
+            }
+        }
+
+        if (!cr.members.empty()) {
+            relations.push_back(std::move(cr));
         }
     }
 };
@@ -1472,6 +1640,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
         std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
         std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
+        std::cerr << "  --parallel-admin       Use parallel admin boundary assembly (default: on)" << std::endl;
+        std::cerr << "  --no-parallel-admin    Disable parallel admin assembly (use osmium fallback)" << std::endl;
         return 1;
     }
 
@@ -1481,6 +1651,7 @@ int main(int argc, char* argv[]) {
     std::string load_cache_path;
     bool multi_output = false;
     bool generate_continents = false;
+    bool parallel_admin = true;
     IndexMode mode = IndexMode::Full;
 
     for (int i = 2; i < argc; i++) {
@@ -1503,6 +1674,10 @@ int main(int argc, char* argv[]) {
             multi_output = true;
         } else if (arg == "--continents") {
             generate_continents = true;
+        } else if (arg == "--parallel-admin") {
+            parallel_admin = true;
+        } else if (arg == "--no-parallel-admin") {
+            parallel_admin = false;
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "full") {
@@ -1601,11 +1776,23 @@ int main(int argc, char* argv[]) {
             osmium::area::Assembler::config_type assembler_config;
             osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
 
+            // Also collect admin/postal relation metadata for parallel assembly
+            RelationCollector rel_collector(data.collected_relations);
+
             {
                 osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
-                osmium::apply(reader1, mp_manager);
+                if (parallel_admin) {
+                    // Run both: mp_manager (for fallback compatibility) and rel_collector
+                    osmium::apply(reader1, mp_manager, rel_collector);
+                } else {
+                    osmium::apply(reader1, mp_manager);
+                }
                 reader1.close();
                 mp_manager.prepare_for_lookup();
+            }
+            if (parallel_admin) {
+                std::cerr << "  Collected " << data.collected_relations.size()
+                          << " admin/postal relations for parallel assembly." << std::endl;
             }
 
             // --- Pass 2: nodes (streaming parallel block processing) ---
@@ -1742,6 +1929,8 @@ int main(int argc, char* argv[]) {
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
                     uint64_t interp_count = 0;
+                    // Way geometries for parallel admin assembly
+                    std::vector<std::pair<int64_t, std::vector<std::pair<double,double>>>> way_geoms;
                 };
 
                 // Read buffers and dispatch to thread pool
@@ -1892,6 +2081,20 @@ int main(int argc, char* argv[]) {
                                             }
                                         }
                                     }
+
+                                    // Store way geometry for parallel admin assembly
+                                    if (parallel_admin && !wnodes.empty()) {
+                                        std::vector<std::pair<double,double>> geom;
+                                        for (const auto& nr : wnodes) {
+                                            try {
+                                                auto loc = index.get(nr.positive_ref());
+                                                if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
+                                            } catch (...) {}
+                                        }
+                                        if (!geom.empty()) {
+                                            local.way_geoms.push_back({way.id(), std::move(geom)});
+                                        }
+                                    }
                                 }
                             }
 
@@ -1924,30 +2127,31 @@ int main(int argc, char* argv[]) {
                 for (auto& w : workers) w.join();
                 std::cerr << "  Parallel way processing complete." << std::endl;
 
-                // Process areas/multipolygons sequentially (mp_manager requires it)
-                // Use a custom location handler that reads from our sharded index
-                std::cerr << "  Processing multipolygon areas..." << std::endl;
-                {
-                    // Create a wrapper handler that resolves locations from sharded index
-                    struct DenseLocationHandler : public osmium::handler::Handler {
-                        DenseIndex& idx;
-                        explicit DenseLocationHandler(DenseIndex& i) : idx(i) {}
-                        void node(osmium::Node& node) {
-                            node.set_location(idx.get(node.positive_id()));
-                        }
-                        void way(osmium::Way& way) {
-                            for (auto& nr : way.nodes()) {
-                                nr.set_location(idx.get(nr.positive_ref()));
+                // Process areas/multipolygons — sequential fallback path
+                if (!parallel_admin) {
+                    // Use a custom location handler that reads from our dense index
+                    std::cerr << "  Processing multipolygon areas (sequential)..." << std::endl;
+                    {
+                        struct DenseLocationHandler : public osmium::handler::Handler {
+                            DenseIndex& idx;
+                            explicit DenseLocationHandler(DenseIndex& i) : idx(i) {}
+                            void node(osmium::Node& node) {
+                                node.set_location(idx.get(node.positive_id()));
                             }
-                        }
-                    } dense_loc_handler{index};
+                            void way(osmium::Way& way) {
+                                for (auto& nr : way.nodes()) {
+                                    nr.set_location(idx.get(nr.positive_ref()));
+                                }
+                            }
+                        } dense_loc_handler{index};
 
-                    osmium::io::Reader reader_rels{input_file};
-                    osmium::apply(reader_rels, dense_loc_handler,
-                        mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
-                            osmium::apply(buffer, handler);
-                        }));
-                    reader_rels.close();
+                        osmium::io::Reader reader_rels{input_file};
+                        osmium::apply(reader_rels, dense_loc_handler,
+                            mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
+                                osmium::apply(buffer, handler);
+                            }));
+                        reader_rels.close();
+                    }
                 }
 
                 // Merge thread-local way/interp data into main ParsedData
@@ -2010,10 +2214,91 @@ int main(int argc, char* argv[]) {
                     total_ways += local.way_count;
                     total_building_addrs += local.building_addr_count;
                     total_interps += local.interp_count;
+
+                    // Merge way geometries for parallel admin assembly
+                    if (parallel_admin) {
+                        for (auto& [wid, geom] : local.way_geoms) {
+                            data.way_geometries[wid] = std::move(geom);
+                        }
+                        local.way_geoms.clear();
+                        local.way_geoms.shrink_to_fit();
+                    }
                 }
                 std::cerr << "  Merged: " << total_ways << " ways, "
                           << total_building_addrs << " building addrs, "
                           << total_interps << " interps from parallel processing." << std::endl;
+
+                // --- Parallel admin boundary assembly ---
+                if (parallel_admin) {
+                    std::cerr << "  Assembling admin polygons in parallel ("
+                              << data.collected_relations.size() << " relations, "
+                              << data.way_geometries.size() << " way geometries)..." << std::endl;
+
+                    // Thread-local admin results (to avoid locking add_admin_polygon)
+                    struct AdminResult {
+                        std::vector<std::pair<double,double>> vertices;
+                        std::string name;
+                        uint8_t admin_level;
+                        std::string country_code;
+                    };
+
+                    std::vector<std::vector<AdminResult>> thread_admin_results(num_threads);
+                    std::atomic<size_t> rel_idx{0};
+                    std::atomic<uint64_t> assembled_count{0};
+
+                    std::vector<std::thread> admin_workers;
+                    for (unsigned int t = 0; t < num_threads; t++) {
+                        admin_workers.emplace_back([&, t]() {
+                            auto& local_results = thread_admin_results[t];
+                            while (true) {
+                                size_t i = rel_idx.fetch_add(1);
+                                if (i >= data.collected_relations.size()) break;
+
+                                const auto& rel = data.collected_relations[i];
+                                auto rings = assemble_outer_rings(rel.members, data.way_geometries);
+
+                                for (auto& ring : rings) {
+                                    if (ring.size() >= 3) {
+                                        AdminResult ar;
+                                        ar.vertices = std::move(ring);
+                                        ar.name = rel.name;
+                                        ar.admin_level = rel.admin_level;
+                                        ar.country_code = rel.country_code;
+                                        local_results.push_back(std::move(ar));
+                                    }
+                                }
+
+                                uint64_t done = assembled_count.fetch_add(1) + 1;
+                                if (done % 10000 == 0) {
+                                    std::cerr << "  Assembled " << done / 1000
+                                              << "K admin relations..." << std::endl;
+                                }
+                            }
+                        });
+                    }
+                    for (auto& w : admin_workers) w.join();
+
+                    // Merge thread-local admin results into ParsedData (sequential, thread-safe)
+                    uint64_t total_admin_rings = 0;
+                    for (auto& local_results : thread_admin_results) {
+                        for (auto& ar : local_results) {
+                            const char* cc = ar.country_code.empty() ? nullptr : ar.country_code.c_str();
+                            add_admin_polygon(data, ar.vertices, ar.name.c_str(),
+                                              ar.admin_level, cc, &admin_pool);
+                            total_admin_rings++;
+                        }
+                    }
+                    std::cerr << "  Parallel admin assembly complete: "
+                              << total_admin_rings << " polygon rings from "
+                              << data.collected_relations.size() << " relations." << std::endl;
+
+                    // Free collected data
+                    data.collected_relations.clear();
+                    data.collected_relations.shrink_to_fit();
+                    data.way_geometries.clear();
+                    // Note: way_geometries uses unordered_map, shrink via swap
+                    std::unordered_map<int64_t, std::vector<std::pair<double,double>>>().swap(data.way_geometries);
+                }
             }
         }
 
