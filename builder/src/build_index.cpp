@@ -493,6 +493,37 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         node_to_ways[g->last_node_id].push_back({i, true});
     }
 
+    // Build coordinate-based fallback adjacency for split/replaced nodes
+    // Key: rounded lat,lng pair → list of node IDs at that location
+    auto coord_key = [](double lat, double lng) -> int64_t {
+        // Round to ~1cm precision to match identical coordinates
+        int32_t ilat = static_cast<int32_t>(lat * 1e7 + (lat >= 0 ? 0.5 : -0.5));
+        int32_t ilng = static_cast<int32_t>(lng * 1e7 + (lng >= 0 ? 0.5 : -0.5));
+        return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
+    };
+    std::unordered_map<int64_t, std::vector<int64_t>> coord_to_nids;
+    for (size_t i = 0; i < outer_ways.size(); i++) {
+        const auto* g = outer_ways[i].geom;
+        if (!g->coords.empty()) {
+            auto& first = g->coords.front();
+            auto& last = g->coords.back();
+            coord_to_nids[coord_key(first.first, first.second)].push_back(g->first_node_id);
+            coord_to_nids[coord_key(last.first, last.second)].push_back(g->last_node_id);
+        }
+    }
+    // Map node IDs that share coordinates (split/replaced nodes)
+    std::unordered_map<int64_t, std::vector<int64_t>> nid_aliases;
+    for (auto& [ck, nids] : coord_to_nids) {
+        if (nids.size() <= 1) continue;
+        // Deduplicate
+        std::sort(nids.begin(), nids.end());
+        nids.erase(std::unique(nids.begin(), nids.end()), nids.end());
+        if (nids.size() <= 1) continue;
+        for (auto nid : nids) {
+            nid_aliases[nid] = nids;
+        }
+    }
+
     std::vector<bool> used(outer_ways.size(), false);
     std::vector<std::vector<std::pair<double,double>>> rings;
 
@@ -501,25 +532,56 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         const std::vector<WayRef>& ways;
         const std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>>& adj;
         std::vector<bool>& used;
+        const std::unordered_map<int64_t, std::vector<int64_t>>& aliases;
+
+        // Check if two node IDs match (directly or via coordinate alias)
+        bool nids_match(int64_t a, int64_t b) const {
+            if (a == b) return true;
+            auto it = aliases.find(a);
+            if (it != aliases.end()) {
+                for (auto alias : it->second) {
+                    if (alias == b) return true;
+                }
+            }
+            return false;
+        }
+
+        // Collect all adjacent way candidates for a node ID (including aliases)
+        void get_candidates(int64_t nid, std::vector<std::pair<size_t, bool>>& out) const {
+            out.clear();
+            auto it = adj.find(nid);
+            if (it != adj.end()) {
+                out.insert(out.end(), it->second.begin(), it->second.end());
+            }
+            // Also check aliases
+            auto ait = aliases.find(nid);
+            if (ait != aliases.end()) {
+                for (auto alias : ait->second) {
+                    if (alias == nid) continue;
+                    auto it2 = adj.find(alias);
+                    if (it2 != adj.end()) {
+                        out.insert(out.end(), it2->second.begin(), it2->second.end());
+                    }
+                }
+            }
+        }
 
         // Try to close a ring from ring_last_nid back to ring_first_nid
-        // path = ordered list of (way_index, reversed) already chosen
         bool try_close(int64_t ring_first_nid, int64_t ring_last_nid,
                        std::vector<std::pair<size_t, bool>>& path, int depth) {
             if (depth > 5000) return false;
 
             // Closed?
-            if (ring_first_nid == ring_last_nid && !path.empty()) return true;
+            if (!path.empty() && nids_match(ring_first_nid, ring_last_nid)) return true;
 
-            // Find candidates adjacent to ring_last_nid
-            auto it = adj.find(ring_last_nid);
-            if (it == adj.end()) return false;
+            // Find candidates adjacent to ring_last_nid (including aliases)
+            std::vector<std::pair<size_t, bool>> candidates;
+            get_candidates(ring_last_nid, candidates);
 
-            for (const auto& [wi, is_last] : it->second) {
+            for (const auto& [wi, is_last] : candidates) {
                 if (used[wi]) continue;
                 const auto* g = ways[wi].geom;
 
-                // If is_last, this way's last_node matches ring_last, so traverse reversed
                 bool reversed = is_last;
                 int64_t new_last = reversed ? g->first_node_id : g->last_node_id;
 
@@ -537,7 +599,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         }
     };
 
-    BacktrackState state{outer_ways, node_to_ways, used};
+    BacktrackState state{outer_ways, node_to_ways, used, nid_aliases};
 
     for (size_t start_idx = 0; start_idx < outer_ways.size(); start_idx++) {
         if (used[start_idx]) continue;
@@ -546,8 +608,17 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         int64_t ring_first_nid = start_geom->first_node_id;
         int64_t ring_last_nid = start_geom->last_node_id;
 
-        // Single way already closed
-        if (start_geom->coords.size() >= 4 && ring_first_nid == ring_last_nid) {
+        // Single way already closed (by node ID or coordinate alias)
+        bool self_closed = (ring_first_nid == ring_last_nid);
+        if (!self_closed) {
+            auto ait = nid_aliases.find(ring_first_nid);
+            if (ait != nid_aliases.end()) {
+                for (auto alias : ait->second) {
+                    if (alias == ring_last_nid) { self_closed = true; break; }
+                }
+            }
+        }
+        if (start_geom->coords.size() >= 4 && self_closed) {
             used[start_idx] = true;
             rings.push_back(start_geom->coords);
             continue;
@@ -2323,6 +2394,41 @@ int main(int argc, char* argv[]) {
 
                                 const auto& rel = data.collected_relations[i];
                                 auto rings = assemble_outer_rings(rel.members, data.way_geometries);
+
+                                // Diagnostic: log relations with 0 rings produced
+                                if (rings.empty() && !rel.members.empty()) {
+                                    int total_outer = 0, found = 0, missing = 0;
+                                    for (const auto& [way_id, role] : rel.members) {
+                                        if (role == "outer" || role.empty()) {
+                                            total_outer++;
+                                            auto it = data.way_geometries.find(way_id);
+                                            if (it != data.way_geometries.end() && !it->second.coords.empty()) {
+                                                found++;
+                                            } else {
+                                                missing++;
+                                            }
+                                        }
+                                    }
+                                    if (missing == 0 && found > 0) {
+                                        // All ways found but no ring — dump node IDs
+                                        std::string detail = "  DEBUG '" + rel.name + "': ways:";
+                                        for (const auto& [way_id, role] : rel.members) {
+                                            if (role != "outer" && !role.empty()) continue;
+                                            auto it = data.way_geometries.find(way_id);
+                                            if (it == data.way_geometries.end()) continue;
+                                            detail += " [w" + std::to_string(way_id) +
+                                                      " first=" + std::to_string(it->second.first_node_id) +
+                                                      " last=" + std::to_string(it->second.last_node_id) +
+                                                      " n=" + std::to_string(it->second.coords.size()) + "]";
+                                        }
+                                        std::cerr << detail << std::endl;
+                                    }
+                                    std::cerr << "  WARN: relation '" << rel.name
+                                              << "' (level " << (int)rel.admin_level
+                                              << ", " << rel.members.size() << " members): "
+                                              << "0 rings from " << total_outer << " outer ways ("
+                                              << found << " found, " << missing << " missing)" << std::endl;
+                                }
 
                                 for (auto& ring : rings) {
                                     if (ring.size() >= 3) {
