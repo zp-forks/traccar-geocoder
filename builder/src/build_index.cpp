@@ -2220,7 +2220,8 @@ int main(int argc, char* argv[]) {
                                     }
 
                                     // Handle closed ways that are admin boundaries themselves
-                                    // (not part of a multipolygon relation, but standalone polygons)
+                                    // Osmium creates areas from closed ways independently of
+                                    // multipolygon relations, even if the way is a relation member.
                                     if (parallel_admin) {
                                         const char* boundary = way.tags()["boundary"];
                                         if (boundary) {
@@ -2236,10 +2237,20 @@ int main(int argc, char* argv[]) {
                                                 } else {
                                                     al = 11;
                                                 }
-                                                if (al >= 2 && al <= 11 && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
+                                                int max_al = is_postal ? 11 : 10;
+                                                if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
                                                     const char* aname = way.tags()["name"];
-                                                    if (!aname && is_postal) aname = way.tags()["postal_code"];
-                                                    if (aname || is_postal) {
+                                                    if (!aname && is_admin) continue; // admin needs name
+                                                    std::string name_str;
+                                                    if (is_postal) {
+                                                        const char* pc = way.tags()["postal_code"];
+                                                        if (!pc) pc = aname;
+                                                        if (!pc) continue; // postal needs postal_code or name
+                                                        name_str = pc;
+                                                    } else {
+                                                        name_str = aname;
+                                                    }
+                                                    {
                                                         std::vector<std::pair<double,double>> verts;
                                                         bool all_valid = true;
                                                         for (const auto& nr : wnodes) {
@@ -2258,7 +2269,7 @@ int main(int argc, char* argv[]) {
                                                             }
                                                             local.closed_way_admins.push_back({
                                                                 std::move(verts),
-                                                                aname ? aname : "",
+                                                                std::move(name_str),
                                                                 al, std::move(cc)
                                                             });
                                                         }
@@ -2443,6 +2454,24 @@ int main(int argc, char* argv[]) {
                                 if (i >= data.collected_relations.size()) break;
 
                                 const auto& rel = data.collected_relations[i];
+
+                                // Skip relations with missing outer member ways —
+                                // these cross the extract boundary and would produce
+                                // incorrect partial polygons
+                                bool has_missing = false;
+                                for (const auto& [way_id, role] : rel.members) {
+                                    if (role == "outer" || role.empty()) {
+                                        if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
+                                            has_missing = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (has_missing) {
+                                    assembled_count.fetch_add(1);
+                                    continue;
+                                }
+
                                 auto rings = assemble_outer_rings(rel.members, data.way_geometries);
 
                                 // Diagnostic: log relations with 0 rings produced
