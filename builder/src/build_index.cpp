@@ -463,6 +463,45 @@ static std::vector<std::pair<double,double>> simplify_polygon(
     return result;
 }
 
+// --- Ring self-intersection check (matches osmium's segment crossing detection) ---
+
+static bool segments_intersect(double ax1, double ay1, double ax2, double ay2,
+                                double bx1, double by1, double bx2, double by2) {
+    // Check if segment (a1,a2) crosses segment (b1,b2)
+    // Using cross product orientation test
+    auto cross = [](double ox, double oy, double ax, double ay, double bx, double by) -> double {
+        return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
+    };
+    double d1 = cross(bx1, by1, bx2, by2, ax1, ay1);
+    double d2 = cross(bx1, by1, bx2, by2, ax2, ay2);
+    double d3 = cross(ax1, ay1, ax2, ay2, bx1, by1);
+    double d4 = cross(ax1, ay1, ax2, ay2, bx2, by2);
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+        return true;
+    }
+    return false;
+}
+
+static bool ring_has_self_intersection(const std::vector<std::pair<double,double>>& ring) {
+    // O(n^2) check — only called for assembled rings (typically < 1000 vertices)
+    size_t n = ring.size();
+    if (n < 4) return false;
+    for (size_t i = 0; i + 1 < n; i++) {
+        for (size_t j = i + 2; j + 1 < n; j++) {
+            // Skip adjacent segments (they share an endpoint)
+            if (j == i + 1 || (i == 0 && j == n - 2)) continue;
+            if (segments_intersect(ring[i].first, ring[i].second,
+                                    ring[i+1].first, ring[i+1].second,
+                                    ring[j].first, ring[j].second,
+                                    ring[j+1].first, ring[j+1].second)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // --- Parallel admin: assemble outer rings from collected way geometries ---
 
 static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
@@ -616,7 +655,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
                     }
                 }
             }
-            if (ring.size() >= 4) {
+            if (ring.size() >= 4 && !ring_has_self_intersection(ring)) {
                 rings.push_back(std::move(ring));
             }
         } else {
@@ -2454,6 +2493,14 @@ int main(int argc, char* argv[]) {
                                 if (i >= data.collected_relations.size()) break;
 
                                 const auto& rel = data.collected_relations[i];
+
+                                // Skip level 2 border-line relations (no ISO code) —
+                                // these are boundary lines between countries, not
+                                // country polygons. Osmium rejects them as geometrically invalid.
+                                if (rel.admin_level == 2 && rel.country_code.empty()) {
+                                    assembled_count.fetch_add(1);
+                                    continue;
+                                }
 
                                 // Skip relations with missing outer member ways —
                                 // these cross the extract boundary and would produce
