@@ -257,7 +257,12 @@ struct ParsedData {
 
     // Collected data for parallel admin assembly
     std::vector<CollectedRelation> collected_relations;
-    std::unordered_map<int64_t, std::vector<std::pair<double,double>>> way_geometries;
+    struct WayGeometry {
+        std::vector<std::pair<double,double>> coords;
+        int64_t first_node_id;
+        int64_t last_node_id;
+    };
+    std::unordered_map<int64_t, WayGeometry> way_geometries;
 };
 
 // --- S2 helpers ---
@@ -462,27 +467,19 @@ static std::vector<std::pair<double,double>> simplify_polygon(
 
 static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
-    const std::unordered_map<int64_t, std::vector<std::pair<double,double>>>& way_geoms)
+    const std::unordered_map<int64_t, ParsedData::WayGeometry>& way_geoms)
 {
-    static constexpr double COORD_TOLERANCE = 1e-7;
-
-    auto coords_equal = [](const std::pair<double,double>& a,
-                           const std::pair<double,double>& b) {
-        return std::fabs(a.first - b.first) < COORD_TOLERANCE &&
-               std::fabs(a.second - b.second) < COORD_TOLERANCE;
-    };
-
-    // Collect indices of members with role "outer" or empty role
+    // Match way endpoints by OSM node ID (exact) rather than coordinates (lossy)
     struct WayRef {
         int64_t way_id;
-        const std::vector<std::pair<double,double>>* geom;
+        const ParsedData::WayGeometry* geom;
         bool used;
     };
     std::vector<WayRef> outer_ways;
     for (const auto& [way_id, role] : members) {
         if (role == "outer" || role.empty()) {
             auto it = way_geoms.find(way_id);
-            if (it != way_geoms.end() && !it->second.empty()) {
+            if (it != way_geoms.end() && !it->second.coords.empty()) {
                 outer_ways.push_back({way_id, &it->second, false});
             }
         }
@@ -493,51 +490,51 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     for (size_t start_idx = 0; start_idx < outer_ways.size(); start_idx++) {
         if (outer_ways[start_idx].used) continue;
 
-        // Start a new ring with this way
         outer_ways[start_idx].used = true;
-        std::vector<std::pair<double,double>> ring = *outer_ways[start_idx].geom;
+        std::vector<std::pair<double,double>> ring = outer_ways[start_idx].geom->coords;
 
-        // Try to extend the ring until it closes or we can't find a match
+        // Track the current last node ID of the ring
+        int64_t ring_first_nid = outer_ways[start_idx].geom->first_node_id;
+        int64_t ring_last_nid = outer_ways[start_idx].geom->last_node_id;
+
         bool extended = true;
         while (extended) {
             extended = false;
 
-            // Check if ring is closed
-            if (ring.size() >= 4 && coords_equal(ring.front(), ring.back())) {
-                break; // Ring is closed
+            // Check if ring is closed (first node ID == last node ID)
+            if (ring.size() >= 4 && ring_first_nid == ring_last_nid) {
+                break;
             }
-
-            const auto& ring_end = ring.back();
 
             for (size_t ci = 0; ci < outer_ways.size(); ci++) {
                 if (outer_ways[ci].used) continue;
-                const auto& candidate = *outer_ways[ci].geom;
-                if (candidate.empty()) continue;
+                const auto* cand = outer_ways[ci].geom;
+                if (cand->coords.empty()) continue;
 
                 // Try forward: candidate's first node matches ring's last node
-                if (coords_equal(candidate.front(), ring_end)) {
+                if (cand->first_node_id == ring_last_nid) {
                     outer_ways[ci].used = true;
-                    // Append candidate (skip first node to avoid duplicate)
-                    ring.insert(ring.end(), candidate.begin() + 1, candidate.end());
+                    ring.insert(ring.end(), cand->coords.begin() + 1, cand->coords.end());
+                    ring_last_nid = cand->last_node_id;
                     extended = true;
                     break;
                 }
 
                 // Try reversed: candidate's last node matches ring's last node
-                if (coords_equal(candidate.back(), ring_end)) {
+                if (cand->last_node_id == ring_last_nid) {
                     outer_ways[ci].used = true;
-                    // Append candidate in reverse (skip first = last of reversed to avoid duplicate)
-                    for (auto rit = candidate.rbegin() + 1; rit != candidate.rend(); ++rit) {
+                    for (auto rit = cand->coords.rbegin() + 1; rit != cand->coords.rend(); ++rit) {
                         ring.push_back(*rit);
                     }
+                    ring_last_nid = cand->first_node_id;
                     extended = true;
                     break;
                 }
             }
         }
 
-        // Only keep closed rings with at least 3 unique vertices
-        if (ring.size() >= 4 && coords_equal(ring.front(), ring.back())) {
+        // Only keep closed rings
+        if (ring.size() >= 4 && ring_first_nid == ring_last_nid) {
             rings.push_back(std::move(ring));
         }
     }
@@ -1953,7 +1950,13 @@ int main(int argc, char* argv[]) {
                     uint64_t building_addr_count = 0;
                     uint64_t interp_count = 0;
                     // Way geometries for parallel admin assembly
-                    std::vector<std::pair<int64_t, std::vector<std::pair<double,double>>>> way_geoms;
+                    struct WayGeomEntry {
+                        int64_t way_id;
+                        std::vector<std::pair<double,double>> coords;
+                        int64_t first_node_id;
+                        int64_t last_node_id;
+                    };
+                    std::vector<WayGeomEntry> way_geoms;
                 };
 
                 // Read buffers and dispatch to thread pool
@@ -2115,7 +2118,9 @@ int main(int argc, char* argv[]) {
                                             } catch (...) {}
                                         }
                                         if (!geom.empty()) {
-                                            local.way_geoms.push_back({way.id(), std::move(geom)});
+                                            int64_t first_nid = wnodes.front().positive_ref();
+                                            int64_t last_nid = wnodes.back().positive_ref();
+                                            local.way_geoms.push_back({way.id(), std::move(geom), first_nid, last_nid});
                                         }
                                     }
                                 }
@@ -2240,8 +2245,12 @@ int main(int argc, char* argv[]) {
 
                     // Merge way geometries for parallel admin assembly
                     if (parallel_admin) {
-                        for (auto& [wid, geom] : local.way_geoms) {
-                            data.way_geometries[wid] = std::move(geom);
+                        for (auto& wg : local.way_geoms) {
+                            ParsedData::WayGeometry g;
+                            g.coords = std::move(wg.coords);
+                            g.first_node_id = wg.first_node_id;
+                            g.last_node_id = wg.last_node_id;
+                            data.way_geometries[wg.way_id] = std::move(g);
                         }
                         local.way_geoms.clear();
                         local.way_geoms.shrink_to_fit();
@@ -2319,8 +2328,7 @@ int main(int argc, char* argv[]) {
                     data.collected_relations.clear();
                     data.collected_relations.shrink_to_fit();
                     data.way_geometries.clear();
-                    // Note: way_geometries uses unordered_map, shrink via swap
-                    std::unordered_map<int64_t, std::vector<std::pair<double,double>>>().swap(data.way_geometries);
+                    std::unordered_map<int64_t, ParsedData::WayGeometry>().swap(data.way_geometries);
                 }
             }
         }
