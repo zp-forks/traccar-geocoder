@@ -506,7 +506,8 @@ static bool ring_has_self_intersection(const std::vector<std::pair<double,double
 
 static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
-    const std::unordered_map<int64_t, ParsedData::WayGeometry>& way_geoms)
+    const std::unordered_map<int64_t, ParsedData::WayGeometry>& way_geoms,
+    bool include_all_roles = false)
 {
     // Coordinate-based ring assembly: split ways at shared internal nodes,
     // then stitch sub-ways at endpoints with backtracking.
@@ -519,11 +520,14 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
     };
 
-    // Collect all coordinates from all outer ways, count occurrences
+    // Collect coordinates from member ways.
+    // First pass uses outer/empty-role ways only. If that produces 0 rings,
+    // retry with ALL ways (matching osmium's check_roles=false fallback) —
+    // inner ways sometimes bridge gaps between outer ways.
     std::unordered_map<int64_t, int> coord_count;
     std::vector<const std::vector<std::pair<double,double>>*> way_coords;
     for (const auto& [way_id, role] : members) {
-        if (role != "outer" && !role.empty()) continue;
+        if (!include_all_roles && role != "outer" && !role.empty()) continue;
         auto it = way_geoms.find(way_id);
         if (it == way_geoms.end() || it->second.coords.empty()) continue;
         way_coords.push_back(&it->second.coords);
@@ -2494,24 +2498,25 @@ int main(int argc, char* argv[]) {
 
                                 const auto& rel = data.collected_relations[i];
 
-                                // Skip level 2 border-line relations (no ISO code) —
-                                // these are boundary lines between countries, not
-                                // country polygons. Osmium rejects them as geometrically invalid.
-                                if (rel.admin_level == 2 && rel.country_code.empty()) {
+                                // Skip level 2 border-line relations — these have names like
+                                // "Deutschland - Österreich" (two countries separated by
+                                // " - " or " — "). They are boundary lines, not country
+                                // polygons, and produce self-intersecting geometry.
+                                if (rel.admin_level == 2 && rel.country_code.empty() &&
+                                    (rel.name.find(" - ") != std::string::npos ||
+                                     rel.name.find(" \xe2\x80\x94 ") != std::string::npos)) { // " — " (em dash)
                                     assembled_count.fetch_add(1);
                                     continue;
                                 }
 
-                                // Skip relations with missing outer member ways —
+                                // Skip relations with missing member ways —
                                 // these cross the extract boundary and would produce
                                 // incorrect partial polygons
                                 bool has_missing = false;
                                 for (const auto& [way_id, role] : rel.members) {
-                                    if (role == "outer" || role.empty()) {
-                                        if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
-                                            has_missing = true;
-                                            break;
-                                        }
+                                    if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
+                                        has_missing = true;
+                                        break;
                                     }
                                 }
                                 if (has_missing) {
@@ -2520,26 +2525,43 @@ int main(int argc, char* argv[]) {
                                 }
 
                                 auto rings = assemble_outer_rings(rel.members, data.way_geometries);
-
-                                // Diagnostic: log relations with 0 rings produced
-                                if (rings.empty() && !rel.members.empty()) {
-                                    int total_outer = 0, found = 0, missing = 0;
-                                    for (const auto& [way_id, role] : rel.members) {
+                                // If outer-only assembly failed, retry with all ways.
+                                // Osmium ignores roles during assembly — inner ways
+                                // sometimes form the actual boundary or bridge gaps.
+                                if (rings.empty()) {
+                                    // Retry with all ways only if the relation has
+                                    // NO outer/empty-role ways at all (the boundary IS
+                                    // the inner ways). Don't retry when outer ways exist
+                                    // but fail to close — that's genuinely broken geometry.
+                                    bool has_outer = false;
+                                    for (const auto& [wid, role] : rel.members) {
                                         if (role == "outer" || role.empty()) {
-                                            total_outer++;
-                                            auto it = data.way_geometries.find(way_id);
-                                            if (it != data.way_geometries.end() && !it->second.coords.empty()) {
-                                                found++;
-                                            } else {
-                                                missing++;
+                                            if (data.way_geometries.find(wid) != data.way_geometries.end()) {
+                                                has_outer = true;
+                                                break;
                                             }
                                         }
                                     }
+                                    if (!has_outer) {
+                                        rings = assemble_outer_rings(rel.members, data.way_geometries, true);
+                                    }
+                                }
+
+                                // Diagnostic: log relations with 0 rings produced
+                                if (rings.empty() && !rel.members.empty()) {
+                                    int total_ways = 0, found = 0, missing = 0;
+                                    for (const auto& [way_id, role] : rel.members) {
+                                        total_ways++;
+                                        auto it = data.way_geometries.find(way_id);
+                                        if (it != data.way_geometries.end() && !it->second.coords.empty()) {
+                                            found++;
+                                        } else {
+                                            missing++;
+                                        }
+                                    }
                                     if (missing == 0 && found > 0) {
-                                        // All ways found but no ring — dump node IDs
                                         std::string detail = "  DEBUG '" + rel.name + "': ways:";
                                         for (const auto& [way_id, role] : rel.members) {
-                                            if (role != "outer" && !role.empty()) continue;
                                             auto it = data.way_geometries.find(way_id);
                                             if (it == data.way_geometries.end()) continue;
                                             detail += " [w" + std::to_string(way_id) +
@@ -2552,7 +2574,7 @@ int main(int argc, char* argv[]) {
                                     std::cerr << "  WARN: relation '" << rel.name
                                               << "' (level " << (int)rel.admin_level
                                               << ", " << rel.members.size() << " members): "
-                                              << "0 rings from " << total_outer << " outer ways ("
+                                              << "0 rings from " << total_ways << " ways ("
                                               << found << " found, " << missing << " missing)" << std::endl;
                                 }
 
