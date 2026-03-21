@@ -1920,6 +1920,17 @@ int main(int argc, char* argv[]) {
             }
 
             // --- Pass 3: ways + relations (parallel way processing) ---
+            // Build set of way IDs needed for admin assembly (to avoid storing all way geometries)
+            std::unordered_set<int64_t> admin_way_ids;
+            if (parallel_admin) {
+                for (const auto& rel : data.collected_relations) {
+                    for (const auto& [way_id, role] : rel.members) {
+                        admin_way_ids.insert(way_id);
+                    }
+                }
+                std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
+            }
+
             std::cerr << "  Pass 3: processing ways and areas with " << num_threads
                       << " threads..." << std::endl;
 
@@ -2094,8 +2105,8 @@ int main(int argc, char* argv[]) {
                                         }
                                     }
 
-                                    // Store way geometry for parallel admin assembly
-                                    if (parallel_admin && !wnodes.empty()) {
+                                    // Store way geometry only for admin boundary member ways
+                                    if (parallel_admin && !wnodes.empty() && admin_way_ids.count(way.id())) {
                                         std::vector<std::pair<double,double>> geom;
                                         for (const auto& nr : wnodes) {
                                             try {
