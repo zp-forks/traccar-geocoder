@@ -469,20 +469,9 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
     const std::unordered_map<int64_t, ParsedData::WayGeometry>& way_geoms)
 {
-    // Coordinate-based ring assembly with backtracking and gap closing
-    struct WayRef {
-        int64_t way_id;
-        const ParsedData::WayGeometry* geom;
-    };
-    std::vector<WayRef> outer_ways;
-    for (const auto& [way_id, role] : members) {
-        if (role == "outer" || role.empty()) {
-            auto it = way_geoms.find(way_id);
-            if (it != way_geoms.end() && !it->second.coords.empty()) {
-                outer_ways.push_back({way_id, &it->second});
-            }
-        }
-    }
+    // Coordinate-based ring assembly: split ways at shared internal nodes,
+    // then stitch sub-ways at endpoints with backtracking.
+    // This matches osmium's segment-level approach.
 
     // Coordinate key matching osmium's Location (int32_t nanodegrees)
     auto coord_key = [](double lat, double lng) -> int64_t {
@@ -491,29 +480,87 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
     };
 
-    // Build adjacency by coordinate endpoints
+    // Collect all coordinates from all outer ways, count occurrences
+    std::unordered_map<int64_t, int> coord_count;
+    std::vector<const std::vector<std::pair<double,double>>*> way_coords;
+    for (const auto& [way_id, role] : members) {
+        if (role != "outer" && !role.empty()) continue;
+        auto it = way_geoms.find(way_id);
+        if (it == way_geoms.end() || it->second.coords.empty()) continue;
+        way_coords.push_back(&it->second.coords);
+        for (const auto& [lat, lng] : it->second.coords) {
+            coord_count[coord_key(lat, lng)]++;
+        }
+    }
+
+    // A coordinate is a "split point" if it appears in 2+ ways' node lists.
+    // Endpoints always count, internal nodes that appear in multiple ways need splitting.
+    // Also, all way endpoints are natural split points.
+    std::unordered_set<int64_t> split_points;
+    for (auto* coords : way_coords) {
+        split_points.insert(coord_key(coords->front().first, coords->front().second));
+        split_points.insert(coord_key(coords->back().first, coords->back().second));
+    }
+    for (auto& [ck, cnt] : coord_count) {
+        if (cnt > 1) split_points.insert(ck);
+    }
+
+    // Split each way at split points to create sub-ways
+    struct SubWay {
+        std::vector<std::pair<double,double>> coords;
+    };
+    std::vector<SubWay> sub_ways;
+    for (auto* coords : way_coords) {
+        size_t seg_start = 0;
+        for (size_t i = 1; i < coords->size(); i++) {
+            int64_t ck = coord_key((*coords)[i].first, (*coords)[i].second);
+            if (split_points.count(ck) && i > seg_start) {
+                // Create sub-way from seg_start to i (inclusive)
+                SubWay sw;
+                sw.coords.assign(coords->begin() + seg_start, coords->begin() + i + 1);
+                if (sw.coords.size() >= 2) {
+                    sub_ways.push_back(std::move(sw));
+                }
+                seg_start = i;
+            }
+        }
+        // Handle remaining segment (if not already added)
+        if (seg_start < coords->size() - 1) {
+            SubWay sw;
+            sw.coords.assign(coords->begin() + seg_start, coords->end());
+            if (sw.coords.size() >= 2) {
+                sub_ways.push_back(std::move(sw));
+            }
+        }
+    }
+
+    // Build adjacency by sub-way coordinate endpoints
+    struct WayRef {
+        int64_t way_id;
+        const ParsedData::WayGeometry* geom; // unused for sub-ways
+    };
+    // We'll adapt the BacktrackState to work with sub_ways directly
     std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>> coord_adj;
-    for (size_t i = 0; i < outer_ways.size(); i++) {
-        const auto* g = outer_ways[i].geom;
-        auto& first = g->coords.front();
-        auto& last = g->coords.back();
+    for (size_t i = 0; i < sub_ways.size(); i++) {
+        auto& first = sub_ways[i].coords.front();
+        auto& last = sub_ways[i].coords.back();
         coord_adj[coord_key(first.first, first.second)].push_back({i, false});
         coord_adj[coord_key(last.first, last.second)].push_back({i, true});
     }
 
-    std::vector<bool> used(outer_ways.size(), false);
+    std::vector<bool> used(sub_ways.size(), false);
     std::vector<std::vector<std::pair<double,double>>> rings;
 
-    // Backtracking ring closure using coordinate matching
+    // Backtracking ring closure on sub-ways
     struct BacktrackState {
-        const std::vector<WayRef>& ways;
+        const std::vector<SubWay>& sways;
         const std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>>& adj;
         std::vector<bool>& used;
         decltype(coord_key)& key_fn;
 
         bool try_close(int64_t first_key, int64_t last_key,
                        std::vector<std::pair<size_t, bool>>& path, int depth) {
-            if (depth > 5000) return false;
+            if (depth > 10000) return false;
             if (!path.empty() && first_key == last_key) return true;
 
             auto it = adj.find(last_key);
@@ -521,9 +568,9 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
 
             for (const auto& [wi, is_last] : it->second) {
                 if (used[wi]) continue;
-                const auto* g = ways[wi].geom;
+                const auto& sw = sways[wi];
                 bool reversed = is_last;
-                auto& endpoint = reversed ? g->coords.front() : g->coords.back();
+                auto& endpoint = reversed ? sw.coords.front() : sw.coords.back();
                 int64_t new_key = key_fn(endpoint.first, endpoint.second);
 
                 used[wi] = true;
@@ -538,29 +585,29 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         }
     };
 
-    BacktrackState state{outer_ways, coord_adj, used, coord_key};
+    BacktrackState state{sub_ways, coord_adj, used, coord_key};
 
-    for (size_t start_idx = 0; start_idx < outer_ways.size(); start_idx++) {
+    for (size_t start_idx = 0; start_idx < sub_ways.size(); start_idx++) {
         if (used[start_idx]) continue;
 
-        const auto* sg = outer_ways[start_idx].geom;
-        int64_t first_key = coord_key(sg->coords.front().first, sg->coords.front().second);
-        int64_t last_key = coord_key(sg->coords.back().first, sg->coords.back().second);
+        const auto& sg = sub_ways[start_idx];
+        int64_t first_key = coord_key(sg.coords.front().first, sg.coords.front().second);
+        int64_t last_key = coord_key(sg.coords.back().first, sg.coords.back().second);
 
-        // Single way already closed
-        if (sg->coords.size() >= 4 && first_key == last_key) {
+        // Single sub-way already closed
+        if (sg.coords.size() >= 4 && first_key == last_key) {
             used[start_idx] = true;
-            rings.push_back(sg->coords);
+            rings.push_back(sg.coords);
             continue;
         }
 
-        // Try to build a closed ring
+        // Try to build a closed ring from sub-ways
         used[start_idx] = true;
         std::vector<std::pair<size_t, bool>> path;
         if (state.try_close(first_key, last_key, path, 0)) {
-            std::vector<std::pair<double,double>> ring = sg->coords;
+            std::vector<std::pair<double,double>> ring = sg.coords;
             for (const auto& [wi, reversed] : path) {
-                const auto& coords = outer_ways[wi].geom->coords;
+                const auto& coords = sub_ways[wi].coords;
                 if (!reversed) {
                     ring.insert(ring.end(), coords.begin() + 1, coords.end());
                 } else {
