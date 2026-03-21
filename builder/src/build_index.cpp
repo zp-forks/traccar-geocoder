@@ -2529,20 +2529,21 @@ int main(int argc, char* argv[]) {
                                 // Osmium ignores roles during assembly — inner ways
                                 // sometimes form the actual boundary or bridge gaps.
                                 if (rings.empty()) {
-                                    // Retry with all ways only if the relation has
-                                    // NO outer/empty-role ways at all (the boundary IS
-                                    // the inner ways). Don't retry when outer ways exist
-                                    // but fail to close — that's genuinely broken geometry.
-                                    bool has_outer = false;
+                                    // Retry with all ways only when outer-only produced
+                                    // 0 rings AND the relation has non-outer ways available.
+                                    // Only retry when there are NO outer ways (the boundary IS
+                                    // the inner-role ways). When outer ways exist but don't close,
+                                    // including inner ways creates merged outer+hole geometry.
+                                    bool has_outer_geom = false;
                                     for (const auto& [wid, role] : rel.members) {
                                         if (role == "outer" || role.empty()) {
-                                            if (data.way_geometries.find(wid) != data.way_geometries.end()) {
-                                                has_outer = true;
+                                            if (data.way_geometries.count(wid)) {
+                                                has_outer_geom = true;
                                                 break;
                                             }
                                         }
                                     }
-                                    if (!has_outer) {
+                                    if (!has_outer_geom) {
                                         rings = assemble_outer_rings(rel.members, data.way_geometries, true);
                                     }
                                 }
