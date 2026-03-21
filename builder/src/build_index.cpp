@@ -469,8 +469,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
     const std::unordered_map<int64_t, ParsedData::WayGeometry>& way_geoms)
 {
-    // Match way endpoints by coordinates (like osmium's assembler) to handle
-    // split/replaced nodes that have different IDs at the same location
+    // Coordinate-based ring assembly with backtracking and gap closing
     struct WayRef {
         int64_t way_id;
         const ParsedData::WayGeometry* geom;
@@ -492,7 +491,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
     };
 
-    // Build adjacency: coordinate_key -> list of (way_index, is_last_endpoint)
+    // Build adjacency by coordinate endpoints
     std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>> coord_adj;
     for (size_t i = 0; i < outer_ways.size(); i++) {
         const auto* g = outer_ways[i].geom;
