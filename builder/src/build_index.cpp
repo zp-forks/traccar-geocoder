@@ -469,7 +469,8 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
     const std::unordered_map<int64_t, ParsedData::WayGeometry>& way_geoms)
 {
-    // Match way endpoints by OSM node ID (exact) rather than coordinates (lossy)
+    // Match way endpoints by coordinates (like osmium's assembler) to handle
+    // split/replaced nodes that have different IDs at the same location
     struct WayRef {
         int64_t way_id;
         const ParsedData::WayGeometry* geom;
@@ -484,113 +485,52 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         }
     }
 
-    // Build adjacency: node_id -> list of (way_index, is_last_node)
-    // Each way has two endpoints: first_node_id and last_node_id
-    std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>> node_to_ways;
-    for (size_t i = 0; i < outer_ways.size(); i++) {
-        const auto* g = outer_ways[i].geom;
-        node_to_ways[g->first_node_id].push_back({i, false});
-        node_to_ways[g->last_node_id].push_back({i, true});
-    }
-
-    // Build coordinate-based fallback adjacency for split/replaced nodes
-    // Key: rounded lat,lng pair → list of node IDs at that location
+    // Coordinate key matching osmium's Location (int32_t nanodegrees)
     auto coord_key = [](double lat, double lng) -> int64_t {
-        // Round to ~1cm precision to match identical coordinates
         int32_t ilat = static_cast<int32_t>(lat * 1e7 + (lat >= 0 ? 0.5 : -0.5));
         int32_t ilng = static_cast<int32_t>(lng * 1e7 + (lng >= 0 ? 0.5 : -0.5));
         return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
     };
-    std::unordered_map<int64_t, std::vector<int64_t>> coord_to_nids;
+
+    // Build adjacency: coordinate_key -> list of (way_index, is_last_endpoint)
+    std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>> coord_adj;
     for (size_t i = 0; i < outer_ways.size(); i++) {
         const auto* g = outer_ways[i].geom;
-        if (!g->coords.empty()) {
-            auto& first = g->coords.front();
-            auto& last = g->coords.back();
-            coord_to_nids[coord_key(first.first, first.second)].push_back(g->first_node_id);
-            coord_to_nids[coord_key(last.first, last.second)].push_back(g->last_node_id);
-        }
-    }
-    // Map node IDs that share coordinates (split/replaced nodes)
-    std::unordered_map<int64_t, std::vector<int64_t>> nid_aliases;
-    for (auto& [ck, nids] : coord_to_nids) {
-        if (nids.size() <= 1) continue;
-        // Deduplicate
-        std::sort(nids.begin(), nids.end());
-        nids.erase(std::unique(nids.begin(), nids.end()), nids.end());
-        if (nids.size() <= 1) continue;
-        for (auto nid : nids) {
-            nid_aliases[nid] = nids;
-        }
+        auto& first = g->coords.front();
+        auto& last = g->coords.back();
+        coord_adj[coord_key(first.first, first.second)].push_back({i, false});
+        coord_adj[coord_key(last.first, last.second)].push_back({i, true});
     }
 
     std::vector<bool> used(outer_ways.size(), false);
     std::vector<std::vector<std::pair<double,double>>> rings;
 
-    // Recursive ring closure with backtracking at branch points
+    // Backtracking ring closure using coordinate matching
     struct BacktrackState {
         const std::vector<WayRef>& ways;
         const std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>>& adj;
         std::vector<bool>& used;
-        const std::unordered_map<int64_t, std::vector<int64_t>>& aliases;
+        decltype(coord_key)& key_fn;
 
-        // Check if two node IDs match (directly or via coordinate alias)
-        bool nids_match(int64_t a, int64_t b) const {
-            if (a == b) return true;
-            auto it = aliases.find(a);
-            if (it != aliases.end()) {
-                for (auto alias : it->second) {
-                    if (alias == b) return true;
-                }
-            }
-            return false;
-        }
-
-        // Collect all adjacent way candidates for a node ID (including aliases)
-        void get_candidates(int64_t nid, std::vector<std::pair<size_t, bool>>& out) const {
-            out.clear();
-            auto it = adj.find(nid);
-            if (it != adj.end()) {
-                out.insert(out.end(), it->second.begin(), it->second.end());
-            }
-            // Also check aliases
-            auto ait = aliases.find(nid);
-            if (ait != aliases.end()) {
-                for (auto alias : ait->second) {
-                    if (alias == nid) continue;
-                    auto it2 = adj.find(alias);
-                    if (it2 != adj.end()) {
-                        out.insert(out.end(), it2->second.begin(), it2->second.end());
-                    }
-                }
-            }
-        }
-
-        // Try to close a ring from ring_last_nid back to ring_first_nid
-        bool try_close(int64_t ring_first_nid, int64_t ring_last_nid,
+        bool try_close(int64_t first_key, int64_t last_key,
                        std::vector<std::pair<size_t, bool>>& path, int depth) {
             if (depth > 5000) return false;
+            if (!path.empty() && first_key == last_key) return true;
 
-            // Closed?
-            if (!path.empty() && nids_match(ring_first_nid, ring_last_nid)) return true;
+            auto it = adj.find(last_key);
+            if (it == adj.end()) return false;
 
-            // Find candidates adjacent to ring_last_nid (including aliases)
-            std::vector<std::pair<size_t, bool>> candidates;
-            get_candidates(ring_last_nid, candidates);
-
-            for (const auto& [wi, is_last] : candidates) {
+            for (const auto& [wi, is_last] : it->second) {
                 if (used[wi]) continue;
                 const auto* g = ways[wi].geom;
-
                 bool reversed = is_last;
-                int64_t new_last = reversed ? g->first_node_id : g->last_node_id;
+                auto& endpoint = reversed ? g->coords.front() : g->coords.back();
+                int64_t new_key = key_fn(endpoint.first, endpoint.second);
 
                 used[wi] = true;
                 path.push_back({wi, reversed});
 
-                if (try_close(ring_first_nid, new_last, path, depth + 1)) {
-                    return true;
-                }
+                if (try_close(first_key, new_key, path, depth + 1)) return true;
 
                 path.pop_back();
                 used[wi] = false;
@@ -599,37 +539,27 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         }
     };
 
-    BacktrackState state{outer_ways, node_to_ways, used, nid_aliases};
+    BacktrackState state{outer_ways, coord_adj, used, coord_key};
 
     for (size_t start_idx = 0; start_idx < outer_ways.size(); start_idx++) {
         if (used[start_idx]) continue;
 
-        const auto* start_geom = outer_ways[start_idx].geom;
-        int64_t ring_first_nid = start_geom->first_node_id;
-        int64_t ring_last_nid = start_geom->last_node_id;
+        const auto* sg = outer_ways[start_idx].geom;
+        int64_t first_key = coord_key(sg->coords.front().first, sg->coords.front().second);
+        int64_t last_key = coord_key(sg->coords.back().first, sg->coords.back().second);
 
-        // Single way already closed (by node ID or coordinate alias)
-        bool self_closed = (ring_first_nid == ring_last_nid);
-        if (!self_closed) {
-            auto ait = nid_aliases.find(ring_first_nid);
-            if (ait != nid_aliases.end()) {
-                for (auto alias : ait->second) {
-                    if (alias == ring_last_nid) { self_closed = true; break; }
-                }
-            }
-        }
-        if (start_geom->coords.size() >= 4 && self_closed) {
+        // Single way already closed
+        if (sg->coords.size() >= 4 && first_key == last_key) {
             used[start_idx] = true;
-            rings.push_back(start_geom->coords);
+            rings.push_back(sg->coords);
             continue;
         }
 
-        // Try to build a closed ring starting with this way
+        // Try to build a closed ring
         used[start_idx] = true;
-        std::vector<std::pair<size_t, bool>> path; // (way_index, reversed)
-        if (state.try_close(ring_first_nid, ring_last_nid, path, 0)) {
-            // Build the ring from start_geom + path
-            std::vector<std::pair<double,double>> ring = start_geom->coords;
+        std::vector<std::pair<size_t, bool>> path;
+        if (state.try_close(first_key, last_key, path, 0)) {
+            std::vector<std::pair<double,double>> ring = sg->coords;
             for (const auto& [wi, reversed] : path) {
                 const auto& coords = outer_ways[wi].geom->coords;
                 if (!reversed) {
@@ -644,7 +574,6 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
                 rings.push_back(std::move(ring));
             }
         } else {
-            // Failed — unmark start way so it can be used by another ring attempt
             used[start_idx] = false;
         }
     }
