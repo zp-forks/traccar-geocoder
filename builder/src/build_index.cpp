@@ -1945,7 +1945,9 @@ int main(int argc, char* argv[]) {
                     std::vector<DeferredInterp> deferred_interps;
                     std::vector<AddrPoint> building_addrs;
                     std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
-                    std::vector<std::string> interned_strings; // strings to intern later
+                    std::vector<std::string> way_strings;      // way name strings
+                    std::vector<std::string> addr_strings;     // building addr "hn\0street" strings
+                    std::vector<std::string> interp_strings;   // interp street name strings
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
                     uint64_t interp_count = 0;
@@ -2030,7 +2032,7 @@ int main(int argc, char* argv[]) {
                                                     iw.end_number = 0;
                                                     iw.interpolation = interp_type;
                                                     local.interp_ways.push_back(iw);
-                                                    local.interned_strings.push_back(street);
+                                                    local.interp_strings.push_back(street);
                                                     local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
                                                     local.interp_count++;
                                                 }
@@ -2066,7 +2068,7 @@ int main(int argc, char* argv[]) {
                                                     0, 0 // placeholder string IDs
                                                 });
                                                 // Store strings for later interning
-                                                local.interned_strings.push_back(std::string(housenumber) + "\0" + std::string(street));
+                                                local.addr_strings.push_back(std::string(housenumber) + "\0" + std::string(street));
                                                 local.building_addr_count++;
                                             }
                                         }
@@ -2101,7 +2103,7 @@ int main(int argc, char* argv[]) {
                                                 header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
                                                 header.name_id = 0; // placeholder, intern later
                                                 local.ways.push_back(header);
-                                                local.interned_strings.push_back(name);
+                                                local.way_strings.push_back(name);
                                                 local.deferred_ways.push_back({way_id, node_offset, header.node_count});
                                                 local.way_count++;
                                             }
@@ -2191,14 +2193,11 @@ int main(int argc, char* argv[]) {
                     uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());
                     uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
 
-                    // String interning index for this thread's data
-                    size_t str_idx = 0;
-
                     // Merge street ways
                     for (size_t i = 0; i < local.ways.size(); i++) {
                         auto h = local.ways[i];
                         h.node_offset += node_base;
-                        h.name_id = data.string_pool.intern(local.interned_strings[str_idx++]);
+                        h.name_id = data.string_pool.intern(local.way_strings[i]);
                         data.ways.push_back(h);
                     }
                     data.street_nodes.insert(data.street_nodes.end(),
@@ -2213,7 +2212,7 @@ int main(int argc, char* argv[]) {
 
                     // Merge building addresses
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
-                        auto& s = local.interned_strings[str_idx++];
+                        auto& s = local.addr_strings[i];
                         auto sep = s.find('\0');
                         std::string hn = s.substr(0, sep);
                         std::string st = s.substr(sep + 1);
@@ -2226,7 +2225,7 @@ int main(int argc, char* argv[]) {
                     for (size_t i = 0; i < local.interp_ways.size(); i++) {
                         auto iw = local.interp_ways[i];
                         iw.node_offset += interp_node_base;
-                        iw.street_id = data.string_pool.intern(local.interned_strings[str_idx++]);
+                        iw.street_id = data.string_pool.intern(local.interp_strings[i]);
                         data.interp_ways.push_back(iw);
                     }
                     data.interp_nodes.insert(data.interp_nodes.end(),

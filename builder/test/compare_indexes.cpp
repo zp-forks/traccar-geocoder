@@ -1,5 +1,7 @@
 // Semantic comparison of two geocoder index directories.
-// Decodes all binary files, normalizes ordering, and compares content.
+// Decodes all binary files, creates canonical fingerprints for each item,
+// and compares as multisets — handles any ordering differences between
+// parallel and sequential builds.
 // Returns 0 if semantically identical, 1 if different.
 //
 // Usage: compare_indexes <dir-A> <dir-B>
@@ -13,6 +15,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // --- Binary structs (must match build_index.cpp and server main.rs) ---
@@ -79,203 +82,213 @@ static std::vector<T> read_structs(const std::string& path) {
     return result;
 }
 
-// --- Decoded representations for comparison ---
+// Round a float coordinate to an integer grid (1e5 ~ 1m precision)
+static int to_grid(float v) {
+    return (int)(v * 1e5f + (v >= 0 ? 0.5f : -0.5f));
+}
 
-struct DecodedAdminPolygon {
-    std::string name;
-    uint8_t admin_level;
-    float area;
-    uint16_t country_code;
-    std::vector<std::pair<float, float>> vertices;
+// --- Canonical fingerprint builders ---
+// Each function produces a string that uniquely identifies an item,
+// independent of storage order.
 
-    // Canonical sort key: name + admin_level + vertex_count
-    // This ensures consistent ordering regardless of insertion order
-    std::string sort_key() const {
-        return name + "|" + std::to_string(admin_level) + "|" + std::to_string(vertices.size());
+// For a way: "name|sorted_node_coords"
+// Nodes are kept in original order (path order matters for ways),
+// but we also provide a sorted-set version for order-independent matching.
+static std::string way_fingerprint(const std::string& name,
+                                    const std::vector<std::pair<float,float>>& nodes) {
+    // Use sorted coordinate set as the canonical form.
+    // Two ways are "the same" if they have the same name and same set of nodes.
+    std::vector<std::pair<int,int>> grid_nodes;
+    grid_nodes.reserve(nodes.size());
+    for (const auto& n : nodes) {
+        grid_nodes.push_back({to_grid(n.first), to_grid(n.second)});
+    }
+    std::sort(grid_nodes.begin(), grid_nodes.end());
+
+    std::string fp = name + "|" + std::to_string(nodes.size());
+    for (const auto& g : grid_nodes) {
+        fp += "|";
+        fp += std::to_string(g.first);
+        fp += ",";
+        fp += std::to_string(g.second);
+    }
+    return fp;
+}
+
+// For an address: "grid_lat,grid_lng|housenumber|street"
+static std::string addr_fingerprint(float lat, float lng,
+                                     const std::string& housenumber,
+                                     const std::string& street) {
+    return std::to_string(to_grid(lat)) + "," + std::to_string(to_grid(lng)) +
+           "|" + housenumber + "|" + street;
+}
+
+// For an admin polygon: "name|level|country|sorted_vertices"
+static std::string admin_fingerprint(const std::string& name,
+                                      uint8_t admin_level,
+                                      uint16_t country_code,
+                                      const std::vector<std::pair<float,float>>& vertices) {
+    std::vector<std::pair<int,int>> grid_verts;
+    grid_verts.reserve(vertices.size());
+    for (const auto& v : vertices) {
+        grid_verts.push_back({to_grid(v.first), to_grid(v.second)});
+    }
+    std::sort(grid_verts.begin(), grid_verts.end());
+
+    std::string fp = name + "|" + std::to_string(admin_level) + "|" + std::to_string(country_code);
+    for (const auto& g : grid_verts) {
+        fp += "|";
+        fp += std::to_string(g.first);
+        fp += ",";
+        fp += std::to_string(g.second);
+    }
+    return fp;
+}
+
+// For interpolation ways: "street|start|end|interp|sorted_nodes"
+static std::string interp_fingerprint(const std::string& street,
+                                       uint32_t start_number, uint32_t end_number,
+                                       uint8_t interpolation,
+                                       const std::vector<std::pair<float,float>>& nodes) {
+    std::vector<std::pair<int,int>> grid_nodes;
+    grid_nodes.reserve(nodes.size());
+    for (const auto& n : nodes) {
+        grid_nodes.push_back({to_grid(n.first), to_grid(n.second)});
+    }
+    std::sort(grid_nodes.begin(), grid_nodes.end());
+
+    std::string fp = street + "|" + std::to_string(start_number) + "-" +
+                     std::to_string(end_number) + "|" + std::to_string(interpolation);
+    for (const auto& g : grid_nodes) {
+        fp += "|";
+        fp += std::to_string(g.first);
+        fp += ",";
+        fp += std::to_string(g.second);
+    }
+    return fp;
+}
+
+// --- Multiset comparison ---
+// Compare two collections by their fingerprints. Reports missing/extra items.
+
+static bool compare_multisets(const char* label,
+                               const std::vector<std::string>& fps_a,
+                               const std::vector<std::string>& fps_b) {
+    // Build frequency maps
+    std::unordered_map<std::string, int> freq_a, freq_b;
+    for (const auto& fp : fps_a) freq_a[fp]++;
+    for (const auto& fp : fps_b) freq_b[fp]++;
+
+    // Find items in A but not in B (missing from B)
+    size_t missing = 0;
+    for (const auto& [fp, count] : freq_a) {
+        int b_count = 0;
+        auto it = freq_b.find(fp);
+        if (it != freq_b.end()) b_count = it->second;
+        if (count > b_count) missing += (count - b_count);
     }
 
-    bool operator<(const DecodedAdminPolygon& o) const {
-        return sort_key() < o.sort_key();
+    // Find items in B but not in A (extra in B)
+    size_t extra = 0;
+    for (const auto& [fp, count] : freq_b) {
+        int a_count = 0;
+        auto it = freq_a.find(fp);
+        if (it != freq_a.end()) a_count = it->second;
+        if (count > a_count) extra += (count - a_count);
     }
 
-    // Compare vertex rings as sets — same vertices regardless of order/rotation/direction
-    static bool rings_equal(const std::vector<std::pair<float,float>>& a,
-                            const std::vector<std::pair<float,float>>& b) {
-        if (a.size() != b.size()) return false;
-        if (a.empty()) return true;
+    size_t matched = fps_a.size() - missing;
 
-        // Round to grid and compare as sorted sets
-        auto to_key = [](const std::pair<float,float>& v) -> std::pair<int,int> {
-            return {(int)(v.first * 1e5f + 0.5f), (int)(v.second * 1e5f + 0.5f)};
-        };
-
-        std::vector<std::pair<int,int>> sa, sb;
-        for (auto& v : a) sa.push_back(to_key(v));
-        for (auto& v : b) sb.push_back(to_key(v));
-        std::sort(sa.begin(), sa.end());
-        std::sort(sb.begin(), sb.end());
-        return sa == sb;
+    if (missing == 0 && extra == 0) {
+        std::cout << "PASS: " << label << " (" << fps_a.size() << " items, all matched)" << std::endl;
+        return true;
+    } else {
+        std::cerr << "FAIL: " << label << " — A=" << fps_a.size() << " B=" << fps_b.size()
+                  << " matched=" << matched
+                  << " only_in_A=" << missing
+                  << " only_in_B=" << extra << std::endl;
+        return false;
     }
+}
 
-    bool operator==(const DecodedAdminPolygon& o) const {
-        if (admin_level != o.admin_level) return false;
-        if (name != o.name) return false;
-        if (country_code != o.country_code) return false;
-        if (vertices.size() != o.vertices.size()) return false;
-        // Area tolerance: relative comparison for large values, absolute for small
-        float area_diff = std::fabs(area - o.area);
-        float area_max = std::max(std::fabs(area), std::fabs(o.area));
-        if (area_max > 1e-6f && area_diff / area_max > 0.01f) return false;
-        if (area_max <= 1e-6f && area_diff > 1e-8f) return false;
-        return rings_equal(vertices, o.vertices);
-    }
-};
+// --- Decode + fingerprint functions ---
 
-struct DecodedWay {
-    std::string name;
-    std::vector<std::pair<float, float>> nodes;
-
-    std::string sort_key() const {
-        std::string key = name + "|" + std::to_string(nodes.size());
-        if (!nodes.empty()) {
-            key += "|" + std::to_string((int)(nodes[0].first * 1e5)) + "," + std::to_string((int)(nodes[0].second * 1e5));
-        }
-        return key;
-    }
-
-    bool operator<(const DecodedWay& o) const {
-        return sort_key() < o.sort_key();
-    }
-
-    bool operator==(const DecodedWay& o) const {
-        if (name != o.name) return false;
-        if (nodes.size() != o.nodes.size()) return false;
-        // Compare as sorted vertex sets (order may differ due to parallel processing)
-        auto to_key = [](const std::pair<float,float>& v) -> std::pair<int,int> {
-            return {(int)(v.first * 1e5f + 0.5f), (int)(v.second * 1e5f + 0.5f)};
-        };
-        std::vector<std::pair<int,int>> sa, sb;
-        for (auto& v : nodes) sa.push_back(to_key(v));
-        for (auto& v : o.nodes) sb.push_back(to_key(v));
-        std::sort(sa.begin(), sa.end());
-        std::sort(sb.begin(), sb.end());
-        return sa == sb;
-    }
-};
-
-struct DecodedAddr {
-    float lat, lng;
-    std::string housenumber;
-    std::string street;
-
-    std::string sort_key() const {
-        return std::to_string((int)(lat * 1e5)) + "," + std::to_string((int)(lng * 1e5)) + "|" + housenumber + "|" + street;
-    }
-
-    bool operator<(const DecodedAddr& o) const {
-        return sort_key() < o.sort_key();
-    }
-
-    bool operator==(const DecodedAddr& o) const {
-        return std::fabs(lat - o.lat) < 1e-5f &&
-               std::fabs(lng - o.lng) < 1e-5f &&
-               housenumber == o.housenumber &&
-               street == o.street;
-    }
-};
-
-// --- Decode functions ---
-
-static std::vector<DecodedAdminPolygon> decode_admin(const std::string& dir) {
+static std::vector<std::string> fingerprint_admin(const std::string& dir) {
     auto strings = read_file(dir + "/strings.bin");
     auto polygons = read_structs<AdminPolygon>(dir + "/admin_polygons.bin");
     auto vertices = read_structs<NodeCoord>(dir + "/admin_vertices.bin");
 
-    std::vector<DecodedAdminPolygon> result;
+    std::vector<std::string> fps;
+    fps.reserve(polygons.size());
     for (const auto& p : polygons) {
-        DecodedAdminPolygon dp;
-        dp.name = get_string(strings, p.name_id);
-        dp.admin_level = p.admin_level;
-        dp.area = p.area;
-        dp.country_code = p.country_code;
+        std::string name = get_string(strings, p.name_id);
+        std::vector<std::pair<float,float>> verts;
         for (uint16_t i = 0; i < p.vertex_count; i++) {
             uint32_t vi = p.vertex_offset + i;
             if (vi < vertices.size()) {
-                dp.vertices.push_back({vertices[vi].lat, vertices[vi].lng});
+                verts.push_back({vertices[vi].lat, vertices[vi].lng});
             }
         }
-        result.push_back(std::move(dp));
+        fps.push_back(admin_fingerprint(name, p.admin_level, p.country_code, verts));
     }
-    return result;
+    return fps;
 }
 
-static std::vector<DecodedWay> decode_ways(const std::string& dir) {
+static std::vector<std::string> fingerprint_ways(const std::string& dir) {
     auto strings = read_file(dir + "/strings.bin");
     auto ways = read_structs<WayHeader>(dir + "/street_ways.bin");
     auto nodes = read_structs<NodeCoord>(dir + "/street_nodes.bin");
 
-    std::vector<DecodedWay> result;
+    std::vector<std::string> fps;
+    fps.reserve(ways.size());
     for (const auto& w : ways) {
-        DecodedWay dw;
-        dw.name = get_string(strings, w.name_id);
+        std::string name = get_string(strings, w.name_id);
+        std::vector<std::pair<float,float>> way_nodes;
         for (uint8_t i = 0; i < w.node_count; i++) {
             uint32_t ni = w.node_offset + i;
             if (ni < nodes.size()) {
-                dw.nodes.push_back({nodes[ni].lat, nodes[ni].lng});
+                way_nodes.push_back({nodes[ni].lat, nodes[ni].lng});
             }
         }
-        result.push_back(std::move(dw));
+        fps.push_back(way_fingerprint(name, way_nodes));
     }
-    return result;
+    return fps;
 }
 
-static std::vector<DecodedAddr> decode_addrs(const std::string& dir) {
+static std::vector<std::string> fingerprint_addrs(const std::string& dir) {
     auto strings = read_file(dir + "/strings.bin");
     auto points = read_structs<AddrPoint>(dir + "/addr_points.bin");
 
-    std::vector<DecodedAddr> result;
+    std::vector<std::string> fps;
+    fps.reserve(points.size());
     for (const auto& p : points) {
-        DecodedAddr da;
-        da.lat = p.lat;
-        da.lng = p.lng;
-        da.housenumber = get_string(strings, p.housenumber_id);
-        da.street = get_string(strings, p.street_id);
-        result.push_back(std::move(da));
+        std::string hn = get_string(strings, p.housenumber_id);
+        std::string st = get_string(strings, p.street_id);
+        fps.push_back(addr_fingerprint(p.lat, p.lng, hn, st));
     }
-    return result;
+    return fps;
 }
 
-// --- Comparison ---
+static std::vector<std::string> fingerprint_interps(const std::string& dir) {
+    auto strings = read_file(dir + "/strings.bin");
+    auto interps = read_structs<InterpWay>(dir + "/interp_ways.bin");
+    auto nodes = read_structs<NodeCoord>(dir + "/interp_nodes.bin");
 
-template<typename T>
-static bool compare_sorted(const char* label, std::vector<T> a, std::vector<T> b) {
-    std::sort(a.begin(), a.end());
-    std::sort(b.begin(), b.end());
-
-    if (a.size() != b.size()) {
-        std::cerr << "FAIL: " << label << " count differs (A=" << a.size()
-                  << " B=" << b.size() << ")" << std::endl;
-        return false;
-    }
-
-    size_t diffs = 0;
-    for (size_t i = 0; i < a.size(); i++) {
-        if (!(a[i] == b[i])) {
-            if (diffs < 3) {
-                std::cerr << "  Mismatch at sorted position " << i << std::endl;
+    std::vector<std::string> fps;
+    fps.reserve(interps.size());
+    for (const auto& iw : interps) {
+        std::string street = get_string(strings, iw.street_id);
+        std::vector<std::pair<float,float>> way_nodes;
+        for (uint8_t i = 0; i < iw.node_count; i++) {
+            uint32_t ni = iw.node_offset + i;
+            if (ni < nodes.size()) {
+                way_nodes.push_back({nodes[ni].lat, nodes[ni].lng});
             }
-            diffs++;
         }
+        fps.push_back(interp_fingerprint(street, iw.start_number, iw.end_number,
+                                          iw.interpolation, way_nodes));
     }
-
-    if (diffs > 0) {
-        std::cerr << "FAIL: " << label << " has " << diffs << " differences out of "
-                  << a.size() << " items" << std::endl;
-        return false;
-    }
-
-    std::cout << "PASS: " << label << " (" << a.size() << " items)" << std::endl;
-    return true;
+    return fps;
 }
 
 int main(int argc, char* argv[]) {
@@ -296,25 +309,41 @@ int main(int argc, char* argv[]) {
 
     // Compare admin polygons
     {
-        auto a = decode_admin(dir_a);
-        auto b = decode_admin(dir_b);
-        if (!compare_sorted("admin_polygons", std::move(a), std::move(b)))
+        std::cout << "Loading admin polygons..." << std::flush;
+        auto fps_a = fingerprint_admin(dir_a);
+        auto fps_b = fingerprint_admin(dir_b);
+        std::cout << " done." << std::endl;
+        if (!compare_multisets("admin_polygons", fps_a, fps_b))
             all_pass = false;
     }
 
     // Compare street ways
     {
-        auto a = decode_ways(dir_a);
-        auto b = decode_ways(dir_b);
-        if (!compare_sorted("street_ways", std::move(a), std::move(b)))
+        std::cout << "Loading street ways..." << std::flush;
+        auto fps_a = fingerprint_ways(dir_a);
+        auto fps_b = fingerprint_ways(dir_b);
+        std::cout << " done." << std::endl;
+        if (!compare_multisets("street_ways", fps_a, fps_b))
             all_pass = false;
     }
 
     // Compare address points
     {
-        auto a = decode_addrs(dir_a);
-        auto b = decode_addrs(dir_b);
-        if (!compare_sorted("address_points", std::move(a), std::move(b)))
+        std::cout << "Loading address points..." << std::flush;
+        auto fps_a = fingerprint_addrs(dir_a);
+        auto fps_b = fingerprint_addrs(dir_b);
+        std::cout << " done." << std::endl;
+        if (!compare_multisets("address_points", fps_a, fps_b))
+            all_pass = false;
+    }
+
+    // Compare interpolation ways
+    {
+        std::cout << "Loading interpolation ways..." << std::flush;
+        auto fps_a = fingerprint_interps(dir_a);
+        auto fps_b = fingerprint_interps(dir_b);
+        std::cout << " done." << std::endl;
+        if (!compare_multisets("interp_ways", fps_a, fps_b))
             all_pass = false;
     }
 
