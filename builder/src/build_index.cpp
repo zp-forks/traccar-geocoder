@@ -1985,7 +1985,7 @@ int main(int argc, char* argv[]) {
                     std::vector<AddrPoint> building_addrs;
                     std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
                     std::vector<std::string> way_strings;      // way name strings
-                    std::vector<std::string> addr_strings;     // building addr "hn\0street" strings
+                    std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
                     std::vector<std::string> interp_strings;   // interp street name strings
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
@@ -2107,7 +2107,7 @@ int main(int argc, char* argv[]) {
                                                     0, 0 // placeholder string IDs
                                                 });
                                                 // Store strings for later interning
-                                                local.addr_strings.push_back(std::string(housenumber) + "\0" + std::string(street));
+                                                local.addr_strings.push_back({housenumber, street});
                                                 local.building_addr_count++;
                                             }
                                         }
@@ -2251,13 +2251,10 @@ int main(int argc, char* argv[]) {
 
                     // Merge building addresses
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
-                        auto& s = local.addr_strings[i];
-                        auto sep = s.find('\0');
-                        std::string hn = s.substr(0, sep);
-                        std::string st = s.substr(sep + 1);
                         uint64_t dummy = 0;
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
-                                       hn.c_str(), st.c_str(), dummy);
+                                       local.addr_strings[i].first.c_str(),
+                                       local.addr_strings[i].second.c_str(), dummy);
                     }
 
                     // Merge interpolation ways

@@ -291,16 +291,79 @@ static std::vector<std::string> fingerprint_interps(const std::string& dir) {
     return fps;
 }
 
+// --- Semantic (cross-version) fingerprints ---
+// Match by name/attributes only, ignoring coordinate precision differences
+
+// Way: name + node_count only
+static std::string way_semantic_fp(const std::string& name, size_t node_count) {
+    return name + "|" + std::to_string(node_count);
+}
+
+// Address: housenumber + street + coarse grid coords (~100m precision)
+// Centroid may differ slightly across code versions, so use coarse grid
+static std::string addr_semantic_fp(float lat, float lng,
+                                     const std::string& housenumber, const std::string& street) {
+    int glat = (int)(lat * 1e3f + (lat >= 0 ? 0.5f : -0.5f));
+    int glng = (int)(lng * 1e3f + (lng >= 0 ? 0.5f : -0.5f));
+    return std::to_string(glat) + "," + std::to_string(glng) + "|" + housenumber + "|" + street;
+}
+
+// Admin: name + level
+static std::string admin_semantic_fp(const std::string& name, uint8_t admin_level) {
+    return name + "|" + std::to_string(admin_level);
+}
+
+static std::vector<std::string> semantic_fp_ways(const std::string& dir) {
+    auto strings = read_file(dir + "/strings.bin");
+    auto ways = read_structs<WayHeader>(dir + "/street_ways.bin");
+
+    std::vector<std::string> fps;
+    fps.reserve(ways.size());
+    for (const auto& w : ways) {
+        std::string name = get_string(strings, w.name_id);
+        fps.push_back(way_semantic_fp(name, w.node_count));
+    }
+    return fps;
+}
+
+static std::vector<std::string> semantic_fp_addrs(const std::string& dir) {
+    auto strings = read_file(dir + "/strings.bin");
+    auto points = read_structs<AddrPoint>(dir + "/addr_points.bin");
+
+    std::vector<std::string> fps;
+    fps.reserve(points.size());
+    for (const auto& p : points) {
+        std::string hn = get_string(strings, p.housenumber_id);
+        std::string st = get_string(strings, p.street_id);
+        fps.push_back(addr_semantic_fp(p.lat, p.lng, hn, st));
+    }
+    return fps;
+}
+
+static std::vector<std::string> semantic_fp_admin(const std::string& dir) {
+    auto strings = read_file(dir + "/strings.bin");
+    auto polygons = read_structs<AdminPolygon>(dir + "/admin_polygons.bin");
+
+    std::vector<std::string> fps;
+    fps.reserve(polygons.size());
+    for (const auto& p : polygons) {
+        std::string name = get_string(strings, p.name_id);
+        fps.push_back(admin_semantic_fp(name, p.admin_level));
+    }
+    return fps;
+}
+
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: compare_indexes <dir-A> <dir-B>" << std::endl;
+    if (argc < 3) {
+        std::cerr << "Usage: compare_indexes <dir-A> <dir-B> [--semantic]" << std::endl;
         return 2;
     }
 
     std::string dir_a = argv[1];
     std::string dir_b = argv[2];
+    bool semantic = (argc > 3 && std::string(argv[3]) == "--semantic");
 
-    std::cout << "Comparing:" << std::endl;
+    std::cout << "Comparing" << (semantic ? " (semantic/cross-version)" : " (exact)") << ":" << std::endl;
     std::cout << "  A: " << dir_a << std::endl;
     std::cout << "  B: " << dir_b << std::endl;
     std::cout << std::endl;
@@ -310,8 +373,8 @@ int main(int argc, char* argv[]) {
     // Compare admin polygons
     {
         std::cout << "Loading admin polygons..." << std::flush;
-        auto fps_a = fingerprint_admin(dir_a);
-        auto fps_b = fingerprint_admin(dir_b);
+        auto fps_a = semantic ? semantic_fp_admin(dir_a) : fingerprint_admin(dir_a);
+        auto fps_b = semantic ? semantic_fp_admin(dir_b) : fingerprint_admin(dir_b);
         std::cout << " done." << std::endl;
         if (!compare_multisets("admin_polygons", fps_a, fps_b))
             all_pass = false;
@@ -320,8 +383,8 @@ int main(int argc, char* argv[]) {
     // Compare street ways
     {
         std::cout << "Loading street ways..." << std::flush;
-        auto fps_a = fingerprint_ways(dir_a);
-        auto fps_b = fingerprint_ways(dir_b);
+        auto fps_a = semantic ? semantic_fp_ways(dir_a) : fingerprint_ways(dir_a);
+        auto fps_b = semantic ? semantic_fp_ways(dir_b) : fingerprint_ways(dir_b);
         std::cout << " done." << std::endl;
         if (!compare_multisets("street_ways", fps_a, fps_b))
             all_pass = false;
@@ -330,8 +393,8 @@ int main(int argc, char* argv[]) {
     // Compare address points
     {
         std::cout << "Loading address points..." << std::flush;
-        auto fps_a = fingerprint_addrs(dir_a);
-        auto fps_b = fingerprint_addrs(dir_b);
+        auto fps_a = semantic ? semantic_fp_addrs(dir_a) : fingerprint_addrs(dir_a);
+        auto fps_b = semantic ? semantic_fp_addrs(dir_b) : fingerprint_addrs(dir_b);
         std::cout << " done." << std::endl;
         if (!compare_multisets("address_points", fps_a, fps_b))
             all_pass = false;
