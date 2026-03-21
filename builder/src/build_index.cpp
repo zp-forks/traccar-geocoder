@@ -596,10 +596,22 @@ static void add_addr_point(ParsedData& data, double lat, double lng,
 // --- Add an admin polygon ---
 
 static void add_admin_polygon(ParsedData& data,
-                               const std::vector<std::pair<double,double>>& vertices,
+                               const std::vector<std::pair<double,double>>& vertices_in,
                                const char* name, uint8_t admin_level,
                                const char* country_code,
                                AdminCoverPool* admin_pool = nullptr) {
+    // Normalize ring rotation: start at the vertex with smallest (lat, lng)
+    // This ensures identical output regardless of ring assembly order.
+    auto vertices = vertices_in;
+    if (vertices.size() >= 4 &&
+        std::fabs(vertices.front().first - vertices.back().first) < 1e-7 &&
+        std::fabs(vertices.front().second - vertices.back().second) < 1e-7) {
+        vertices.pop_back();
+        auto min_it = std::min_element(vertices.begin(), vertices.end());
+        std::rotate(vertices.begin(), min_it, vertices.end());
+        vertices.push_back(vertices.front());
+    }
+
     // Simplify large polygons
     auto simplified = simplify_polygon(vertices, 500);
     if (simplified.size() < 3) return;
