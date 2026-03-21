@@ -2044,6 +2044,14 @@ int main(int argc, char* argv[]) {
                         int64_t last_node_id;
                     };
                     std::vector<WayGeomEntry> way_geoms;
+                    // Closed-way admin polygons (ways with boundary=administrative)
+                    struct ClosedWayAdmin {
+                        std::vector<std::pair<double,double>> vertices;
+                        std::string name;
+                        uint8_t admin_level;
+                        std::string country_code;
+                    };
+                    std::vector<ClosedWayAdmin> closed_way_admins;
                 };
 
                 // Read buffers and dispatch to thread pool
@@ -2210,6 +2218,55 @@ int main(int argc, char* argv[]) {
                                             local.way_geoms.push_back({way.id(), std::move(geom), first_nid, last_nid});
                                         }
                                     }
+
+                                    // Handle closed ways that are admin boundaries themselves
+                                    // (not part of a multipolygon relation, but standalone polygons)
+                                    if (parallel_admin) {
+                                        const char* boundary = way.tags()["boundary"];
+                                        if (boundary) {
+                                            bool is_admin = (std::strcmp(boundary, "administrative") == 0);
+                                            bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
+                                            if ((is_admin || is_postal) && wnodes.size() >= 4 &&
+                                                wnodes.front().ref() == wnodes.back().ref()) {
+                                                // Closed way forming an admin polygon
+                                                uint8_t al = 0;
+                                                if (is_admin) {
+                                                    const char* level_str = way.tags()["admin_level"];
+                                                    if (level_str) al = static_cast<uint8_t>(std::atoi(level_str));
+                                                } else {
+                                                    al = 11;
+                                                }
+                                                if (al >= 2 && al <= 11 && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
+                                                    const char* aname = way.tags()["name"];
+                                                    if (!aname && is_postal) aname = way.tags()["postal_code"];
+                                                    if (aname || is_postal) {
+                                                        std::vector<std::pair<double,double>> verts;
+                                                        bool all_valid = true;
+                                                        for (const auto& nr : wnodes) {
+                                                            try {
+                                                                auto loc = index.get(nr.positive_ref());
+                                                                if (loc.valid()) {
+                                                                    verts.push_back({loc.lat(), loc.lon()});
+                                                                } else { all_valid = false; break; }
+                                                            } catch (...) { all_valid = false; break; }
+                                                        }
+                                                        if (all_valid && verts.size() >= 3) {
+                                                            std::string cc;
+                                                            if (al == 2) {
+                                                                const char* iso = way.tags()["ISO3166-1:alpha2"];
+                                                                if (iso) cc = iso;
+                                                            }
+                                                            local.closed_way_admins.push_back({
+                                                                std::move(verts),
+                                                                aname ? aname : "",
+                                                                al, std::move(cc)
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -2340,6 +2397,24 @@ int main(int argc, char* argv[]) {
                 std::cerr << "  Merged: " << total_ways << " ways, "
                           << total_building_addrs << " building addrs, "
                           << total_interps << " interps from parallel processing." << std::endl;
+
+                // --- Merge closed-way admin polygons ---
+                if (parallel_admin) {
+                    uint64_t closed_way_admin_count = 0;
+                    for (auto& local : tld) {
+                        for (auto& cwa : local.closed_way_admins) {
+                            const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
+                            add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
+                                              cwa.admin_level, cc, &admin_pool);
+                            closed_way_admin_count++;
+                        }
+                        local.closed_way_admins.clear();
+                    }
+                    if (closed_way_admin_count > 0) {
+                        std::cerr << "  Added " << closed_way_admin_count
+                                  << " admin polygons from closed ways." << std::endl;
+                    }
+                }
 
                 // --- Parallel admin boundary assembly ---
                 if (parallel_admin) {
