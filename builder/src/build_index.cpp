@@ -473,69 +473,108 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     struct WayRef {
         int64_t way_id;
         const ParsedData::WayGeometry* geom;
-        bool used;
     };
     std::vector<WayRef> outer_ways;
     for (const auto& [way_id, role] : members) {
         if (role == "outer" || role.empty()) {
             auto it = way_geoms.find(way_id);
             if (it != way_geoms.end() && !it->second.coords.empty()) {
-                outer_ways.push_back({way_id, &it->second, false});
+                outer_ways.push_back({way_id, &it->second});
             }
         }
     }
 
+    // Build adjacency: node_id -> list of (way_index, is_last_node)
+    // Each way has two endpoints: first_node_id and last_node_id
+    std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>> node_to_ways;
+    for (size_t i = 0; i < outer_ways.size(); i++) {
+        const auto* g = outer_ways[i].geom;
+        node_to_ways[g->first_node_id].push_back({i, false});
+        node_to_ways[g->last_node_id].push_back({i, true});
+    }
+
+    std::vector<bool> used(outer_ways.size(), false);
     std::vector<std::vector<std::pair<double,double>>> rings;
 
+    // Recursive ring closure with backtracking at branch points
+    struct BacktrackState {
+        const std::vector<WayRef>& ways;
+        const std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>>& adj;
+        std::vector<bool>& used;
+
+        // Try to close a ring from ring_last_nid back to ring_first_nid
+        // path = ordered list of (way_index, reversed) already chosen
+        bool try_close(int64_t ring_first_nid, int64_t ring_last_nid,
+                       std::vector<std::pair<size_t, bool>>& path, int depth) {
+            if (depth > 5000) return false;
+
+            // Closed?
+            if (ring_first_nid == ring_last_nid && !path.empty()) return true;
+
+            // Find candidates adjacent to ring_last_nid
+            auto it = adj.find(ring_last_nid);
+            if (it == adj.end()) return false;
+
+            for (const auto& [wi, is_last] : it->second) {
+                if (used[wi]) continue;
+                const auto* g = ways[wi].geom;
+
+                // If is_last, this way's last_node matches ring_last, so traverse reversed
+                bool reversed = is_last;
+                int64_t new_last = reversed ? g->first_node_id : g->last_node_id;
+
+                used[wi] = true;
+                path.push_back({wi, reversed});
+
+                if (try_close(ring_first_nid, new_last, path, depth + 1)) {
+                    return true;
+                }
+
+                path.pop_back();
+                used[wi] = false;
+            }
+            return false;
+        }
+    };
+
+    BacktrackState state{outer_ways, node_to_ways, used};
+
     for (size_t start_idx = 0; start_idx < outer_ways.size(); start_idx++) {
-        if (outer_ways[start_idx].used) continue;
+        if (used[start_idx]) continue;
 
-        outer_ways[start_idx].used = true;
-        std::vector<std::pair<double,double>> ring = outer_ways[start_idx].geom->coords;
+        const auto* start_geom = outer_ways[start_idx].geom;
+        int64_t ring_first_nid = start_geom->first_node_id;
+        int64_t ring_last_nid = start_geom->last_node_id;
 
-        // Track the current last node ID of the ring
-        int64_t ring_first_nid = outer_ways[start_idx].geom->first_node_id;
-        int64_t ring_last_nid = outer_ways[start_idx].geom->last_node_id;
-
-        bool extended = true;
-        while (extended) {
-            extended = false;
-
-            // Check if ring is closed (first node ID == last node ID)
-            if (ring.size() >= 4 && ring_first_nid == ring_last_nid) {
-                break;
-            }
-
-            for (size_t ci = 0; ci < outer_ways.size(); ci++) {
-                if (outer_ways[ci].used) continue;
-                const auto* cand = outer_ways[ci].geom;
-                if (cand->coords.empty()) continue;
-
-                // Try forward: candidate's first node matches ring's last node
-                if (cand->first_node_id == ring_last_nid) {
-                    outer_ways[ci].used = true;
-                    ring.insert(ring.end(), cand->coords.begin() + 1, cand->coords.end());
-                    ring_last_nid = cand->last_node_id;
-                    extended = true;
-                    break;
-                }
-
-                // Try reversed: candidate's last node matches ring's last node
-                if (cand->last_node_id == ring_last_nid) {
-                    outer_ways[ci].used = true;
-                    for (auto rit = cand->coords.rbegin() + 1; rit != cand->coords.rend(); ++rit) {
-                        ring.push_back(*rit);
-                    }
-                    ring_last_nid = cand->first_node_id;
-                    extended = true;
-                    break;
-                }
-            }
+        // Single way already closed
+        if (start_geom->coords.size() >= 4 && ring_first_nid == ring_last_nid) {
+            used[start_idx] = true;
+            rings.push_back(start_geom->coords);
+            continue;
         }
 
-        // Only keep closed rings
-        if (ring.size() >= 4 && ring_first_nid == ring_last_nid) {
-            rings.push_back(std::move(ring));
+        // Try to build a closed ring starting with this way
+        used[start_idx] = true;
+        std::vector<std::pair<size_t, bool>> path; // (way_index, reversed)
+        if (state.try_close(ring_first_nid, ring_last_nid, path, 0)) {
+            // Build the ring from start_geom + path
+            std::vector<std::pair<double,double>> ring = start_geom->coords;
+            for (const auto& [wi, reversed] : path) {
+                const auto& coords = outer_ways[wi].geom->coords;
+                if (!reversed) {
+                    ring.insert(ring.end(), coords.begin() + 1, coords.end());
+                } else {
+                    for (auto rit = coords.rbegin() + 1; rit != coords.rend(); ++rit) {
+                        ring.push_back(*rit);
+                    }
+                }
+            }
+            if (ring.size() >= 4) {
+                rings.push_back(std::move(ring));
+            }
+        } else {
+            // Failed — unmark start way so it can be used by another ring attempt
+            used[start_idx] = false;
         }
     }
 
