@@ -280,23 +280,39 @@ static int kStreetCellLevel = 17;
 static int kAdminCellLevel = 10;
 static int kMaxAdminLevel = 0;  // 0 means no filtering
 
-static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
+// Reusable cover_edge that takes an output vector to avoid allocation per call.
+// The S2RegionCoverer is expensive to construct — use thread_local to reuse it.
+static void cover_edge(double lat1, double lng1, double lat2, double lng2,
+                        std::vector<S2CellId>& out) {
+    out.clear();
     S2Point p1 = S2LatLng::FromDegrees(lat1, lng1).ToPoint();
     S2Point p2 = S2LatLng::FromDegrees(lat2, lng2).ToPoint();
 
     if (p1 == p2) {
-        return {S2CellId(p1).parent(kStreetCellLevel)};
+        out.push_back(S2CellId(p1).parent(kStreetCellLevel));
+        return;
     }
+
+    // For a simple edge at a fixed level, we can use a faster approach:
+    // walk the cells along the edge instead of full region covering.
+    // But S2RegionCoverer with fixed_level is already optimized for this.
+    thread_local S2RegionCoverer coverer = []() {
+        S2RegionCoverer::Options options;
+        options.set_fixed_level(kStreetCellLevel);
+        return S2RegionCoverer(options);
+    }();
 
     std::vector<S2Point> points = {p1, p2};
     S2Polyline polyline(points);
-
-    S2RegionCoverer::Options options;
-    options.set_fixed_level(kStreetCellLevel);
-
-    S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polyline);
-    return covering.cell_ids();
+    out = std::move(covering.cell_ids());
+}
+
+// Legacy overload for code that still uses return-by-value
+static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
+    std::vector<S2CellId> result;
+    cover_edge(lat1, lng1, lat2, lng2, result);
+    return result;
 }
 
 static S2CellId point_to_cell(double lat, double lng) {
@@ -1704,15 +1720,8 @@ static std::vector<uint32_t> write_entries(
         total_size += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
     }
 
-    // Build entries buffer and offset vector in one pass over cell_map
+    // Build entries buffer and offset vector
     std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
-
-    // Create position lookup: cell_id → index in sorted_cells (for O(1) lookup)
-    std::unordered_map<uint64_t, uint32_t> cell_to_pos;
-    cell_to_pos.reserve(sorted_cells.size());
-    for (uint32_t i = 0; i < sorted_cells.size(); i++) {
-        cell_to_pos[sorted_cells[i]] = i;
-    }
 
     // Build buffer by iterating sorted_cells (maintains sorted order in file)
     std::vector<char> buf;
@@ -2788,20 +2797,25 @@ int main(int argc, char* argv[]) {
                 for (unsigned int t = 0; t < num_threads; t++) {
                     threads.emplace_back([&, t]() {
                         auto& local = thread_maps[t].ways;
+                        std::vector<S2CellId> edge_cells; // reuse across calls
+                        std::vector<uint64_t> way_cells;  // reuse per-way
                         while (true) {
                             size_t i = way_idx.fetch_add(1);
                             if (i >= data.deferred_ways.size()) break;
                             const auto& dw = data.deferred_ways[i];
-                            std::unordered_set<uint64_t> cells;
+                            way_cells.clear();
                             for (uint8_t j = 0; j + 1 < dw.node_count; j++) {
                                 const auto& n1 = data.street_nodes[dw.node_offset + j];
                                 const auto& n2 = data.street_nodes[dw.node_offset + j + 1];
-                                auto edge_cells = cover_edge(n1.lat, n1.lng, n2.lat, n2.lng);
+                                cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
                                 for (const auto& c : edge_cells) {
-                                    cells.insert(c.id());
+                                    way_cells.push_back(c.id());
                                 }
                             }
-                            for (uint64_t cell_id : cells) {
+                            // Deduplicate cells for this way (sort + unique, faster than unordered_set)
+                            std::sort(way_cells.begin(), way_cells.end());
+                            way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
+                            for (uint64_t cell_id : way_cells) {
                                 local[cell_id].push_back(dw.way_id);
                             }
                         }
@@ -2819,20 +2833,24 @@ int main(int argc, char* argv[]) {
                 for (unsigned int t = 0; t < num_threads; t++) {
                     threads.emplace_back([&, t]() {
                         auto& local = thread_maps[t].interps;
+                        std::vector<S2CellId> edge_cells;
+                        std::vector<uint64_t> way_cells;
                         while (true) {
                             size_t i = interp_idx.fetch_add(1);
                             if (i >= data.deferred_interps.size()) break;
                             const auto& di = data.deferred_interps[i];
-                            std::unordered_set<uint64_t> cells;
+                            way_cells.clear();
                             for (uint8_t j = 0; j + 1 < di.node_count; j++) {
                                 const auto& n1 = data.interp_nodes[di.node_offset + j];
                                 const auto& n2 = data.interp_nodes[di.node_offset + j + 1];
-                                auto edge_cells = cover_edge(n1.lat, n1.lng, n2.lat, n2.lng);
+                                cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
                                 for (const auto& c : edge_cells) {
-                                    cells.insert(c.id());
+                                    way_cells.push_back(c.id());
                                 }
                             }
-                            for (uint64_t cell_id : cells) {
+                            std::sort(way_cells.begin(), way_cells.end());
+                            way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
+                            for (uint64_t cell_id : way_cells) {
                                 local[cell_id].push_back(di.interp_id);
                             }
                         }
@@ -2842,18 +2860,28 @@ int main(int argc, char* argv[]) {
             }
             std::cerr << "  Interpolation ways done." << std::endl;
 
-            // Merge thread-local maps into data
+            // Merge thread-local maps into data (ways and interps in parallel)
             std::cerr << "  Merging thread-local results..." << std::endl;
-            for (auto& tm : thread_maps) {
-                for (auto& [cell_id, ids] : tm.ways) {
-                    auto& target = data.cell_to_ways[cell_id];
-                    target.insert(target.end(), ids.begin(), ids.end());
+            auto merge_ways = std::async(std::launch::async, [&] {
+                for (auto& tm : thread_maps) {
+                    for (auto& [cell_id, ids] : tm.ways) {
+                        auto& target = data.cell_to_ways[cell_id];
+                        target.insert(target.end(), ids.begin(), ids.end());
+                    }
+                    tm.ways.clear();
                 }
-                for (auto& [cell_id, ids] : tm.interps) {
-                    auto& target = data.cell_to_interps[cell_id];
-                    target.insert(target.end(), ids.begin(), ids.end());
+            });
+            auto merge_interps = std::async(std::launch::async, [&] {
+                for (auto& tm : thread_maps) {
+                    for (auto& [cell_id, ids] : tm.interps) {
+                        auto& target = data.cell_to_interps[cell_id];
+                        target.insert(target.end(), ids.begin(), ids.end());
+                    }
+                    tm.interps.clear();
                 }
-            }
+            });
+            merge_ways.get();
+            merge_interps.get();
 
             // Free deferred work items
             data.deferred_ways.clear();
