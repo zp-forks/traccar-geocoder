@@ -2175,18 +2175,32 @@ int main(int argc, char* argv[]) {
                           << " admin/postal relations for parallel assembly." << std::endl;
             }
 
-            // --- Pass 2: nodes (streaming parallel block processing) ---
+            // --- Combined Pass 2+3: nodes then ways in a single PBF read ---
+            // PBF guarantees ordering: nodes → ways → relations.
+            // We read everything in one pass, processing nodes first, then
+            // transitioning to way processing when the first way block arrives.
             log_phase("Pass 1: relation scanning", _pt);
-            std::cerr << "  Pass 2: processing nodes in parallel..." << std::endl;
+
+            // Build admin_way_ids BEFORE the combined pass (needed during way processing)
+            std::unordered_set<int64_t> admin_way_ids;
+            if (parallel_admin) {
+                for (const auto& rel : data.collected_relations) {
+                    for (const auto& [way_id, role] : rel.members) {
+                        admin_way_ids.insert(way_id);
+                    }
+                }
+                std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
+            }
+
+            std::cerr << "  Pass 2+3: processing nodes and ways in single read..." << std::endl;
 
             {
-                // Producer-consumer: reader feeds blocks, workers process them
-                // Bounded queue prevents memory blowup
+                // Shared queue infrastructure for both phases
                 std::mutex queue_mutex;
                 std::condition_variable queue_cv;
                 std::deque<osmium::memory::Buffer> block_queue;
                 bool reader_done = false;
-                const size_t MAX_QUEUE = 64; // limit buffered blocks
+                const size_t MAX_QUEUE = 64;
 
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
@@ -2252,25 +2266,39 @@ int main(int argc, char* argv[]) {
                     });
                 }
 
-                // Reader thread (producer)
-                {
-                    osmium::io::Reader reader_nodes{input_file, osmium::osm_entity_bits::node};
-                    while (auto buf = reader_nodes.read()) {
-                        {
-                            std::unique_lock<std::mutex> lock(queue_mutex);
-                            queue_cv.wait(lock, [&]{ return block_queue.size() < MAX_QUEUE; });
-                            block_queue.push_back(std::move(buf));
-                        }
+                // Single reader for all entity types — processes nodes first,
+                // then transitions to way processing when first way block arrives.
+                osmium::io::Reader combined_reader{input_file};
+                bool nodes_done = false;
+                osmium::memory::Buffer first_way_buf; // stash the first way block
+
+                // Phase 1: Feed node blocks to node workers
+                while (auto buf = combined_reader.read()) {
+                    // Check if this buffer contains nodes or ways/relations
+                    bool has_node = false;
+                    for (const auto& item : buf) {
+                        if (item.type() == osmium::item_type::node) { has_node = true; break; }
+                    }
+
+                    if (has_node) {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        queue_cv.wait(lock, [&]{ return block_queue.size() < MAX_QUEUE; });
+                        block_queue.push_back(std::move(buf));
                         queue_cv.notify_one();
+                    } else {
+                        // First non-node block — stash it and transition
+                        first_way_buf = std::move(buf);
+                        nodes_done = true;
+                        break;
                     }
-                    reader_nodes.close();
-                    {
-                        std::lock_guard<std::mutex> lock(queue_mutex);
-                        reader_done = true;
-                    }
-                    queue_cv.notify_all();
                 }
 
+                // Signal node workers done
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    reader_done = true;
+                }
+                queue_cv.notify_all();
                 for (auto& w : node_workers) w.join();
 
                 // Merge address points
@@ -2286,27 +2314,10 @@ int main(int argc, char* argv[]) {
                 }
                 std::cerr << "  Node processing complete: " << total_addrs
                           << " address points collected." << std::endl;
-            }
+                log_phase("Pass 2: node processing", _pt);
+                std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
 
-            // --- Pass 3: ways + relations (parallel way processing) ---
-            // Build set of way IDs needed for admin assembly (to avoid storing all way geometries)
-            std::unordered_set<int64_t> admin_way_ids;
-            if (parallel_admin) {
-                for (const auto& rel : data.collected_relations) {
-                    for (const auto& [way_id, role] : rel.members) {
-                        admin_way_ids.insert(way_id);
-                    }
-                }
-                std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
-            }
-
-            log_phase("Pass 2: node processing", _pt);
-            std::cerr << "  Pass 3: processing ways and areas with " << num_threads
-                      << " threads..." << std::endl;
-
-            {
-                osmium::io::Reader reader_ways{input_file,
-                    osmium::osm_entity_bits::way | osmium::osm_entity_bits::relation};
+                // --- Phase 2: Way processing using same reader ---
 
                 // Thread-local data for parallel way processing
                 struct ThreadLocalData {
@@ -2351,7 +2362,7 @@ int main(int argc, char* argv[]) {
                 const size_t WAY_MAX_QUEUE = 64;
 
                 std::vector<ThreadLocalData> tld(num_threads);
-                std::atomic<uint64_t> blocks_done{0};
+                std::atomic<uint64_t> way_blocks_done{0};
 
                 std::vector<std::thread> workers;
                 for (unsigned int t = 0; t < num_threads; t++) {
@@ -2569,7 +2580,7 @@ int main(int argc, char* argv[]) {
                                 }
                             }
 
-                            uint64_t done = blocks_done.fetch_add(1) + 1;
+                            uint64_t done = way_blocks_done.fetch_add(1) + 1;
                             if (done % 1000 == 0) {
                                 std::cerr << "  Processed " << done << " way blocks..." << std::endl;
                             }
@@ -2577,9 +2588,17 @@ int main(int argc, char* argv[]) {
                     });
                 }
 
-                // Way reader (producer)
+                // Way reader: use the combined_reader (continuing from where nodes left off)
                 {
-                    while (auto buf = reader_ways.read()) {
+                    // First, push the stashed way buffer
+                    if (first_way_buf) {
+                        std::unique_lock<std::mutex> lock(way_queue_mutex);
+                        way_queue_cv.wait(lock, [&]{ return way_block_queue.size() < WAY_MAX_QUEUE; });
+                        way_block_queue.push_back(std::move(first_way_buf));
+                        way_queue_cv.notify_one();
+                    }
+                    // Continue reading remaining blocks from the same reader
+                    while (auto buf = combined_reader.read()) {
                         {
                             std::unique_lock<std::mutex> lock(way_queue_mutex);
                             way_queue_cv.wait(lock, [&]{ return way_block_queue.size() < WAY_MAX_QUEUE; });
@@ -2587,7 +2606,7 @@ int main(int argc, char* argv[]) {
                         }
                         way_queue_cv.notify_one();
                     }
-                    reader_ways.close();
+                    combined_reader.close();
                     {
                         std::lock_guard<std::mutex> lock(way_queue_mutex);
                         way_reader_done = true;
@@ -2717,7 +2736,7 @@ int main(int argc, char* argv[]) {
 
                 // --- Parallel admin boundary assembly ---
                 if (parallel_admin) {
-                    log_phase("Pass 3: way processing", _pt);
+                    log_phase("Pass 2b: way processing", _pt);
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
                               << data.way_geometries.size() << " way geometries)..." << std::endl;
