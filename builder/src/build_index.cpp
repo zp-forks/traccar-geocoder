@@ -615,7 +615,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
 
         bool try_close(int64_t first_key, int64_t last_key,
                        std::vector<std::pair<size_t, bool>>& path, int depth) {
-            if (depth > 10000) return false;
+            if (depth > 500) return false; // Limit backtracking depth for planet-scale data
             if (!path.empty() && first_key == last_key) return true;
 
             auto it = adj.find(last_key);
