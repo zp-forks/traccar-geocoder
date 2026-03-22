@@ -606,8 +606,8 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     std::vector<bool> used(sub_ways.size(), false);
     std::vector<std::vector<std::pair<double,double>>> rings;
 
-    // Ring closure: greedy first, then limited backtracking fallback.
-    // Track used sub-ways per attempt so we can reset on failure.
+    // Ring closure: backtracking first (correct), greedy fallback (fast).
+    // Backtracking has a 100K call budget to prevent exponential blowup.
 
     // Backtracking with depth limit (for fallback only)
     struct BacktrackState {
@@ -643,7 +643,9 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         }
     };
 
+    // Backtracking first (correct branch choices), greedy fallback (for budget-exceeded cases)
     BacktrackState bt{sub_ways, coord_adj, used, coord_key, 0};
+    bool budget_exceeded = false;
 
     for (size_t start_idx = 0; start_idx < sub_ways.size(); start_idx++) {
         if (used[start_idx]) continue;
@@ -659,7 +661,33 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
             continue;
         }
 
-        // Greedy extension: follow the chain, tracking what we use
+        // Try backtracking first (correct at branch points)
+        used[start_idx] = true;
+        bt.calls = 0;
+        std::vector<std::pair<size_t, bool>> path;
+        if (bt.try_close(first_key, last_key, path, 0)) {
+            std::vector<std::pair<double,double>> ring = sg.coords;
+            for (const auto& [wi, reversed] : path) {
+                const auto& coords = sub_ways[wi].coords;
+                if (!reversed) {
+                    ring.insert(ring.end(), coords.begin() + 1, coords.end());
+                } else {
+                    for (auto rit = coords.rbegin() + 1; rit != coords.rend(); ++rit) {
+                        ring.push_back(*rit);
+                    }
+                }
+            }
+            if (ring.size() >= 4 && !ring_has_self_intersection(ring)) {
+                rings.push_back(std::move(ring));
+                continue;
+            }
+        }
+
+        // Backtracking failed or budget exceeded — try greedy
+        used[start_idx] = false;
+        if (bt.calls >= 100000) budget_exceeded = true;
+
+        // Greedy extension
         used[start_idx] = true;
         std::vector<size_t> attempt_used = {start_idx};
         std::vector<std::pair<double,double>> ring = sg.coords;
@@ -669,24 +697,16 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
             extended = false;
             auto it = coord_adj.find(current_last);
             if (it == coord_adj.end()) break;
-
             for (const auto& [wi, is_last] : it->second) {
                 if (used[wi]) continue;
                 const auto& sw = sub_ways[wi];
                 bool reversed = is_last;
                 auto& endpoint = reversed ? sw.coords.front() : sw.coords.back();
-                int64_t new_key = coord_key(endpoint.first, endpoint.second);
-
                 used[wi] = true;
                 attempt_used.push_back(wi);
-                if (!reversed) {
-                    ring.insert(ring.end(), sw.coords.begin() + 1, sw.coords.end());
-                } else {
-                    for (auto rit = sw.coords.rbegin() + 1; rit != sw.coords.rend(); ++rit) {
-                        ring.push_back(*rit);
-                    }
-                }
-                current_last = new_key;
+                if (!reversed) ring.insert(ring.end(), sw.coords.begin() + 1, sw.coords.end());
+                else for (auto rit = sw.coords.rbegin() + 1; rit != sw.coords.rend(); ++rit) ring.push_back(*rit);
+                current_last = coord_key(endpoint.first, endpoint.second);
                 extended = true;
                 break;
             }
@@ -695,85 +715,8 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         if (ring.size() >= 4 && current_last == first_key &&
             !ring_has_self_intersection(ring)) {
             rings.push_back(std::move(ring));
-            continue;
-        }
-
-        // Greedy failed — reset and try backtracking with limited work budget
-        for (auto wi : attempt_used) used[wi] = false;
-
-        used[start_idx] = true;
-        bt.calls = 0;
-        std::vector<std::pair<size_t, bool>> path;
-        if (bt.try_close(first_key, last_key, path, 0)) {
-            std::vector<std::pair<double,double>> bt_ring = sg.coords;
-            for (const auto& [wi, reversed] : path) {
-                const auto& coords = sub_ways[wi].coords;
-                if (!reversed) {
-                    bt_ring.insert(bt_ring.end(), coords.begin() + 1, coords.end());
-                } else {
-                    for (auto rit = coords.rbegin() + 1; rit != coords.rend(); ++rit) {
-                        bt_ring.push_back(*rit);
-                    }
-                }
-            }
-            if (bt_ring.size() >= 4 && !ring_has_self_intersection(bt_ring)) {
-                rings.push_back(std::move(bt_ring));
-                continue;
-            }
-        }
-
-        // Both failed — reset
-        used[start_idx] = false;
-    }
-
-    // Second pass: try backtracking on remaining unused sub-ways.
-    // The greedy pass may have consumed sub-ways needed by other rings.
-    // Reset all unused flags and try again with backtracking only.
-    { // Second pass: backtracking retry (100K call budget prevents exponential blowup)
-        bool any_unused = false;
-        for (size_t i = 0; i < used.size(); i++) {
-            if (!used[i]) { any_unused = true; break; }
-        }
-        if (any_unused) {
-            // Reset ALL used flags and try pure backtracking
-            std::fill(used.begin(), used.end(), false);
-            // Re-mark already-found rings' sub-ways as used
-            // (we can't easily do this, so just re-run from scratch)
-            std::vector<std::vector<std::pair<double,double>>> saved_rings = std::move(rings);
-            rings.clear();
-
-            for (size_t start_idx = 0; start_idx < sub_ways.size(); start_idx++) {
-                if (used[start_idx]) continue;
-                const auto& sg = sub_ways[start_idx];
-                int64_t fk = coord_key(sg.coords.front().first, sg.coords.front().second);
-                int64_t lk = coord_key(sg.coords.back().first, sg.coords.back().second);
-                if (sg.coords.size() >= 4 && fk == lk) {
-                    used[start_idx] = true;
-                    rings.push_back(sg.coords);
-                    continue;
-                }
-                used[start_idx] = true;
-                bt.calls = 0;
-                std::vector<std::pair<size_t, bool>> path;
-                if (bt.try_close(fk, lk, path, 0)) {
-                    std::vector<std::pair<double,double>> r = sg.coords;
-                    for (const auto& [wi, rev] : path) {
-                        const auto& c = sub_ways[wi].coords;
-                        if (!rev) r.insert(r.end(), c.begin() + 1, c.end());
-                        else for (auto it2 = c.rbegin() + 1; it2 != c.rend(); ++it2) r.push_back(*it2);
-                    }
-                    if (r.size() >= 4 && !ring_has_self_intersection(r)) {
-                        rings.push_back(std::move(r));
-                        continue;
-                    }
-                }
-                used[start_idx] = false;
-            }
-
-            // Use whichever pass produced more rings
-            if (rings.size() < saved_rings.size()) {
-                rings = std::move(saved_rings);
-            }
+        } else {
+            for (auto wi : attempt_used) used[wi] = false;
         }
     }
 
