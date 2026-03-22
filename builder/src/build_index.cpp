@@ -698,8 +698,8 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         for (size_t i = 0; i < used.size(); i++) {
             if (!used[i]) { any_unused = true; break; }
         }
-        if (any_unused) {
-            // Try pure backtracking from clean state
+        if (any_unused && sub_ways.size() <= 30) {
+            // Only retry for small relations — large ones stall the build
             std::vector<bool> bt_used(sub_ways.size(), false);
             std::vector<std::vector<std::pair<double,double>>> bt_rings;
 
