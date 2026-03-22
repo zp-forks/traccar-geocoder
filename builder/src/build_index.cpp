@@ -1777,6 +1777,7 @@ static void write_cell_index(
 
 static void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
     ensure_dir(output_dir);
+    auto _wt = std::chrono::steady_clock::now();
 
     bool write_streets = (mode != IndexMode::AdminOnly);
     bool write_addresses = (mode == IndexMode::Full);
@@ -1816,6 +1817,7 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
             street_offsets = f1.get();
         }
 
+        log_phase("  Write: entry files", _wt);
         // Build geo_cells.bin in memory buffer (avoids 332M × 4 small writes + hash lookups)
         {
             size_t n = sorted_geo_cells.size();
@@ -1844,6 +1846,7 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
                   << data.interp_ways.size() << " interps)" << std::endl;
     }
 
+    log_phase("  Write: geo_cells.bin", _wt);
     // Write admin cell index, raw data files, and admin polygons in parallel
     auto admin_future = std::async(std::launch::async, [&] {
         write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
@@ -1894,6 +1897,7 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
     }));
 
     // Wait for all parallel writes
+    log_phase("  Write: parallel data files launched", _wt);
     admin_future.get();
     for (auto& f : write_futures) f.get();
 }
@@ -2782,23 +2786,26 @@ int main(int argc, char* argv[]) {
             log_phase("Admin assembly", _pt);
             std::cerr << "Computing S2 cells for ways with " << num_threads << " threads..." << std::endl;
 
-            // Each thread builds its own local cell maps, then we merge
-            struct ThreadLocalMaps {
-                std::unordered_map<uint64_t, std::vector<uint32_t>> ways;
-                std::unordered_map<uint64_t, std::vector<uint32_t>> interps;
-            };
-            std::vector<ThreadLocalMaps> thread_maps(num_threads);
+            // Flat-array approach: threads emit (cell_id, item_id) pairs into
+            // thread-local vectors, then we sort globally and group by cell_id.
+            // This avoids hash maps entirely — sort is cache-friendly O(n log n).
 
-            // Process streets in parallel
+            struct CellItem { uint64_t cell_id; uint32_t item_id; };
+
+            auto _s2t = std::chrono::steady_clock::now();
+
+            // Process streets: emit (cell_id, way_id) pairs
             std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
+            std::vector<std::vector<CellItem>> way_pairs(num_threads);
             {
                 std::atomic<size_t> way_idx{0};
                 std::vector<std::thread> threads;
                 for (unsigned int t = 0; t < num_threads; t++) {
                     threads.emplace_back([&, t]() {
-                        auto& local = thread_maps[t].ways;
-                        std::vector<S2CellId> edge_cells; // reuse across calls
-                        std::vector<uint64_t> way_cells;  // reuse per-way
+                        auto& local = way_pairs[t];
+                        local.reserve(data.deferred_ways.size() / num_threads * 3);
+                        std::vector<S2CellId> edge_cells;
+                        std::vector<uint64_t> way_cells;
                         while (true) {
                             size_t i = way_idx.fetch_add(1);
                             if (i >= data.deferred_ways.size()) break;
@@ -2808,31 +2815,29 @@ int main(int argc, char* argv[]) {
                                 const auto& n1 = data.street_nodes[dw.node_offset + j];
                                 const auto& n2 = data.street_nodes[dw.node_offset + j + 1];
                                 cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
-                                for (const auto& c : edge_cells) {
-                                    way_cells.push_back(c.id());
-                                }
+                                for (const auto& c : edge_cells) way_cells.push_back(c.id());
                             }
-                            // Deduplicate cells for this way (sort + unique, faster than unordered_set)
                             std::sort(way_cells.begin(), way_cells.end());
                             way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
                             for (uint64_t cell_id : way_cells) {
-                                local[cell_id].push_back(dw.way_id);
+                                local.push_back({cell_id, dw.way_id});
                             }
                         }
                     });
                 }
                 for (auto& t : threads) t.join();
             }
-            std::cerr << "  Street ways done." << std::endl;
+            log_phase("  S2: street ways (parallel)", _s2t);
 
-            // Process interpolations in parallel
+            // Process interpolations: emit (cell_id, interp_id) pairs
             std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
+            std::vector<std::vector<CellItem>> interp_pairs(num_threads);
             {
                 std::atomic<size_t> interp_idx{0};
                 std::vector<std::thread> threads;
                 for (unsigned int t = 0; t < num_threads; t++) {
                     threads.emplace_back([&, t]() {
-                        auto& local = thread_maps[t].interps;
+                        auto& local = interp_pairs[t];
                         std::vector<S2CellId> edge_cells;
                         std::vector<uint64_t> way_cells;
                         while (true) {
@@ -2844,44 +2849,59 @@ int main(int argc, char* argv[]) {
                                 const auto& n1 = data.interp_nodes[di.node_offset + j];
                                 const auto& n2 = data.interp_nodes[di.node_offset + j + 1];
                                 cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
-                                for (const auto& c : edge_cells) {
-                                    way_cells.push_back(c.id());
-                                }
+                                for (const auto& c : edge_cells) way_cells.push_back(c.id());
                             }
                             std::sort(way_cells.begin(), way_cells.end());
                             way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
                             for (uint64_t cell_id : way_cells) {
-                                local[cell_id].push_back(di.interp_id);
+                                local.push_back({cell_id, di.interp_id});
                             }
                         }
                     });
                 }
                 for (auto& t : threads) t.join();
             }
-            std::cerr << "  Interpolation ways done." << std::endl;
+            log_phase("  S2: interp ways (parallel)", _s2t);
 
-            // Merge thread-local maps into data (ways and interps in parallel)
-            std::cerr << "  Merging thread-local results..." << std::endl;
-            auto merge_ways = std::async(std::launch::async, [&] {
-                for (auto& tm : thread_maps) {
-                    for (auto& [cell_id, ids] : tm.ways) {
-                        auto& target = data.cell_to_ways[cell_id];
-                        target.insert(target.end(), ids.begin(), ids.end());
-                    }
-                    tm.ways.clear();
+            // Merge thread-local pairs into single vectors, sort, build cell maps
+            std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
+            auto build_cell_map = [](std::vector<std::vector<CellItem>>& thread_pairs,
+                                      std::unordered_map<uint64_t, std::vector<uint32_t>>& out) {
+                // Concatenate all thread-local vectors
+                size_t total = 0;
+                for (auto& v : thread_pairs) total += v.size();
+                std::vector<CellItem> all;
+                all.reserve(total);
+                for (auto& v : thread_pairs) {
+                    all.insert(all.end(), v.begin(), v.end());
+                    v.clear(); v.shrink_to_fit();
                 }
-            });
-            auto merge_interps = std::async(std::launch::async, [&] {
-                for (auto& tm : thread_maps) {
-                    for (auto& [cell_id, ids] : tm.interps) {
-                        auto& target = data.cell_to_interps[cell_id];
-                        target.insert(target.end(), ids.begin(), ids.end());
-                    }
-                    tm.interps.clear();
+                // Sort by cell_id
+                std::sort(all.begin(), all.end(), [](const CellItem& a, const CellItem& b) {
+                    return a.cell_id < b.cell_id;
+                });
+                // Group into cell map
+                out.reserve(total / 2); // rough estimate of unique cells
+                for (size_t i = 0; i < all.size(); ) {
+                    size_t j = i;
+                    while (j < all.size() && all[j].cell_id == all[i].cell_id) j++;
+                    auto& vec = out[all[i].cell_id];
+                    vec.reserve(j - i);
+                    for (size_t k = i; k < j; k++) vec.push_back(all[k].item_id);
+                    i = j;
                 }
+            };
+
+            // Build way and interp maps in parallel
+            auto f_ways = std::async(std::launch::async, [&] {
+                build_cell_map(way_pairs, data.cell_to_ways);
             });
-            merge_ways.get();
-            merge_interps.get();
+            auto f_interps = std::async(std::launch::async, [&] {
+                build_cell_map(interp_pairs, data.cell_to_interps);
+            });
+            f_ways.get();
+            f_interps.get();
+            log_phase("  S2: sort + group into cell maps", _s2t);
 
             // Free deferred work items
             data.deferred_ways.clear();
