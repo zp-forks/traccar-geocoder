@@ -1774,21 +1774,37 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
 
     if (write_streets) {
         // Merged geo cell index for streets, addresses, and interpolation
-        std::set<uint64_t> all_geo_cells;
-        for (const auto& [id, _] : data.cell_to_ways) all_geo_cells.insert(id);
-        if (write_addresses) {
-            for (const auto& [id, _] : data.cell_to_addrs) all_geo_cells.insert(id);
-            for (const auto& [id, _] : data.cell_to_interps) all_geo_cells.insert(id);
+        // Use sorted vector instead of std::set for faster construction
+        std::vector<uint64_t> sorted_geo_cells;
+        {
+            std::unordered_set<uint64_t> all_geo_cells;
+            all_geo_cells.reserve(data.cell_to_ways.size() + data.cell_to_addrs.size());
+            for (const auto& [id, _] : data.cell_to_ways) all_geo_cells.insert(id);
+            if (write_addresses) {
+                for (const auto& [id, _] : data.cell_to_addrs) all_geo_cells.insert(id);
+                for (const auto& [id, _] : data.cell_to_interps) all_geo_cells.insert(id);
+            }
+            sorted_geo_cells.assign(all_geo_cells.begin(), all_geo_cells.end());
+            std::sort(sorted_geo_cells.begin(), sorted_geo_cells.end());
         }
-        std::vector<uint64_t> sorted_geo_cells(all_geo_cells.begin(), all_geo_cells.end());
 
-        auto street_offsets = write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, data.cell_to_ways);
-
-        std::unordered_map<uint64_t, uint32_t> addr_offsets;
-        std::unordered_map<uint64_t, uint32_t> interp_offsets;
-        if (write_addresses) {
-            addr_offsets = write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, data.cell_to_addrs);
-            interp_offsets = write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, data.cell_to_interps);
+        // Write entry files in parallel
+        std::unordered_map<uint64_t, uint32_t> street_offsets, addr_offsets, interp_offsets;
+        {
+            auto f1 = std::async(std::launch::async, [&]() {
+                return write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, data.cell_to_ways);
+            });
+            if (write_addresses) {
+                auto f2 = std::async(std::launch::async, [&]() {
+                    return write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, data.cell_to_addrs);
+                });
+                auto f3 = std::async(std::launch::async, [&]() {
+                    return write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, data.cell_to_interps);
+                });
+                addr_offsets = f2.get();
+                interp_offsets = f3.get();
+            }
+            street_offsets = f1.get();
         }
 
         {
@@ -1812,61 +1828,58 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
                   << data.interp_ways.size() << " interps)" << std::endl;
     }
 
-    write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
-    std::cerr << "admin index: " << data.cell_to_admin.size() << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
+    // Write admin cell index, raw data files, and admin polygons in parallel
+    auto admin_future = std::async(std::launch::async, [&] {
+        write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
+        std::cerr << "admin index: " << data.cell_to_admin.size() << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
+    });
+
+    std::vector<std::future<void>> write_futures;
 
     if (write_streets) {
-        // Street ways
-        {
+        write_futures.push_back(std::async(std::launch::async, [&] {
             std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.ways.data()), data.ways.size() * sizeof(WayHeader));
-        }
-
-        // Street nodes
-        {
+        }));
+        write_futures.push_back(std::async(std::launch::async, [&] {
             std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.street_nodes.data()), data.street_nodes.size() * sizeof(NodeCoord));
-        }
-
+        }));
         if (write_addresses) {
-            // Address points
-            {
+            write_futures.push_back(std::async(std::launch::async, [&] {
                 std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(data.addr_points.data()), data.addr_points.size() * sizeof(AddrPoint));
-            }
-
-            // Interpolation ways
-            {
+            }));
+            write_futures.push_back(std::async(std::launch::async, [&] {
                 std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(data.interp_ways.data()), data.interp_ways.size() * sizeof(InterpWay));
-            }
-
-            // Interpolation nodes
-            {
+            }));
+            write_futures.push_back(std::async(std::launch::async, [&] {
                 std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(data.interp_nodes.data()), data.interp_nodes.size() * sizeof(NodeCoord));
-            }
+            }));
         }
     }
 
-    // Admin polygons
-    {
+    write_futures.push_back(std::async(std::launch::async, [&] {
         std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(data.admin_polygons.data()), data.admin_polygons.size() * sizeof(AdminPolygon));
-    }
+    }));
 
-    // Admin vertices
-    {
+    write_futures.push_back(std::async(std::launch::async, [&] {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(data.admin_vertices.data()), data.admin_vertices.size() * sizeof(NodeCoord));
-    }
+    }));
 
-    // Strings
-    {
+    write_futures.push_back(std::async(std::launch::async, [&] {
         std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
         f.write(data.string_pool.data().data(), data.string_pool.data().size());
         std::cerr << "strings.bin: " << data.string_pool.data().size() << " bytes" << std::endl;
-    }
+    }));
+
+    // Wait for all parallel writes
+    admin_future.get();
+    for (auto& f : write_futures) f.get();
 }
 
 // --- Main ---
