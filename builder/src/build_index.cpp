@@ -1682,23 +1682,47 @@ static ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bb
 static const uint32_t NO_DATA = 0xFFFFFFFFu;
 
 // Write entries file and return offset map
-static std::unordered_map<uint64_t, uint32_t> write_entries(
+// Build entry data in memory, then write in one shot.
+// Returns a vector of offsets indexed by sorted_cell position (not a hash map).
+static std::vector<uint32_t> write_entries(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
     const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
 ) {
-    std::unordered_map<uint64_t, uint32_t> offsets;
-    std::ofstream f(path, std::ios::binary);
+    // Pre-compute total size for buffer allocation
+    size_t total_size = 0;
+    for (auto& [id, ids] : cell_map) {
+        total_size += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
+    }
+
+    // Build entries buffer and offset vector in one pass over cell_map
+    std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
+
+    // Create position lookup: cell_id → index in sorted_cells (for O(1) lookup)
+    std::unordered_map<uint64_t, uint32_t> cell_to_pos;
+    cell_to_pos.reserve(sorted_cells.size());
+    for (uint32_t i = 0; i < sorted_cells.size(); i++) {
+        cell_to_pos[sorted_cells[i]] = i;
+    }
+
+    // Build buffer by iterating sorted_cells (maintains sorted order in file)
+    std::vector<char> buf;
+    buf.reserve(total_size);
     uint32_t current = 0;
-    for (uint64_t cell_id : sorted_cells) {
-        auto it = cell_map.find(cell_id);
+    for (uint32_t i = 0; i < sorted_cells.size(); i++) {
+        auto it = cell_map.find(sorted_cells[i]);
         if (it == cell_map.end()) continue;
-        offsets[cell_id] = current;
+        offsets[i] = current;
         uint16_t count = static_cast<uint16_t>(std::min(it->second.size(), size_t(65535)));
-        f.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        f.write(reinterpret_cast<const char*>(it->second.data()), it->second.size() * sizeof(uint32_t));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count), reinterpret_cast<const char*>(&count) + sizeof(count));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(it->second.data()),
+                   reinterpret_cast<const char*>(it->second.data()) + it->second.size() * sizeof(uint32_t));
         current += sizeof(uint16_t) + it->second.size() * sizeof(uint32_t);
     }
+
+    // Single write
+    std::ofstream f(path, std::ios::binary);
+    f.write(buf.data(), buf.size());
     return offsets;
 }
 
@@ -1755,8 +1779,8 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
             std::sort(sorted_geo_cells.begin(), sorted_geo_cells.end());
         }
 
-        // Write entry files in parallel
-        std::unordered_map<uint64_t, uint32_t> street_offsets, addr_offsets, interp_offsets;
+        // Write entry files in parallel (returns positional offset vectors, not hash maps)
+        std::vector<uint32_t> street_offsets, addr_offsets, interp_offsets;
         {
             auto f1 = std::async(std::launch::async, [&]() {
                 return write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, data.cell_to_ways);
@@ -1774,19 +1798,26 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
             street_offsets = f1.get();
         }
 
+        // Build geo_cells.bin in memory buffer (avoids 332M × 4 small writes + hash lookups)
         {
-            std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
-            for (uint64_t cell_id : sorted_geo_cells) {
-                f.write(reinterpret_cast<const char*>(&cell_id), sizeof(cell_id));
-                auto write_offset = [&](const std::unordered_map<uint64_t, uint32_t>& offsets) {
-                    auto it = offsets.find(cell_id);
-                    uint32_t offset = (it != offsets.end()) ? it->second : NO_DATA;
-                    f.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
-                };
-                write_offset(street_offsets);
-                write_offset(addr_offsets);
-                write_offset(interp_offsets);
+            size_t n = sorted_geo_cells.size();
+            size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t); // cell_id + 3 offsets
+            std::vector<char> buf(n * row_size);
+            char* ptr = buf.data();
+
+            // Fill empty offset vectors if not writing addresses
+            if (addr_offsets.empty()) addr_offsets.resize(n, NO_DATA);
+            if (interp_offsets.empty()) interp_offsets.resize(n, NO_DATA);
+
+            for (size_t i = 0; i < n; i++) {
+                memcpy(ptr, &sorted_geo_cells[i], sizeof(uint64_t)); ptr += sizeof(uint64_t);
+                memcpy(ptr, &street_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                memcpy(ptr, &addr_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                memcpy(ptr, &interp_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
             }
+
+            std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
+            f.write(buf.data(), buf.size());
         }
 
         std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
