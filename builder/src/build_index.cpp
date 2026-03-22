@@ -724,7 +724,57 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
 
         // Both failed — reset
         used[start_idx] = false;
-        // Backtracking already resets its own used flags on failure
+    }
+
+    // Second pass: try backtracking on remaining unused sub-ways.
+    // The greedy pass may have consumed sub-ways needed by other rings.
+    // Reset all unused flags and try again with backtracking only.
+    if (sub_ways.size() <= 200) { // only for small relations (avoid exponential blowup)
+        bool any_unused = false;
+        for (size_t i = 0; i < used.size(); i++) {
+            if (!used[i]) { any_unused = true; break; }
+        }
+        if (any_unused) {
+            // Reset ALL used flags and try pure backtracking
+            std::fill(used.begin(), used.end(), false);
+            // Re-mark already-found rings' sub-ways as used
+            // (we can't easily do this, so just re-run from scratch)
+            std::vector<std::vector<std::pair<double,double>>> saved_rings = std::move(rings);
+            rings.clear();
+
+            for (size_t start_idx = 0; start_idx < sub_ways.size(); start_idx++) {
+                if (used[start_idx]) continue;
+                const auto& sg = sub_ways[start_idx];
+                int64_t fk = coord_key(sg.coords.front().first, sg.coords.front().second);
+                int64_t lk = coord_key(sg.coords.back().first, sg.coords.back().second);
+                if (sg.coords.size() >= 4 && fk == lk) {
+                    used[start_idx] = true;
+                    rings.push_back(sg.coords);
+                    continue;
+                }
+                used[start_idx] = true;
+                bt.calls = 0;
+                std::vector<std::pair<size_t, bool>> path;
+                if (bt.try_close(fk, lk, path, 0)) {
+                    std::vector<std::pair<double,double>> r = sg.coords;
+                    for (const auto& [wi, rev] : path) {
+                        const auto& c = sub_ways[wi].coords;
+                        if (!rev) r.insert(r.end(), c.begin() + 1, c.end());
+                        else for (auto it2 = c.rbegin() + 1; it2 != c.rend(); ++it2) r.push_back(*it2);
+                    }
+                    if (r.size() >= 4 && !ring_has_self_intersection(r)) {
+                        rings.push_back(std::move(r));
+                        continue;
+                    }
+                }
+                used[start_idx] = false;
+            }
+
+            // Use whichever pass produced more rings
+            if (rings.size() < saved_rings.size()) {
+                rings = std::move(saved_rings);
+            }
+        }
     }
 
     return rings;
