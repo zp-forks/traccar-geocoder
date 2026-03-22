@@ -729,7 +729,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     // Second pass: try backtracking on remaining unused sub-ways.
     // The greedy pass may have consumed sub-ways needed by other rings.
     // Reset all unused flags and try again with backtracking only.
-    if (sub_ways.size() <= 200) { // only for small relations (avoid exponential blowup)
+    { // Second pass: backtracking retry (100K call budget prevents exponential blowup)
         bool any_unused = false;
         for (size_t i = 0; i < used.size(); i++) {
             if (!used[i]) { any_unused = true; break; }
