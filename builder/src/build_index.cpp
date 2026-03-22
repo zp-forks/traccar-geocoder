@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -110,6 +111,14 @@ private:
     std::unordered_map<std::string, uint32_t> index_;
     std::vector<char> data_;
 };
+
+// --- Phase timer ---
+static void log_phase(const char* name, std::chrono::steady_clock::time_point& t) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t).count();
+    std::cerr << "  [" << ms/1000 << "." << (ms%1000)/100 << "s] " << name << std::endl;
+    t = std::chrono::steady_clock::now();
+}
 
 // --- Deferred S2 work items (computed in parallel after PBF read) ---
 
@@ -1954,6 +1963,7 @@ int main(int argc, char* argv[]) {
     }
 
     ParsedData data;
+    auto _pt = std::chrono::steady_clock::now();
 
     if (!load_cache_path.empty()) {
         // Load from cache
@@ -2054,6 +2064,7 @@ int main(int argc, char* argv[]) {
             }
 
             // --- Pass 2: nodes (streaming parallel block processing) ---
+            log_phase("Pass 1: relation scanning", _pt);
             std::cerr << "  Pass 2: processing nodes in parallel..." << std::endl;
 
             {
@@ -2177,6 +2188,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
             }
 
+            log_phase("Pass 2: node processing", _pt);
             std::cerr << "  Pass 3: processing ways and areas with " << num_threads
                       << " threads..." << std::endl;
 
@@ -2593,6 +2605,7 @@ int main(int argc, char* argv[]) {
 
                 // --- Parallel admin boundary assembly ---
                 if (parallel_admin) {
+                    log_phase("Pass 3: way processing", _pt);
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
                               << data.way_geometries.size() << " way geometries)..." << std::endl;
@@ -2757,6 +2770,7 @@ int main(int argc, char* argv[]) {
 
         // --- Parallel S2 cell computation for ways and interpolation ---
         {
+            log_phase("Admin assembly", _pt);
             std::cerr << "Computing S2 cells for ways with " << num_threads << " threads..." << std::endl;
 
             // Each thread builds its own local cell maps, then we merge
@@ -2855,6 +2869,7 @@ int main(int argc, char* argv[]) {
         resolve_interpolation_endpoints(data);
 
         // Deduplicate all cell maps (in parallel)
+        log_phase("S2 cell computation", _pt);
         std::cerr << "Deduplicating..." << std::endl;
         {
             auto f1 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_ways); });
@@ -2871,6 +2886,7 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Write index files ---
+    log_phase("Deduplication", _pt);
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
 
     if (multi_output) {
@@ -2916,6 +2932,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    log_phase("Index file writing", _pt);
     std::cerr << "Done." << std::endl;
     return 0;
 }
