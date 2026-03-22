@@ -524,19 +524,49 @@ static bool segments_intersect(double ax1, double ay1, double ax2, double ay2,
 }
 
 static bool ring_has_self_intersection(const std::vector<std::pair<double,double>>& ring) {
-    // O(n^2) check — only called for assembled rings (typically < 1000 vertices)
+    // Sweep-line inspired check: sort segments by min-x, then only check
+    // overlapping x-ranges. Much faster than O(n²) for large rings.
     size_t n = ring.size();
     if (n < 4) return false;
+
+    // For small rings, brute force is fine
+    if (n <= 32) {
+        for (size_t i = 0; i + 1 < n; i++) {
+            for (size_t j = i + 2; j + 1 < n; j++) {
+                if (j == i + 1 || (i == 0 && j == n - 2)) continue;
+                if (segments_intersect(ring[i].first, ring[i].second,
+                                        ring[i+1].first, ring[i+1].second,
+                                        ring[j].first, ring[j].second,
+                                        ring[j+1].first, ring[j+1].second))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // For larger rings, sort segments by min-x and prune non-overlapping
+    struct Seg { double min_x, max_x; size_t idx; };
+    std::vector<Seg> segs(n - 1);
     for (size_t i = 0; i + 1 < n; i++) {
-        for (size_t j = i + 2; j + 1 < n; j++) {
-            // Skip adjacent segments (they share an endpoint)
-            if (j == i + 1 || (i == 0 && j == n - 2)) continue;
+        double x1 = ring[i].second, x2 = ring[i+1].second; // use lng as x
+        segs[i] = {std::min(x1,x2), std::max(x1,x2), i};
+    }
+    std::sort(segs.begin(), segs.end(), [](const Seg& a, const Seg& b) {
+        return a.min_x < b.min_x;
+    });
+
+    for (size_t a = 0; a + 1 < segs.size(); a++) {
+        for (size_t b = a + 1; b < segs.size(); b++) {
+            if (segs[b].min_x > segs[a].max_x) break; // no more x-overlap
+            size_t i = segs[a].idx, j = segs[b].idx;
+            // Skip adjacent segments
+            if (j == i + 1 || i == j + 1) continue;
+            if ((i == 0 && j == n - 2) || (j == 0 && i == n - 2)) continue;
             if (segments_intersect(ring[i].first, ring[i].second,
                                     ring[i+1].first, ring[i+1].second,
                                     ring[j].first, ring[j].second,
-                                    ring[j+1].first, ring[j+1].second)) {
+                                    ring[j+1].first, ring[j+1].second))
                 return true;
-            }
         }
     }
     return false;
@@ -2908,12 +2938,12 @@ int main(int argc, char* argv[]) {
                     all.insert(all.end(), v.begin(), v.end());
                     v.clear(); v.shrink_to_fit();
                 }
-                // Sort by cell_id
+                // Sort by cell_id (cache-friendly sequential access)
                 std::sort(all.begin(), all.end(), [](const CellItem& a, const CellItem& b) {
                     return a.cell_id < b.cell_id;
                 });
                 // Group into cell map
-                out.reserve(total / 2); // rough estimate of unique cells
+                out.reserve(total / 2);
                 for (size_t i = 0; i < all.size(); ) {
                     size_t j = i;
                     while (j < all.size() && all[j].cell_id == all[i].cell_id) j++;
