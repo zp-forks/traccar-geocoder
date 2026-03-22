@@ -704,9 +704,12 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
             std::vector<std::vector<std::pair<double,double>>> bt_rings;
 
             BacktrackState bt2{sub_ways, coord_adj, bt_used, coord_key, 0};
+            int total_bt_calls = 0;
+            constexpr int MAX_TOTAL_BT_CALLS = 500000; // total budget for entire relation
 
             for (size_t si = 0; si < sub_ways.size(); si++) {
                 if (bt_used[si]) continue;
+                if (total_bt_calls >= MAX_TOTAL_BT_CALLS) break; // budget exceeded
                 const auto& sg = sub_ways[si];
                 int64_t fk = coord_key(sg.coords.front().first, sg.coords.front().second);
                 int64_t lk = coord_key(sg.coords.back().first, sg.coords.back().second);
@@ -731,6 +734,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
                     }
                 }
                 bt_used[si] = false;
+                total_bt_calls += bt2.calls;
             }
 
             // Keep whichever pass produced more rings
