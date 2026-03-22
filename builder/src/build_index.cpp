@@ -1751,15 +1751,12 @@ static ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bb
 
 static const uint32_t NO_DATA = 0xFFFFFFFFu;
 
-// Write entries file. Returns a vector of offsets indexed by sorted_cell position.
-// Avoids hash lookups by extracting entries from cell_map in sorted order.
+// Write entries file from a hash map (used for addr and interp cell maps).
 static std::vector<uint32_t> write_entries(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
     const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
 ) {
-    // Build sorted list of (cell_id, pointer_to_ids) from the cell_map.
-    // This avoids per-cell hash lookups during the write loop.
     struct CellRef { uint64_t cell_id; const std::vector<uint32_t>* ids; };
     std::vector<CellRef> sorted_refs;
     sorted_refs.reserve(cell_map.size());
@@ -1769,27 +1766,17 @@ static std::vector<uint32_t> write_entries(
     std::sort(sorted_refs.begin(), sorted_refs.end(),
         [](const CellRef& a, const CellRef& b) { return a.cell_id < b.cell_id; });
 
-    // Build position lookup: binary search from sorted_cells
-    // Both sorted_refs and sorted_cells are sorted by cell_id.
-    // Walk both in parallel (merge-join) to assign positions.
     std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
-
-    // Pre-compute total size
     size_t total_size = 0;
-    for (auto& r : sorted_refs) {
-        total_size += sizeof(uint16_t) + r.ids->size() * sizeof(uint32_t);
-    }
+    for (auto& r : sorted_refs) total_size += sizeof(uint16_t) + r.ids->size() * sizeof(uint32_t);
 
     std::vector<char> buf;
     buf.reserve(total_size);
     uint32_t current = 0;
-
-    // Merge-join: walk sorted_cells and sorted_refs together
     size_t ri = 0;
     for (uint32_t si = 0; si < sorted_cells.size() && ri < sorted_refs.size(); si++) {
         if (sorted_cells[si] < sorted_refs[ri].cell_id) continue;
         if (sorted_cells[si] > sorted_refs[ri].cell_id) { si--; ri++; continue; }
-        // Match
         offsets[si] = current;
         const auto& ids = *sorted_refs[ri].ids;
         uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(65535)));
@@ -1800,7 +1787,57 @@ static std::vector<uint32_t> write_entries(
         current += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
         ri++;
     }
+    std::ofstream f(path, std::ios::binary);
+    f.write(buf.data(), buf.size());
+    return offsets;
+}
 
+// Write entries file directly from sorted (cell_id, item_id) pairs.
+// Skips hash map entirely — O(n) linear scan of pre-sorted data.
+struct CellItemPair { uint64_t cell_id; uint32_t item_id; };
+
+static std::vector<uint32_t> write_entries_from_sorted(
+    const std::string& path,
+    const std::vector<uint64_t>& sorted_cells,
+    const std::vector<CellItemPair>& sorted_pairs // sorted by cell_id
+) {
+    std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
+    // Pre-compute total size: for each unique cell, sizeof(uint16_t) + n * sizeof(uint32_t)
+    size_t total_size = 0;
+    for (size_t i = 0; i < sorted_pairs.size(); ) {
+        size_t j = i;
+        while (j < sorted_pairs.size() && sorted_pairs[j].cell_id == sorted_pairs[i].cell_id) j++;
+        total_size += sizeof(uint16_t) + (j - i) * sizeof(uint32_t);
+        i = j;
+    }
+
+    std::vector<char> buf;
+    buf.reserve(total_size);
+    uint32_t current = 0;
+
+    // Merge-join: walk sorted_cells and sorted_pairs together
+    size_t pi = 0;
+    for (uint32_t si = 0; si < sorted_cells.size() && pi < sorted_pairs.size(); si++) {
+        if (sorted_cells[si] < sorted_pairs[pi].cell_id) continue;
+        if (sorted_cells[si] > sorted_pairs[pi].cell_id) {
+            // Skip pairs not in sorted_cells (shouldn't happen but be safe)
+            while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id < sorted_cells[si]) pi++;
+            si--;
+            continue;
+        }
+        // Match: collect all items for this cell
+        offsets[si] = current;
+        size_t start = pi;
+        while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
+        uint16_t count = static_cast<uint16_t>(std::min(pi - start, size_t(65535)));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
+                   reinterpret_cast<const char*>(&count) + sizeof(count));
+        for (size_t k = start; k < pi; k++) {
+            buf.insert(buf.end(), reinterpret_cast<const char*>(&sorted_pairs[k].item_id),
+                       reinterpret_cast<const char*>(&sorted_pairs[k].item_id) + sizeof(uint32_t));
+        }
+        current += sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
+    }
     std::ofstream f(path, std::ios::binary);
     f.write(buf.data(), buf.size());
     return offsets;
@@ -2927,42 +2964,50 @@ int main(int argc, char* argv[]) {
 
             // Merge thread-local pairs into single vectors, sort, build cell maps
             std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
-            auto build_cell_map = [](std::vector<std::vector<CellItem>>& thread_pairs,
-                                      std::unordered_map<uint64_t, std::vector<uint32_t>>& out) {
-                // Concatenate all thread-local vectors
+            // Concatenate + sort helper for flat CellItem pairs
+            auto concat_and_sort = [](std::vector<std::vector<CellItem>>& thread_pairs) -> std::vector<CellItemPair> {
                 size_t total = 0;
                 for (auto& v : thread_pairs) total += v.size();
-                std::vector<CellItem> all;
+                std::vector<CellItemPair> all;
                 all.reserve(total);
                 for (auto& v : thread_pairs) {
-                    all.insert(all.end(), v.begin(), v.end());
+                    for (auto& ci : v) all.push_back({ci.cell_id, ci.item_id});
                     v.clear(); v.shrink_to_fit();
                 }
-                // Sort by cell_id (cache-friendly sequential access)
-                std::sort(all.begin(), all.end(), [](const CellItem& a, const CellItem& b) {
-                    return a.cell_id < b.cell_id;
+                std::sort(all.begin(), all.end(), [](const CellItemPair& a, const CellItemPair& b) {
+                    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
                 });
-                // Group into cell map
-                out.reserve(total / 2);
-                for (size_t i = 0; i < all.size(); ) {
+                return all;
+            };
+
+            // Build hash map from sorted pairs (for interps + cell_to_addrs union)
+            auto build_cell_map = [](const std::vector<CellItemPair>& sorted,
+                                      std::unordered_map<uint64_t, std::vector<uint32_t>>& out) {
+                out.reserve(sorted.size() / 2);
+                for (size_t i = 0; i < sorted.size(); ) {
                     size_t j = i;
-                    while (j < all.size() && all[j].cell_id == all[i].cell_id) j++;
-                    auto& vec = out[all[i].cell_id];
+                    while (j < sorted.size() && sorted[j].cell_id == sorted[i].cell_id) j++;
+                    auto& vec = out[sorted[i].cell_id];
                     vec.reserve(j - i);
-                    for (size_t k = i; k < j; k++) vec.push_back(all[k].item_id);
+                    for (size_t k = i; k < j; k++) vec.push_back(sorted[k].item_id);
                     i = j;
                 }
             };
 
-            // Build way and interp maps in parallel
+            // Sort ways and interps in parallel. Keep way pairs sorted for direct writing.
+            std::vector<CellItemPair> sorted_way_pairs, sorted_interp_pairs;
             auto f_ways = std::async(std::launch::async, [&] {
-                build_cell_map(way_pairs, data.cell_to_ways);
+                sorted_way_pairs = concat_and_sort(way_pairs);
+                build_cell_map(sorted_way_pairs, data.cell_to_ways);
             });
             auto f_interps = std::async(std::launch::async, [&] {
-                build_cell_map(interp_pairs, data.cell_to_interps);
+                sorted_interp_pairs = concat_and_sort(interp_pairs);
+                build_cell_map(sorted_interp_pairs, data.cell_to_interps);
             });
             f_ways.get();
             f_interps.get();
+            // Note: cell_to_ways and cell_to_interps are already sorted+deduped
+            // from the concat_and_sort, so the dedup phase can skip them.
             log_phase("  S2: sort + group into cell maps", _s2t);
 
             // Free deferred work items
@@ -2982,11 +3027,10 @@ int main(int argc, char* argv[]) {
         log_phase("S2 cell computation", _pt);
         std::cerr << "Deduplicating..." << std::endl;
         {
-            auto f1 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_ways); });
+            // cell_to_ways and cell_to_interps are already sorted from concat_and_sort
             auto f2 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_addrs); });
-            auto f3 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_interps); });
             auto f4 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_admin); });
-            f1.get(); f2.get(); f3.get(); f4.get();
+            f2.get(); f4.get();
         }
 
         // Save cache if requested
