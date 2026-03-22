@@ -67,11 +67,24 @@ name differs.
 
 ## Performance
 
-| Phase | Sequential baseline | Parallel |
-|---|---|---|
-| Total build (planet) | ~5 hours | ~40 minutes |
-| Admin assembly | ~2 hours (sequential osmium) | ~5 minutes (parallel stitcher) |
-| Index writing | ~25-30 minutes | ~10-12 minutes (parallel writes) |
+| Phase | Sequential baseline | Parallel (initial) | Parallel (optimized) |
+|---|---|---|---|
+| Total build (planet) | ~5 hours | ~40 minutes | **~18 minutes** |
+| Admin assembly | ~2 hours | ~5 minutes | ~2.6 minutes |
+| S2 cell computation | — | ~17 minutes | ~5.8 minutes |
+| Index writing | ~25-30 minutes | ~10 minutes | ~4.2 minutes |
+
+### Optimization Summary
+
+| Optimization | Impact |
+|---|---|
+| thread_local S2RegionCoverer | Avoid 335M constructor calls |
+| cover_edge fast-path (same/adjacent cell) | Skip S2 library for ~80% of edges (3.6x) |
+| Flat-array S2 cell collection | Replace hash map merge with sort (2.7x) |
+| Sweep-line self-intersection check | O(n log n) vs O(n²) for large rings (2x admin) |
+| Merge-join entry writing | Sequential scan vs hash lookups (1.8x) |
+| Parallel index file writes | 8 files written concurrently |
+| Buffered IO | Single write calls vs millions of small writes |
 
 ## Admin Polygon Gap Journey
 
