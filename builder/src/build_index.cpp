@@ -246,6 +246,9 @@ private:
 
 // --- Parsed data container ---
 
+// Sorted cell-item pair for direct entry writing (avoids hash map)
+struct CellItemPair { uint64_t cell_id; uint32_t item_id; };
+
 struct ParsedData {
     StringPool string_pool;
     std::vector<WayHeader> ways;
@@ -263,6 +266,9 @@ struct ParsedData {
     // Deferred work for parallel S2 computation (ways + interps)
     std::vector<DeferredWay> deferred_ways;
     std::vector<DeferredInterp> deferred_interps;
+
+    // Sorted (cell_id, way_id) pairs from S2 computation — kept for direct entry writing
+    std::vector<CellItemPair> sorted_way_cells;
 
     // Collected data for parallel admin assembly
     std::vector<CollectedRelation> collected_relations;
@@ -1794,8 +1800,6 @@ static std::vector<uint32_t> write_entries(
 
 // Write entries file directly from sorted (cell_id, item_id) pairs.
 // Skips hash map entirely — O(n) linear scan of pre-sorted data.
-struct CellItemPair { uint64_t cell_id; uint32_t item_id; };
-
 static std::vector<uint32_t> write_entries_from_sorted(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
@@ -1901,6 +1905,10 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
         std::vector<uint32_t> street_offsets, addr_offsets, interp_offsets;
         {
             auto f1 = std::async(std::launch::async, [&]() {
+                // Use direct sorted-pair writing for ways (skips hash map extraction + sort)
+                if (!data.sorted_way_cells.empty()) {
+                    return write_entries_from_sorted(output_dir + "/street_entries.bin", sorted_geo_cells, data.sorted_way_cells);
+                }
                 return write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, data.cell_to_ways);
             });
             if (write_addresses) {
@@ -3017,6 +3025,9 @@ int main(int argc, char* argv[]) {
             std::vector<CellItemPair> sorted_way_pairs, sorted_interp_pairs;
             auto f_ways = std::async(std::launch::async, [&] {
                 sorted_way_pairs = concat_and_sort(way_pairs);
+                // Keep sorted pairs for direct entry writing (skip hash map in write phase)
+                data.sorted_way_cells = sorted_way_pairs;
+                // Still need hash map for sorted_geo_cells union construction
                 build_cell_map(sorted_way_pairs, data.cell_to_ways);
             });
             auto f_interps = std::async(std::launch::async, [&] {
