@@ -502,6 +502,18 @@ static bool ring_has_self_intersection(const std::vector<std::pair<double,double
     return false;
 }
 
+// Check if a ring has duplicate coordinates (spikes/figure-8 from merged holes)
+// A valid simple polygon visits each coordinate exactly once (except closing point).
+static bool ring_has_duplicate_coords(const std::vector<std::pair<double,double>>& ring,
+                                       decltype(std::function<int64_t(double,double)>()) coord_key_fn) {
+    std::unordered_set<int64_t> seen;
+    for (size_t i = 0; i + 1 < ring.size(); i++) { // skip closing point
+        int64_t k = coord_key_fn(ring[i].first, ring[i].second);
+        if (!seen.insert(k).second) return true; // duplicate
+    }
+    return false;
+}
+
 // --- Parallel admin: assemble outer rings from collected way geometries ---
 
 static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
@@ -2526,25 +2538,21 @@ int main(int argc, char* argv[]) {
 
                                 auto rings = assemble_outer_rings(rel.members, data.way_geometries);
                                 // If outer-only assembly failed, retry with all ways.
-                                // Osmium ignores roles during assembly — inner ways
-                                // sometimes form the actual boundary or bridge gaps.
+                                // Osmium ignores roles during assembly (check_roles=false) —
+                                // inner ways sometimes form the boundary or bridge gaps.
+                                // Filter retry results: discard rings with duplicate coords
+                                // (figure-8 shapes from merging holes with outer boundary).
                                 if (rings.empty()) {
-                                    // Retry with all ways only when outer-only produced
-                                    // 0 rings AND the relation has non-outer ways available.
-                                    // Only retry when there are NO outer ways (the boundary IS
-                                    // the inner-role ways). When outer ways exist but don't close,
-                                    // including inner ways creates merged outer+hole geometry.
-                                    bool has_outer_geom = false;
-                                    for (const auto& [wid, role] : rel.members) {
-                                        if (role == "outer" || role.empty()) {
-                                            if (data.way_geometries.count(wid)) {
-                                                has_outer_geom = true;
-                                                break;
-                                            }
+                                    auto retry = assemble_outer_rings(rel.members, data.way_geometries, true);
+                                    auto ck = [](double lat, double lng) -> int64_t {
+                                        int32_t ilat = static_cast<int32_t>(lat * 1e7 + (lat >= 0 ? 0.5 : -0.5));
+                                        int32_t ilng = static_cast<int32_t>(lng * 1e7 + (lng >= 0 ? 0.5 : -0.5));
+                                        return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
+                                    };
+                                    for (auto& ring : retry) {
+                                        if (!ring_has_duplicate_coords(ring, ck)) {
+                                            rings.push_back(std::move(ring));
                                         }
-                                    }
-                                    if (!has_outer_geom) {
-                                        rings = assemble_outer_rings(rel.members, data.way_geometries, true);
                                     }
                                 }
 
