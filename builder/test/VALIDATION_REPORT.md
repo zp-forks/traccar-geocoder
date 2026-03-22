@@ -55,6 +55,26 @@ choices than osmium's assembler. Higher-level admin names are unaffected.
 7. **Self-intersection detection** — invalid assembled rings discarded
 8. **Planet-scale performance** — greedy stitcher replaces exponential backtracking
 
+## Planet (86GB PBF) — Global Comparison
+
+### Cross-version (Baseline vs Parallel)
+
+| Component | Baseline | Parallel | Status |
+|---|---|---|---|
+| Street ways | 47,826,371 | 47,826,371 | **100% PASS** |
+| Address points | 160,091,817 | 160,091,817 | **100% PASS** |
+| Interpolation ways | 72,817 | 72,817 | 99.85% (107 freq diffs) |
+| Admin polygons | 943,638 | 947,306 | 99.998% |
+| Admin (unique name\|level) | 642,275 | 644,716 | **12 missing, 2,453 extra** |
+
+The 12 missing admin boundaries are small municipality subdivisions in Argentina (5),
+Peru (1), South Africa (1), Indonesia (1), and Brazil (4) where the greedy ring stitcher
+makes a different branch choice than osmium's assembler. All are level 8-10 boundaries
+with no impact on reverse geocoding.
+
+The 2,453 extras are legitimate boundaries recovered by our improved coordinate-matching
+stitcher, closed-way polygon support, and inner-way bridging.
+
 ## Admin Polygon Gap Journey
 
 | Stage | Gap (Germany) | Gap (Europe) | Gap (Planet) |
