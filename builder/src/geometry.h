@@ -209,19 +209,33 @@ inline double meters_to_degrees(double meters, double latitude_deg) {
     return meters / (111320.0 * cos_lat);
 }
 
-// Get epsilon in meters for an admin level.
-// Lower levels (country) get larger epsilon, higher levels (city) get finer detail.
+// Per-level epsilon defaults in meters. Index 0-1 unused, 2=country ... 8=city.
+// Can be overridden at runtime via kAdminEpsilonMeters and kEpsilonScale.
+inline double kDefaultEpsilon[] = {
+    15.0,   // 0 (unused)
+    15.0,   // 1 (unused)
+    500.0,  // 2 country
+    200.0,  // 3 large region
+    100.0,  // 4 state/province
+    50.0,   // 5 district
+    30.0,   // 6 county
+    20.0,   // 7 municipality
+    15.0,   // 8 city/town
+    15.0,   // 9
+    15.0,   // 10
+    15.0,   // 11 postal
+};
+
+// Runtime-configurable epsilon table and scale factor.
+// Set by main() from CLI args. Scale multiplies all values uniformly.
+inline double kAdminEpsilonMeters[12] = {
+    15, 15, 500, 200, 100, 50, 30, 20, 15, 15, 15, 15
+};
+inline double kEpsilonScale = 1.0;
+
 inline double admin_epsilon_meters(uint8_t admin_level) {
-    switch (admin_level) {
-        case 2:  return 500.0;  // country
-        case 3:  return 200.0;  // large region
-        case 4:  return 100.0;  // state/province
-        case 5:  return 50.0;   // district
-        case 6:  return 30.0;   // county
-        case 7:  return 20.0;   // municipality
-        case 8:  return 15.0;   // city/town
-        default: return 15.0;   // postal codes, etc.
-    }
+    int idx = (admin_level <= 11) ? admin_level : 11;
+    return kAdminEpsilonMeters[idx] * kEpsilonScale;
 }
 
 // Parse leading digits from a house number string

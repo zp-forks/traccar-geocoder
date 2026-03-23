@@ -49,8 +49,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
         std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
         std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
-        std::cerr << "  --simplify-epsilon     Use error-bounded simplification (meters per admin level)" << std::endl;
+        std::cerr << "  --simplify-epsilon     Use error-bounded simplification (per-level defaults)" << std::endl;
         std::cerr << "  --simplify-epsilon N   Use fixed epsilon of N meters for all levels" << std::endl;
+        std::cerr << "  --epsilon-scale F      Multiply all per-level epsilons by F (e.g. 2.0 = 2x coarser)" << std::endl;
+        std::cerr << "  --epsilon-levels L2,L3,...,L8  Set epsilon in meters per level (7 values)" << std::endl;
         return 1;
     }
 
@@ -94,8 +96,24 @@ int main(int argc, char* argv[]) {
                     simplify_epsilon_override = val;
                     i++;
                 }
-                // else: not a number, use per-level defaults
             }
+        } else if (arg == "--epsilon-scale" && i + 1 < argc) {
+            kEpsilonScale = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--epsilon-levels" && i + 1 < argc) {
+            // Parse comma-separated values: L2,L3,L4,L5,L6,L7,L8
+            std::string vals = argv[++i];
+            int level = 2;
+            size_t pos = 0;
+            while (pos < vals.size() && level <= 8) {
+                size_t next = vals.find(',', pos);
+                if (next == std::string::npos) next = vals.size();
+                double v = std::strtod(vals.substr(pos, next - pos).c_str(), nullptr);
+                if (v > 0) kAdminEpsilonMeters[level] = v;
+                level++;
+                pos = next + 1;
+            }
+            // Also set levels 9-11 to same as level 8
+            for (int l = level; l <= 11; l++) kAdminEpsilonMeters[l] = kAdminEpsilonMeters[8];
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "full") {
@@ -120,7 +138,11 @@ int main(int argc, char* argv[]) {
         if (simplify_epsilon_override > 0) {
             std::cerr << "Simplification: error-bounded, fixed " << simplify_epsilon_override << "m epsilon" << std::endl;
         } else {
-            std::cerr << "Simplification: error-bounded, per-level epsilon (15-500m)" << std::endl;
+            std::cerr << "Simplification: error-bounded, scale=" << kEpsilonScale
+                      << ", epsilons: L2=" << admin_epsilon_meters(2)
+                      << "m L4=" << admin_epsilon_meters(4)
+                      << "m L6=" << admin_epsilon_meters(6)
+                      << "m L8=" << admin_epsilon_meters(8) << "m" << std::endl;
         }
     }
 
