@@ -189,7 +189,11 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                             ? extract_unique_cells(data.sorted_addr_cells)
                             : extract_from_map(data.cell_to_addrs);
                     });
-                    auto f3 = std::async(std::launch::async, [&] { return extract_from_map(data.cell_to_interps); });
+                    auto f3 = std::async(std::launch::async, [&] {
+                        return !data.sorted_interp_cells.empty()
+                            ? extract_unique_cells(data.sorted_interp_cells)
+                            : extract_from_map(data.cell_to_interps);
+                    });
                     addr_cells = f2.get();
                     interp_cells = f3.get();
                 }
@@ -224,6 +228,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                     return write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, data.cell_to_addrs);
                 });
                 auto f3 = std::async(std::launch::async, [&]() {
+                    if (!data.sorted_interp_cells.empty())
+                        return write_entries_from_sorted(output_dir + "/interp_entries.bin", sorted_geo_cells, data.sorted_interp_cells);
                     return write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, data.cell_to_interps);
                 });
                 addr_offsets = f2.get();

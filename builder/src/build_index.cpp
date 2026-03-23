@@ -1109,8 +1109,7 @@ int main(int argc, char* argv[]) {
                 parallel_sort_and_build(way_pairs, data.cell_to_ways, data.sorted_way_cells);
             });
             auto f_interps = std::async(std::launch::async, [&] {
-                std::vector<CellItemPair> interp_sorted; // not needed for writing
-                parallel_sort_and_build(interp_pairs, data.cell_to_interps, interp_sorted);
+                parallel_sort_and_build(interp_pairs, data.cell_to_interps, data.sorted_interp_cells);
             });
             f_ways.get();
             f_interps.get();

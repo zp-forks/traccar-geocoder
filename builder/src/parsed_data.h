@@ -50,6 +50,7 @@ struct ParsedData {
     // Sorted (cell_id, item_id) pairs — kept for direct entry writing
     std::vector<CellItemPair> sorted_way_cells;
     std::vector<CellItemPair> sorted_addr_cells;
+    std::vector<CellItemPair> sorted_interp_cells;
 
     // Collected data for parallel admin assembly
     std::vector<CollectedRelation> collected_relations;
