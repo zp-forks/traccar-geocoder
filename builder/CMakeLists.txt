@@ -10,7 +10,15 @@ find_package(BZip2 REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(s2 QUIET)
 
-add_executable(build-index src/build_index.cpp)
+add_executable(build-index
+    src/build_index.cpp
+    src/s2_helpers.cpp
+    src/ring_assembly.cpp
+    src/cache.cpp
+    src/continent_filter.cpp
+    src/cell_index.cpp
+    src/interpolation.cpp
+)
 
 if(EXISTS /opt/homebrew/include)
     target_include_directories(build-index PRIVATE /opt/homebrew/include)
