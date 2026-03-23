@@ -3099,20 +3099,24 @@ int main(int argc, char* argv[]) {
             // Merge thread-local pairs into single vectors, sort, build cell maps
             std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
             // Concatenate + sort helper for flat CellItem pairs
-            // Parallel sort: each thread's data is already localized. Sort each
-            // thread's vector in parallel, then k-way merge into final sorted array.
-            auto concat_and_sort = [&num_threads](std::vector<std::vector<CellItem>>& thread_pairs) -> std::vector<CellItemPair> {
-                // Convert CellItem to CellItemPair and sort each thread's chunk in parallel
+            // Parallel sort each thread's pairs, then k-way merge directly into
+            // hash map + sorted output. No intermediate merged vector needed.
+            auto parallel_sort_and_build = [](
+                std::vector<std::vector<CellItem>>& thread_pairs,
+                std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
+                std::vector<CellItemPair>& sorted_out
+            ) {
+                // Step 1: Convert + sort each thread's data in parallel
                 size_t total = 0;
                 for (auto& v : thread_pairs) total += v.size();
 
-                std::vector<std::vector<CellItemPair>> sorted_chunks(thread_pairs.size());
+                std::vector<std::vector<CellItemPair>> chunks(thread_pairs.size());
                 {
                     std::vector<std::thread> sort_threads;
                     for (size_t t = 0; t < thread_pairs.size(); t++) {
                         sort_threads.emplace_back([&, t]() {
                             auto& src = thread_pairs[t];
-                            auto& dst = sorted_chunks[t];
+                            auto& dst = chunks[t];
                             dst.reserve(src.size());
                             for (auto& ci : src) dst.push_back({ci.cell_id, ci.item_id});
                             src.clear(); src.shrink_to_fit();
@@ -3124,57 +3128,68 @@ int main(int argc, char* argv[]) {
                     for (auto& t : sort_threads) t.join();
                 }
 
-                // Merge sorted chunks (sequential but cache-friendly)
-                std::vector<CellItemPair> all;
-                all.reserve(total);
-                // Simple pairwise merge
-                for (auto& chunk : sorted_chunks) {
-                    if (all.empty()) {
-                        all = std::move(chunk);
-                    } else {
-                        std::vector<CellItemPair> merged;
-                        merged.reserve(all.size() + chunk.size());
-                        std::merge(all.begin(), all.end(), chunk.begin(), chunk.end(),
-                            std::back_inserter(merged), [](const CellItemPair& a, const CellItemPair& b) {
-                                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                            });
-                        all = std::move(merged);
+                // Step 2: K-way merge using min-heap, directly building hash map + sorted output
+                sorted_out.clear();
+                sorted_out.reserve(total);
+                cell_map.reserve(total / 2);
+
+                // Min-heap: (cell_id, item_id, chunk_index)
+                struct HeapEntry {
+                    uint64_t cell_id;
+                    uint32_t item_id;
+                    uint32_t chunk;
+                    bool operator>(const HeapEntry& o) const {
+                        return cell_id > o.cell_id || (cell_id == o.cell_id && item_id > o.item_id);
+                    }
+                };
+                std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+                std::vector<size_t> chunk_pos(chunks.size(), 0);
+
+                // Seed heap with first element from each non-empty chunk
+                for (uint32_t c = 0; c < chunks.size(); c++) {
+                    if (!chunks[c].empty()) {
+                        heap.push({chunks[c][0].cell_id, chunks[c][0].item_id, c});
+                        chunk_pos[c] = 1;
                     }
                 }
-                return all;
-            };
 
-            // Build hash map from sorted pairs (for interps + cell_to_addrs union)
-            auto build_cell_map = [](const std::vector<CellItemPair>& sorted,
-                                      std::unordered_map<uint64_t, std::vector<uint32_t>>& out) {
-                out.reserve(sorted.size() / 2);
-                for (size_t i = 0; i < sorted.size(); ) {
-                    size_t j = i;
-                    while (j < sorted.size() && sorted[j].cell_id == sorted[i].cell_id) j++;
-                    auto& vec = out[sorted[i].cell_id];
-                    vec.reserve(j - i);
-                    for (size_t k = i; k < j; k++) vec.push_back(sorted[k].item_id);
-                    i = j;
+                uint64_t prev_cell = UINT64_MAX;
+                while (!heap.empty()) {
+                    auto top = heap.top();
+                    heap.pop();
+
+                    sorted_out.push_back({top.cell_id, top.item_id});
+
+                    // Build hash map incrementally
+                    if (top.cell_id != prev_cell) {
+                        cell_map[top.cell_id].push_back(top.item_id);
+                        prev_cell = top.cell_id;
+                    } else {
+                        cell_map[top.cell_id].push_back(top.item_id);
+                    }
+
+                    // Advance the chunk this entry came from
+                    uint32_t c = top.chunk;
+                    if (chunk_pos[c] < chunks[c].size()) {
+                        auto& next = chunks[c][chunk_pos[c]];
+                        heap.push({next.cell_id, next.item_id, c});
+                        chunk_pos[c]++;
+                    }
                 }
             };
 
-            // Sort ways and interps in parallel. Keep way pairs sorted for direct writing.
-            std::vector<CellItemPair> sorted_way_pairs, sorted_interp_pairs;
+
+            // Sort each thread's pairs in parallel, then k-way merge directly
+            // into hash map + sorted output. No intermediate merged vector.
             auto f_ways = std::async(std::launch::async, [&] {
-                sorted_way_pairs = concat_and_sort(way_pairs);
-                // Keep sorted pairs for direct entry writing (skip hash map in write phase)
-                data.sorted_way_cells = sorted_way_pairs;
-                // Still need hash map for sorted_geo_cells union construction
-                build_cell_map(sorted_way_pairs, data.cell_to_ways);
+                parallel_sort_and_build(way_pairs, data.cell_to_ways, data.sorted_way_cells);
             });
             auto f_interps = std::async(std::launch::async, [&] {
-                sorted_interp_pairs = concat_and_sort(interp_pairs);
-                build_cell_map(sorted_interp_pairs, data.cell_to_interps);
+                std::vector<CellItemPair> interp_sorted; // not needed for writing
+                parallel_sort_and_build(interp_pairs, data.cell_to_interps, interp_sorted);
             });
             f_ways.get();
             f_interps.get();
-            // Note: cell_to_ways and cell_to_interps are already sorted+deduped
-            // from the concat_and_sort, so the dedup phase can skip them.
             log_phase("  S2: sort + group into cell maps", _s2t);
 
             // Free deferred work items
