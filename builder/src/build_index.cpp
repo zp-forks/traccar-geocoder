@@ -304,8 +304,7 @@ static void cover_edge(double lat1, double lng1, double lat2, double lng2,
         return;
     }
 
-    // Adjacent cells — second most common case
-    // Check if midpoint is in one of the two cells
+    // Adjacent cells — check midpoint
     S2CellId cm = S2CellId(S2LatLng::FromDegrees((lat1+lat2)/2, (lng1+lng2)/2)).parent(kStreetCellLevel);
     if (cm == c1 || cm == c2) {
         out.push_back(c1);
@@ -313,7 +312,7 @@ static void cover_edge(double lat1, double lng1, double lat2, double lng2,
         return;
     }
 
-    // Longer edge — need full covering. Use S2RegionCoverer.
+    // Longer edge — use S2RegionCoverer for correctness (handles geodesic curves)
     thread_local S2RegionCoverer coverer = []() {
         S2RegionCoverer::Options options;
         options.set_fixed_level(kStreetCellLevel);
@@ -1799,50 +1798,94 @@ static std::vector<uint32_t> write_entries(
     return offsets;
 }
 
-// Write entries file directly from sorted (cell_id, item_id) pairs.
-// Skips hash map entirely — O(n) linear scan of pre-sorted data.
+// Write entries file from sorted pairs — parallel chunked merge-join.
+// Splits sorted_cells into chunks, each thread builds its chunk independently,
+// then prefix-sum computes global offsets and buffers are concatenated.
 static std::vector<uint32_t> write_entries_from_sorted(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
-    const std::vector<CellItemPair>& sorted_pairs // sorted by cell_id
+    const std::vector<CellItemPair>& sorted_pairs
 ) {
     std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
-    // Pre-compute total size: for each unique cell, sizeof(uint16_t) + n * sizeof(uint32_t)
-    size_t total_size = 0;
-    for (size_t i = 0; i < sorted_pairs.size(); ) {
-        size_t j = i;
-        while (j < sorted_pairs.size() && sorted_pairs[j].cell_id == sorted_pairs[i].cell_id) j++;
-        total_size += sizeof(uint16_t) + (j - i) * sizeof(uint32_t);
-        i = j;
+    if (sorted_pairs.empty()) {
+        std::ofstream f(path, std::ios::binary);
+        return offsets;
     }
 
+    // Find where each chunk of sorted_cells starts in sorted_pairs
+    // using binary search (both are sorted by cell_id)
+    unsigned int nthreads = std::min(std::thread::hardware_concurrency(), 32u);
+    if (nthreads == 0) nthreads = 4;
+    size_t cells_per_chunk = (sorted_cells.size() + nthreads - 1) / nthreads;
+
+    struct ChunkResult {
+        std::vector<char> buf;
+        size_t cell_start, cell_end; // range in sorted_cells
+        uint32_t local_size; // total bytes in this chunk's buffer
+    };
+    std::vector<ChunkResult> chunks(nthreads);
+
+    // Parallel: each thread processes its range of sorted_cells
+    std::vector<std::thread> threads;
+    for (unsigned int t = 0; t < nthreads; t++) {
+        size_t cs = t * cells_per_chunk;
+        size_t ce = std::min(cs + cells_per_chunk, sorted_cells.size());
+        if (cs >= sorted_cells.size()) break;
+
+        threads.emplace_back([&, t, cs, ce]() {
+            auto& chunk = chunks[t];
+            chunk.cell_start = cs;
+            chunk.cell_end = ce;
+            chunk.local_size = 0;
+
+            // Binary search for where this chunk's first cell appears in sorted_pairs
+            size_t pi = std::lower_bound(sorted_pairs.begin(), sorted_pairs.end(),
+                sorted_cells[cs], [](const CellItemPair& p, uint64_t id) {
+                    return p.cell_id < id;
+                }) - sorted_pairs.begin();
+
+            // Merge-join for this chunk
+            for (size_t si = cs; si < ce && pi < sorted_pairs.size(); si++) {
+                if (sorted_cells[si] < sorted_pairs[pi].cell_id) continue;
+                while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id < sorted_cells[si]) pi++;
+                if (pi >= sorted_pairs.size() || sorted_pairs[pi].cell_id != sorted_cells[si]) continue;
+
+                offsets[si] = chunk.local_size; // local offset, adjusted later
+                size_t start = pi;
+                while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
+                uint16_t count = static_cast<uint16_t>(std::min(pi - start, size_t(65535)));
+                size_t entry_size = sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
+                size_t buf_pos = chunk.buf.size();
+                chunk.buf.resize(buf_pos + entry_size);
+                memcpy(chunk.buf.data() + buf_pos, &count, sizeof(count));
+                for (size_t k = start; k < pi; k++) {
+                    memcpy(chunk.buf.data() + buf_pos + sizeof(uint16_t) + (k - start) * sizeof(uint32_t),
+                           &sorted_pairs[k].item_id, sizeof(uint32_t));
+                }
+                chunk.local_size += entry_size;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    // Prefix-sum: compute global offsets for each chunk
+    uint32_t global_offset = 0;
+    for (auto& chunk : chunks) {
+        for (size_t si = chunk.cell_start; si < chunk.cell_end; si++) {
+            if (offsets[si] != NO_DATA) {
+                offsets[si] += global_offset;
+            }
+        }
+        global_offset += chunk.local_size;
+    }
+
+    // Concatenate buffers and write
     std::vector<char> buf;
-    buf.reserve(total_size);
-    uint32_t current = 0;
-
-    // Merge-join: walk sorted_cells and sorted_pairs together
-    size_t pi = 0;
-    for (uint32_t si = 0; si < sorted_cells.size() && pi < sorted_pairs.size(); si++) {
-        if (sorted_cells[si] < sorted_pairs[pi].cell_id) continue;
-        if (sorted_cells[si] > sorted_pairs[pi].cell_id) {
-            // Skip pairs not in sorted_cells (shouldn't happen but be safe)
-            while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id < sorted_cells[si]) pi++;
-            si--;
-            continue;
-        }
-        // Match: collect all items for this cell
-        offsets[si] = current;
-        size_t start = pi;
-        while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
-        uint16_t count = static_cast<uint16_t>(std::min(pi - start, size_t(65535)));
-        buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
-                   reinterpret_cast<const char*>(&count) + sizeof(count));
-        for (size_t k = start; k < pi; k++) {
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&sorted_pairs[k].item_id),
-                       reinterpret_cast<const char*>(&sorted_pairs[k].item_id) + sizeof(uint32_t));
-        }
-        current += sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
+    buf.reserve(global_offset);
+    for (auto& chunk : chunks) {
+        buf.insert(buf.end(), chunk.buf.begin(), chunk.buf.end());
     }
+
     std::ofstream f(path, std::ios::binary);
     f.write(buf.data(), buf.size());
     return offsets;
