@@ -37,26 +37,24 @@ echo "Binary: $BINARY"
 echo "PBF: $PBF"
 echo ""
 
-# Test 1: Build with parallel admin assembly
-echo "--- Test 1: Parallel admin assembly ---"
-mkdir -p "$TMPDIR/parallel"
-"$BINARY" "$TMPDIR/parallel" "$PBF" --parallel-admin 2>&1 | grep -E 'polygon|Done|street ways|address'
+# Test 1: Build index
+echo "--- Test 1: Build index ---"
+mkdir -p "$TMPDIR/output"
+"$BINARY" "$TMPDIR/output" "$PBF" 2>&1 | grep -E 'polygon|Done|street ways|address'
 
-# Test 2: Build with sequential admin assembly
+# Test 2: Build again and compare (deterministic output)
 echo ""
-echo "--- Test 2: Sequential admin assembly ---"
-mkdir -p "$TMPDIR/sequential"
-"$BINARY" "$TMPDIR/sequential" "$PBF" --no-parallel-admin 2>&1 | grep -E 'polygon|Done|street ways|address'
+echo "--- Test 2: Rebuild and compare (determinism) ---"
+mkdir -p "$TMPDIR/output2"
+"$BINARY" "$TMPDIR/output2" "$PBF" 2>&1 | grep -E 'polygon|Done'
 
-# Test 3: Compare outputs
 echo ""
-echo "--- Test 3: Exact comparison ---"
-"$COMPARE" "$TMPDIR/parallel" "$TMPDIR/sequential" 2>&1
+echo "--- Test 3: Exact comparison (two builds) ---"
+"$COMPARE" "$TMPDIR/output" "$TMPDIR/output2" 2>&1
 
-# Test 4: Semantic comparison
 echo ""
 echo "--- Test 4: Semantic comparison ---"
-"$COMPARE" "$TMPDIR/parallel" "$TMPDIR/sequential" --semantic 2>&1
+"$COMPARE" "$TMPDIR/output" "$TMPDIR/output2" --semantic 2>&1
 
 # Test 5: Verify all index files exist
 echo ""
@@ -66,7 +64,7 @@ addr_entries.bin addr_points.bin geo_cells.bin interp_entries.bin interp_nodes.b
 interp_ways.bin street_entries.bin street_nodes.bin street_ways.bin strings.bin"
 ALL_PRESENT=true
 for f in $EXPECTED_FILES; do
-    if [ ! -f "$TMPDIR/parallel/$f" ]; then
+    if [ ! -f "$TMPDIR/output/$f" ]; then
         echo "MISSING: $f"
         ALL_PRESENT=false
     fi
@@ -79,7 +77,7 @@ fi
 echo ""
 echo "--- Test 6: Non-empty files ---"
 for f in admin_cells.bin admin_polygons.bin geo_cells.bin street_ways.bin street_nodes.bin addr_points.bin strings.bin; do
-    SIZE=$(stat --format='%s' "$TMPDIR/parallel/$f" 2>/dev/null || echo 0)
+    SIZE=$(stat --format='%s' "$TMPDIR/output/$f" 2>/dev/null || echo 0)
     if [ "$SIZE" -eq 0 ]; then
         echo "FAIL: $f is empty"
         ALL_PRESENT=false
