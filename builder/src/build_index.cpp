@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <mutex>
@@ -53,6 +54,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --simplify-epsilon N   Use fixed epsilon of N meters for all levels" << std::endl;
         std::cerr << "  --epsilon-scale F      Multiply all per-level epsilons by F (e.g. 2.0 = 2x coarser)" << std::endl;
         std::cerr << "  --epsilon-levels L2,L3,...,L8  Set epsilon in meters per level (7 values)" << std::endl;
+        std::cerr << "  --multi-quality [S,S,...]  Write quality variants at given scales (default: 0,0.2,0.5,1,1.5,2,2.5)" << std::endl;
         return 1;
     }
 
@@ -65,6 +67,8 @@ int main(int argc, char* argv[]) {
     IndexMode mode = IndexMode::Full;
     SimplifyMode simplify_mode = SimplifyMode::MaxVertices;
     double simplify_epsilon_override = 0; // 0 = use per-level defaults
+    bool multi_quality = false;
+    std::vector<double> quality_scales;
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -99,6 +103,25 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--epsilon-scale" && i + 1 < argc) {
             kEpsilonScale = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--multi-quality") {
+            multi_quality = true;
+            simplify_mode = SimplifyMode::ErrorBounded;
+            simplify_epsilon_override = 0.1; // effectively uncapped
+            // Optional: next arg might be comma-separated scales
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                std::string vals = argv[++i];
+                size_t pos = 0;
+                while (pos < vals.size()) {
+                    size_t next = vals.find(',', pos);
+                    if (next == std::string::npos) next = vals.size();
+                    double v = std::strtod(vals.substr(pos, next - pos).c_str(), nullptr);
+                    quality_scales.push_back(v);
+                    pos = next + 1;
+                }
+            }
+            if (quality_scales.empty()) {
+                quality_scales = {0, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5};
+            }
         } else if (arg == "--epsilon-levels" && i + 1 < argc) {
             // Parse comma-separated values: L2,L3,L4,L5,L6,L7,L8
             std::string vals = argv[++i];
@@ -1236,51 +1259,192 @@ int main(int argc, char* argv[]) {
     log_phase("Deduplication", _pt);
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
 
-    if (multi_output) {
-        // Write all 3 index modes in parallel (they read shared data, write to separate dirs)
-        auto wf1 = std::async(std::launch::async, [&]{ write_index(data, output_dir + "/full", IndexMode::Full); });
-        auto wf2 = std::async(std::launch::async, [&]{ write_index(data, output_dir + "/no-addresses", IndexMode::NoAddresses); });
-        auto wf3 = std::async(std::launch::async, [&]{ write_index(data, output_dir + "/admin-only", IndexMode::AdminOnly); });
-        wf1.get(); wf2.get(); wf3.get();
-    } else {
-        write_index(data, output_dir, mode);
-    }
+    // Helper: write quality variants for a dataset into base_dir/admin/qN/
+    auto write_qualities = [&](const ParsedData& d, const std::string& base_dir) {
+        if (!multi_quality) return;
+        std::string admin_dir = base_dir + "/admin";
+        for (double scale : quality_scales) {
+            std::string qname = (scale == 0) ? "uncapped" : "q" + std::to_string(scale);
+            // Clean up trailing zeros: "q1.000000" -> "q1"
+            if (scale > 0) {
+                char buf[32]; snprintf(buf, sizeof(buf), "q%.4g", scale);
+                qname = buf;
+            }
+            std::string qdir = admin_dir + "/" + qname;
+            std::cerr << "    Quality: " << qname << "..." << std::endl;
+            write_quality_variant(d, admin_dir, qdir, scale);
+        }
+    };
 
+    // Helper: write one region (planet or continent subset) in S3-friendly layout
+    auto write_region = [&](const ParsedData& d, const std::string& base_dir) {
+        ensure_dir(base_dir);
+
+        if (multi_output) {
+            // S3-friendly layout: separate directories for each data type
+            auto wf1 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/full", IndexMode::Full); });
+            auto wf2 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses); });
+            auto wf3 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/admin", IndexMode::AdminOnly); });
+            wf1.get(); wf2.get(); wf3.get();
+        } else {
+            write_index(d, base_dir, mode);
+        }
+
+        write_qualities(d, base_dir);
+    };
+
+    // Write planet
+    write_region(data, output_dir);
+    log_phase("Planet index writing", _pt);
+
+    // Write continents
     if (generate_continents) {
-        // Process continents in parallel (each filters independently from shared data)
-        std::vector<std::future<void>> continent_futures;
         std::mutex cerr_mutex;
+        // Process continents sequentially to avoid memory explosion
+        // (each filter_by_bbox creates a full copy)
         for (size_t ci = 0; ci < kContinentCount; ci++) {
             const auto& continent = kContinents[ci];
-            continent_futures.push_back(std::async(std::launch::async, [&, continent]() {
-                {
-                    std::lock_guard<std::mutex> lock(cerr_mutex);
-                    std::cerr << "Filtering for continent: " << continent.name << "..." << std::endl;
-                }
-                auto subset = filter_by_bbox(data, continent);
-                std::string base = output_dir + "/" + continent.name;
-                ensure_dir(base);
-                if (multi_output) {
-                    // Write modes in parallel within each continent
-                    auto cf1 = std::async(std::launch::async, [&]{ write_index(subset, base + "/full", IndexMode::Full); });
-                    auto cf2 = std::async(std::launch::async, [&]{ write_index(subset, base + "/no-addresses", IndexMode::NoAddresses); });
-                    auto cf3 = std::async(std::launch::async, [&]{ write_index(subset, base + "/admin-only", IndexMode::AdminOnly); });
-                    cf1.get(); cf2.get(); cf3.get();
-                } else {
-                    write_index(subset, base, mode);
-                }
-                {
-                    std::lock_guard<std::mutex> lock(cerr_mutex);
-                    std::cerr << "Done continent: " << continent.name << std::endl;
-                }
-            }));
-        }
-        for (auto& f : continent_futures) {
-            f.get();
+            std::cerr << "Filtering for continent: " << continent.name << "..." << std::endl;
+            auto subset = filter_by_bbox(data, continent);
+            write_region(subset, output_dir + "/" + continent.name);
+            std::cerr << "Done continent: " << continent.name << std::endl;
         }
     }
 
-    log_phase("Index file writing", _pt);
+    log_phase("Index file writing (total)", _pt);
+
+    // --- Generate manifest.json ---
+    {
+        auto file_size = [](const std::string& path) -> int64_t {
+            struct stat st;
+            if (stat(path.c_str(), &st) == 0) return st.st_size;
+            return -1;
+        };
+
+        auto dir_size = [&](const std::string& dir, const std::vector<std::string>& files) -> int64_t {
+            int64_t total = 0;
+            for (const auto& f : files) {
+                int64_t s = file_size(dir + "/" + f);
+                if (s > 0) total += s;
+            }
+            return total;
+        };
+
+        std::vector<std::string> admin_base_files = {
+            "admin_cells.bin", "admin_entries.bin", "strings.bin"
+        };
+        std::vector<std::string> admin_quality_files = {
+            "admin_polygons.bin", "admin_vertices.bin"
+        };
+        std::vector<std::string> street_files = {
+            "street_ways.bin", "street_nodes.bin", "street_entries.bin"
+        };
+        std::vector<std::string> address_files = {
+            "addr_points.bin", "addr_entries.bin",
+            "interp_ways.bin", "interp_nodes.bin", "interp_entries.bin"
+        };
+        std::vector<std::string> geo_files = {"geo_cells.bin"};
+
+        // Build list of regions
+        std::vector<std::pair<std::string, std::string>> regions; // (name, path)
+        regions.push_back({"planet", output_dir});
+        if (generate_continents) {
+            for (size_t ci = 0; ci < kContinentCount; ci++) {
+                regions.push_back({kContinents[ci].name,
+                    output_dir + "/" + kContinents[ci].name});
+            }
+        }
+
+        // Quality level names
+        auto quality_dir_name = [](double scale) -> std::string {
+            if (scale == 0) return "uncapped";
+            char buf[32]; snprintf(buf, sizeof(buf), "q%.4g", scale);
+            return buf;
+        };
+
+        std::ofstream mf(output_dir + "/manifest.json");
+        mf << "{\n";
+        mf << "  \"version\": 1,\n";
+        mf << "  \"regions\": [\n";
+
+        for (size_t ri = 0; ri < regions.size(); ri++) {
+            const auto& [rname, rpath] = regions[ri];
+            mf << "    {\n";
+            mf << "      \"name\": \"" << rname << "\",\n";
+
+            // Modes
+            mf << "      \"modes\": {\n";
+            if (multi_output) {
+                // Full
+                std::string full_dir = rpath + "/full";
+                int64_t full_sz = dir_size(full_dir, geo_files) +
+                    dir_size(full_dir, street_files) +
+                    dir_size(full_dir, address_files) +
+                    dir_size(full_dir, admin_base_files) +
+                    dir_size(full_dir, admin_quality_files);
+                mf << "        \"full\": {\"size\": " << full_sz << "},\n";
+
+                // Streets (no addresses)
+                std::string na_dir = rpath + "/no-addresses";
+                int64_t na_sz = dir_size(na_dir, geo_files) +
+                    dir_size(na_dir, street_files) +
+                    dir_size(na_dir, admin_base_files) +
+                    dir_size(na_dir, admin_quality_files);
+                mf << "        \"no-addresses\": {\"size\": " << na_sz << "},\n";
+
+                // Admin base (shared files)
+                std::string admin_dir = rpath + "/admin";
+                int64_t admin_base_sz = dir_size(admin_dir, admin_base_files);
+                mf << "        \"admin\": {\"base_size\": " << admin_base_sz << "}\n";
+            } else {
+                int64_t sz = 0;
+                for (const auto& lists : {geo_files, street_files, address_files,
+                                          admin_base_files, admin_quality_files}) {
+                    sz += dir_size(rpath, lists);
+                }
+                mf << "        \"" << (mode == IndexMode::Full ? "full" :
+                    mode == IndexMode::NoAddresses ? "no-addresses" : "admin") << "\": {\"size\": " << sz << "}\n";
+            }
+            mf << "      },\n";
+
+            // Quality variants
+            if (multi_quality) {
+                std::string admin_dir = multi_output ? rpath + "/admin" : rpath;
+                mf << "      \"qualities\": [\n";
+                for (size_t qi = 0; qi < quality_scales.size(); qi++) {
+                    double scale = quality_scales[qi];
+                    std::string qname = quality_dir_name(scale);
+                    std::string qdir = admin_dir + "/" + qname;
+                    int64_t qsz = dir_size(qdir, admin_quality_files);
+
+                    // Compute epsilon values for this scale
+                    double eps_l2 = (scale == 0) ? 0 : 500.0 * scale * kEpsilonScale;
+                    double eps_l8 = (scale == 0) ? 0 : 15.0 * scale * kEpsilonScale;
+
+                    mf << "        {\"name\": \"" << qname << "\", \"scale\": " << scale
+                       << ", \"size\": " << qsz
+                       << ", \"epsilon_l2_m\": " << eps_l2
+                       << ", \"epsilon_l8_m\": " << eps_l8
+                       << "}";
+                    if (qi + 1 < quality_scales.size()) mf << ",";
+                    mf << "\n";
+                }
+                mf << "      ]\n";
+            } else {
+                mf << "      \"qualities\": []\n";
+            }
+
+            mf << "    }";
+            if (ri + 1 < regions.size()) mf << ",";
+            mf << "\n";
+        }
+
+        mf << "  ]\n";
+        mf << "}\n";
+
+        std::cerr << "Wrote " << output_dir << "/manifest.json" << std::endl;
+    }
+
     std::cerr << "Done." << std::endl;
     return 0;
 }

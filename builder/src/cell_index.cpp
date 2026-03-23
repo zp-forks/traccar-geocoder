@@ -1,6 +1,7 @@
 #include "cell_index.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -8,6 +9,11 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+#include <unistd.h>
+
+#include "geometry.h"
+#include "s2_helpers.h"
 
 std::vector<uint32_t> write_entries(
     const std::string& path,
@@ -376,4 +382,88 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     log_phase("  Write: parallel data files launched", _wt);
     admin_future.get();
     for (auto& f : write_futures) f.get();
+}
+
+void write_quality_variant(const ParsedData& data, const std::string& source_dir,
+                           const std::string& output_dir, double epsilon_scale) {
+    ensure_dir(output_dir);
+
+    // Re-simplify admin polygons at the given epsilon scale
+    std::vector<AdminPolygon> new_polys;
+    std::vector<NodeCoord> new_verts;
+    new_polys.reserve(data.admin_polygons.size());
+
+    // Parallel simplification
+    struct SimplifiedPoly {
+        std::vector<std::pair<double,double>> verts;
+    };
+    std::vector<SimplifiedPoly> simplified(data.admin_polygons.size());
+
+    {
+        std::atomic<size_t> idx{0};
+        unsigned nthreads = std::thread::hardware_concurrency();
+        if (nthreads == 0) nthreads = 4;
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t < nthreads; t++) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    size_t i = idx.fetch_add(1);
+                    if (i >= data.admin_polygons.size()) break;
+                    const auto& ap = data.admin_polygons[i];
+
+                    // Extract original vertices
+                    std::vector<std::pair<double,double>> pts;
+                    pts.reserve(ap.vertex_count);
+                    for (uint32_t j = 0; j < ap.vertex_count; j++) {
+                        const auto& v = data.admin_vertices[ap.vertex_offset + j];
+                        pts.emplace_back(v.lat, v.lng);
+                    }
+
+                    if (epsilon_scale > 0) {
+                        double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
+                        double lat = pts.empty() ? 0.0 : pts[0].first;
+                        double eps_deg = meters_to_degrees(eps_m, lat);
+                        simplified[i].verts = simplify_polygon_epsilon(pts, eps_deg);
+                    } else {
+                        simplified[i].verts = std::move(pts);
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
+
+    // Sequential: build new polygon and vertex arrays
+    for (size_t i = 0; i < data.admin_polygons.size(); i++) {
+        auto& sv = simplified[i].verts;
+        if (sv.size() < 3) continue;
+
+        AdminPolygon np = data.admin_polygons[i];
+        np.vertex_offset = static_cast<uint32_t>(new_verts.size());
+        np.vertex_count = static_cast<uint32_t>(sv.size());
+        np.area = polygon_area(sv);
+
+        for (const auto& [lat, lng] : sv) {
+            new_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+        }
+        new_polys.push_back(np);
+    }
+
+    std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
+              << " polygons, " << new_verts.size() << " vertices ("
+              << new_verts.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
+
+    // Write admin files
+    {
+        std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(new_polys.data()), new_polys.size() * sizeof(AdminPolygon));
+    }
+    {
+        std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(new_verts.data()), new_verts.size() * sizeof(NodeCoord));
+    }
+
+    // Quality directories only contain the two files that change.
+    // Shared files (admin_cells.bin, admin_entries.bin, strings.bin)
+    // stay in the parent directory.
 }
