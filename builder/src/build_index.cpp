@@ -3244,48 +3244,30 @@ int main(int argc, char* argv[]) {
         log_phase("S2 cell computation", _pt);
         std::cerr << "Deduplicating + sorting for write..." << std::endl;
         {
-            // Convert addr hash map to sorted pairs using parallel chunked sort
+            // Convert addr hash map to sorted pairs.
+            // Sort cell IDs only (30M unique), then build pairs in sorted order.
+            // Much faster than sorting all 160M pairs.
             auto f2 = std::async(std::launch::async, [&] {
-                // Extract all pairs
-                std::vector<CellItemPair> pairs;
-                pairs.reserve(data.cell_to_addrs.size() * 2);
+                // Extract and sort unique cell IDs
+                std::vector<uint64_t> sorted_cells;
+                sorted_cells.reserve(data.cell_to_addrs.size());
+                size_t total_pairs = 0;
                 for (auto& [cell_id, ids] : data.cell_to_addrs) {
+                    sorted_cells.push_back(cell_id);
+                    total_pairs += ids.size();
+                }
+                std::sort(sorted_cells.begin(), sorted_cells.end());
+
+                // Build sorted pairs by iterating sorted cell IDs
+                std::vector<CellItemPair> pairs;
+                pairs.reserve(total_pairs);
+                for (uint64_t cell_id : sorted_cells) {
+                    auto& ids = data.cell_to_addrs[cell_id];
+                    std::sort(ids.begin(), ids.end()); // sort within cell
+                    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
                     for (auto id : ids) pairs.push_back({cell_id, id});
                 }
-
-                // Parallel chunked sort: split into N chunks, sort each, merge
-                auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
-                    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                };
-                unsigned int nt = std::min(std::thread::hardware_concurrency(), 32u);
-                if (nt < 2 || pairs.size() < 100000) {
-                    std::sort(pairs.begin(), pairs.end(), cmp);
-                } else {
-                    size_t chunk = (pairs.size() + nt - 1) / nt;
-                    std::vector<std::thread> ts;
-                    for (unsigned int t = 0; t < nt; t++) {
-                        size_t s = t * chunk, e = std::min(s + chunk, pairs.size());
-                        if (s >= pairs.size()) break;
-                        ts.emplace_back([&, s, e]{ std::sort(pairs.begin() + s, pairs.begin() + e, cmp); });
-                    }
-                    for (auto& t : ts) t.join();
-                    // Merge sorted chunks pairwise
-                    for (size_t cs = chunk; cs < pairs.size(); cs *= 2) {
-                        std::vector<std::thread> mts;
-                        for (size_t i = 0; i + cs < pairs.size(); i += cs * 2) {
-                            size_t mid = i + cs, end = std::min(mid + cs, pairs.size());
-                            mts.emplace_back([&, i, mid, end]{ std::inplace_merge(pairs.begin() + i, pairs.begin() + mid, pairs.begin() + end, cmp); });
-                        }
-                        for (auto& t : mts) t.join();
-                    }
-                }
-
-                pairs.erase(std::unique(pairs.begin(), pairs.end(), [](const CellItemPair& a, const CellItemPair& b) {
-                    return a.cell_id == b.cell_id && a.item_id == b.item_id;
-                }), pairs.end());
                 data.sorted_addr_cells = std::move(pairs);
-                // Skip rebuilding hash map — sorted_addr_cells is used directly
-                // for both sorted_geo_cells construction and entry writing.
             });
             auto f4 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_admin); });
             f2.get(); f4.get();
