@@ -24,7 +24,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-// FlexMem no longer used — replaced by DenseIndex mmap
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -34,80 +33,19 @@
 #include <s2/s2loop.h>
 #include <s2/s2builder.h>
 
+#include "types.h"
+#include "string_pool.h"
+#include "geometry.h"
+
 // --- Directory creation ---
 
 static void ensure_dir(const std::string& path) {
     mkdir(path.c_str(), 0755);
 }
 
-// --- Binary format structs ---
+// Types, constants, and IndexMode are in types.h
 
-struct WayHeader {
-    uint32_t node_offset;
-    uint8_t node_count;
-    uint32_t name_id;
-};
-
-struct AddrPoint {
-    float lat;
-    float lng;
-    uint32_t housenumber_id;
-    uint32_t street_id;
-};
-
-struct InterpWay {
-    uint32_t node_offset;
-    uint8_t node_count;
-    uint32_t street_id;
-    uint32_t start_number;
-    uint32_t end_number;
-    uint8_t interpolation;
-};
-
-struct AdminPolygon {
-    uint32_t vertex_offset;
-    uint16_t vertex_count;
-    uint32_t name_id;
-    uint8_t admin_level;
-    float area;
-    uint16_t country_code;
-};
-
-struct NodeCoord {
-    float lat;
-    float lng;
-};
-
-static const uint32_t INTERIOR_FLAG = 0x80000000u;
-static const uint32_t ID_MASK = 0x7FFFFFFFu;
-
-// --- Index mode ---
-
-enum class IndexMode { Full, NoAddresses, AdminOnly };
-
-// --- String interning ---
-
-class StringPool {
-public:
-    uint32_t intern(const std::string& s) {
-        auto it = index_.find(s);
-        if (it != index_.end()) {
-            return it->second;
-        }
-        uint32_t offset = static_cast<uint32_t>(data_.size());
-        index_[s] = offset;
-        data_.insert(data_.end(), s.begin(), s.end());
-        data_.push_back('\0');
-        return offset;
-    }
-
-    const std::vector<char>& data() const { return data_; }
-    std::vector<char>& mutable_data() { return data_; }
-
-private:
-    std::unordered_map<std::string, uint32_t> index_;
-    std::vector<char> data_;
-};
+// StringPool is in string_pool.h
 
 // --- Phase timer ---
 static void log_phase(const char* name, std::chrono::steady_clock::time_point& t) {
@@ -117,29 +55,7 @@ static void log_phase(const char* name, std::chrono::steady_clock::time_point& t
     t = std::chrono::steady_clock::now();
 }
 
-// --- Deferred S2 work items (computed in parallel after PBF read) ---
-
-struct DeferredWay {
-    uint32_t way_id;
-    uint32_t node_offset;
-    uint8_t node_count;
-};
-
-struct DeferredInterp {
-    uint32_t interp_id;
-    uint32_t node_offset;
-    uint8_t node_count;
-};
-
-// Collected relation data for parallel admin assembly
-struct CollectedRelation {
-    int64_t id;
-    uint8_t admin_level;
-    std::string name;
-    std::string country_code;
-    bool is_postal;
-    std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
-};
+// DeferredWay, DeferredInterp, CollectedRelation are in types.h
 
 // Forward declaration
 static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices);
@@ -243,8 +159,7 @@ private:
 
 // --- Parsed data container ---
 
-// Sorted cell-item pair for direct entry writing (avoids hash map)
-struct CellItemPair { uint64_t cell_id; uint32_t item_id; };
+// CellItemPair is in types.h
 
 struct ParsedData {
     StringPool string_pool;
@@ -337,17 +252,7 @@ static S2CellId point_to_cell(double lat, double lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel);
 }
 
-// Approximate polygon area in square degrees
-static float polygon_area(const std::vector<std::pair<double,double>>& vertices) {
-    double area = 0;
-    size_t n = vertices.size();
-    for (size_t i = 0; i < n; i++) {
-        size_t j = (i + 1) % n;
-        area += vertices[i].first * vertices[j].second;
-        area -= vertices[j].first * vertices[i].second;
-    }
-    return static_cast<float>(std::fabs(area) / 2.0);
-}
+// polygon_area is in geometry.h
 
 // Returns pairs of (cell_id, is_interior)
 static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices) {
@@ -374,7 +279,7 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<st
 
     S2RegionCoverer::Options options;
     options.set_max_level(kAdminCellLevel);
-    options.set_max_cells(200);
+    options.set_max_cells(MAX_S2_CELLS_PER_POLY);
 
     S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polygon);
@@ -431,161 +336,9 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<st
     return result;
 }
 
-// --- Douglas-Peucker simplification ---
+// dp_simplify, simplify_polygon are in geometry.h
 
-static void dp_simplify(const std::vector<std::pair<double,double>>& pts,
-                        size_t start, size_t end, double epsilon,
-                        std::vector<bool>& keep) {
-    if (end <= start + 1) return;
-
-    double max_dist = 0;
-    size_t max_idx = start;
-
-    double ax = pts[start].first, ay = pts[start].second;
-    double bx = pts[end].first, by = pts[end].second;
-    double dx = bx - ax, dy = by - ay;
-    double len_sq = dx * dx + dy * dy;
-
-    for (size_t i = start + 1; i < end; i++) {
-        double px = pts[i].first - ax, py = pts[i].second - ay;
-        double dist;
-        if (len_sq == 0) {
-            dist = std::sqrt(px * px + py * py);
-        } else {
-            double t = std::max(0.0, std::min(1.0, (px * dx + py * dy) / len_sq));
-            double proj_x = t * dx - px, proj_y = t * dy - py;
-            dist = std::sqrt(proj_x * proj_x + proj_y * proj_y);
-        }
-        if (dist > max_dist) {
-            max_dist = dist;
-            max_idx = i;
-        }
-    }
-
-    if (max_dist > epsilon) {
-        keep[max_idx] = true;
-        dp_simplify(pts, start, max_idx, epsilon, keep);
-        dp_simplify(pts, max_idx, end, epsilon, keep);
-    }
-}
-
-static std::vector<std::pair<double,double>> simplify_polygon(
-    const std::vector<std::pair<double,double>>& pts, size_t max_vertices) {
-    if (pts.size() <= max_vertices) return pts;
-
-    // Binary search for epsilon that gives ~max_vertices
-    double lo = 0, hi = 1.0;
-    std::vector<std::pair<double,double>> result;
-
-    for (int iter = 0; iter < 20; iter++) {
-        double epsilon = (lo + hi) / 2;
-        std::vector<bool> keep(pts.size(), false);
-        keep[0] = true;
-        keep[pts.size() - 1] = true;
-        dp_simplify(pts, 0, pts.size() - 1, epsilon, keep);
-
-        size_t count = 0;
-        for (bool k : keep) if (k) count++;
-
-        if (count > max_vertices) {
-            lo = epsilon;
-        } else {
-            hi = epsilon;
-        }
-    }
-
-    std::vector<bool> keep(pts.size(), false);
-    keep[0] = true;
-    keep[pts.size() - 1] = true;
-    dp_simplify(pts, 0, pts.size() - 1, hi, keep);
-
-    result.clear();
-    for (size_t i = 0; i < pts.size(); i++) {
-        if (keep[i]) result.push_back(pts[i]);
-    }
-    return result;
-}
-
-// --- Ring self-intersection check (matches osmium's segment crossing detection) ---
-
-static bool segments_intersect(double ax1, double ay1, double ax2, double ay2,
-                                double bx1, double by1, double bx2, double by2) {
-    // Check if segment (a1,a2) crosses segment (b1,b2)
-    // Using cross product orientation test
-    auto cross = [](double ox, double oy, double ax, double ay, double bx, double by) -> double {
-        return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
-    };
-    double d1 = cross(bx1, by1, bx2, by2, ax1, ay1);
-    double d2 = cross(bx1, by1, bx2, by2, ax2, ay2);
-    double d3 = cross(ax1, ay1, ax2, ay2, bx1, by1);
-    double d4 = cross(ax1, ay1, ax2, ay2, bx2, by2);
-    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
-        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
-        return true;
-    }
-    return false;
-}
-
-static bool ring_has_self_intersection(const std::vector<std::pair<double,double>>& ring) {
-    // Sweep-line inspired check: sort segments by min-x, then only check
-    // overlapping x-ranges. Much faster than O(n²) for large rings.
-    size_t n = ring.size();
-    if (n < 4) return false;
-
-    // For small rings, brute force is fine
-    if (n <= 32) {
-        for (size_t i = 0; i + 1 < n; i++) {
-            for (size_t j = i + 2; j + 1 < n; j++) {
-                if (j == i + 1 || (i == 0 && j == n - 2)) continue;
-                if (segments_intersect(ring[i].first, ring[i].second,
-                                        ring[i+1].first, ring[i+1].second,
-                                        ring[j].first, ring[j].second,
-                                        ring[j+1].first, ring[j+1].second))
-                    return true;
-            }
-        }
-        return false;
-    }
-
-    // For larger rings, sort segments by min-x and prune non-overlapping
-    struct Seg { double min_x, max_x; size_t idx; };
-    std::vector<Seg> segs(n - 1);
-    for (size_t i = 0; i + 1 < n; i++) {
-        double x1 = ring[i].second, x2 = ring[i+1].second; // use lng as x
-        segs[i] = {std::min(x1,x2), std::max(x1,x2), i};
-    }
-    std::sort(segs.begin(), segs.end(), [](const Seg& a, const Seg& b) {
-        return a.min_x < b.min_x;
-    });
-
-    for (size_t a = 0; a + 1 < segs.size(); a++) {
-        for (size_t b = a + 1; b < segs.size(); b++) {
-            if (segs[b].min_x > segs[a].max_x) break; // no more x-overlap
-            size_t i = segs[a].idx, j = segs[b].idx;
-            // Skip adjacent segments
-            if (j == i + 1 || i == j + 1) continue;
-            if ((i == 0 && j == n - 2) || (j == 0 && i == n - 2)) continue;
-            if (segments_intersect(ring[i].first, ring[i].second,
-                                    ring[i+1].first, ring[i+1].second,
-                                    ring[j].first, ring[j].second,
-                                    ring[j+1].first, ring[j+1].second))
-                return true;
-        }
-    }
-    return false;
-}
-
-// Check if a ring has duplicate coordinates (spikes/figure-8 from merged holes)
-// A valid simple polygon visits each coordinate exactly once (except closing point).
-static bool ring_has_duplicate_coords(const std::vector<std::pair<double,double>>& ring,
-                                       decltype(std::function<int64_t(double,double)>()) coord_key_fn) {
-    std::unordered_set<int64_t> seen;
-    for (size_t i = 0; i + 1 < ring.size(); i++) { // skip closing point
-        int64_t k = coord_key_fn(ring[i].first, ring[i].second);
-        if (!seen.insert(k).second) return true; // duplicate
-    }
-    return false;
-}
+// segments_intersect, ring_has_self_intersection, ring_has_duplicate_coords are in geometry.h
 
 // --- Parallel admin: assemble outer rings from collected way geometries ---
 
@@ -597,13 +350,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     // Coordinate-based ring assembly: split ways at shared internal nodes,
     // then stitch sub-ways at endpoints with backtracking.
     // This matches osmium's segment-level approach.
-
-    // Coordinate key matching osmium's Location (int32_t nanodegrees)
-    auto coord_key = [](double lat, double lng) -> int64_t {
-        int32_t ilat = static_cast<int32_t>(lat * 1e7 + (lat >= 0 ? 0.5 : -0.5));
-        int32_t ilng = static_cast<int32_t>(lng * 1e7 + (lng >= 0 ? 0.5 : -0.5));
-        return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
-    };
+    // coord_key() from geometry.h provides coordinate hashing.
 
     // Collect coordinates from member ways.
     // First pass uses outer/empty-role ways only. If that produces 0 rings,
@@ -688,14 +435,13 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         const std::vector<SubWay>& sways;
         const std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>>& adj;
         std::vector<bool>& used;
-        decltype(coord_key)& key_fn;
         int calls;
 
         bool try_close(int64_t first_key, int64_t last_key,
                        std::vector<std::pair<size_t, bool>>& path, int depth) {
-            if (++calls > 100000) return false; // limit total work, not just depth
+            if (++calls > BACKTRACK_CALL_BUDGET) return false; // limit total work, not just depth
             if (!path.empty() && first_key == last_key) return true;
-            if (depth > 200) return false;
+            if (depth > BACKTRACK_MAX_DEPTH) return false;
 
             auto it = adj.find(last_key);
             if (it == adj.end()) return false;
@@ -703,7 +449,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
             for (const auto& [wi, is_last] : it->second) {
                 if (used[wi]) continue;
                 auto& endpoint = is_last ? sways[wi].coords.front() : sways[wi].coords.back();
-                int64_t new_key = key_fn(endpoint.first, endpoint.second);
+                int64_t new_key = coord_key(endpoint.first, endpoint.second);
 
                 used[wi] = true;
                 path.push_back({wi, is_last});
@@ -717,7 +463,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         }
     };
 
-    BacktrackState bt{sub_ways, coord_adj, used, coord_key, 0};
+    BacktrackState bt{sub_ways, coord_adj, used, 0};
 
     // Pass 1: Greedy (fast, O(n) per ring)
     for (size_t start_idx = 0; start_idx < sub_ways.size(); start_idx++) {
@@ -771,14 +517,14 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         for (size_t i = 0; i < used.size(); i++) {
             if (!used[i]) { any_unused = true; break; }
         }
-        if (any_unused && sub_ways.size() <= 30) {
+        if (any_unused && sub_ways.size() <= MAX_SUBWAYS_FOR_RETRY) {
             // Only retry for small relations — large ones stall the build
             std::vector<bool> bt_used(sub_ways.size(), false);
             std::vector<std::vector<std::pair<double,double>>> bt_rings;
 
-            BacktrackState bt2{sub_ways, coord_adj, bt_used, coord_key, 0};
+            BacktrackState bt2{sub_ways, coord_adj, bt_used, 0};
             int total_bt_calls = 0;
-            constexpr int MAX_TOTAL_BT_CALLS = 500000; // total budget for entire relation
+            constexpr int MAX_TOTAL_BT_CALLS = BACKTRACK_TOTAL_BUDGET;
 
             for (size_t si = 0; si < sub_ways.size(); si++) {
                 if (bt_used[si]) continue;
@@ -820,31 +566,7 @@ static std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     return rings;
 }
 
-// --- Highway filter ---
-
-static const std::vector<std::string> kExcludedHighways = {
-    "footway", "path", "track", "steps", "cycleway",
-    "service", "pedestrian", "bridleway", "construction"
-};
-
-static bool is_included_highway(const char* value) {
-    for (const auto& excluded : kExcludedHighways) {
-        if (excluded == value) return false;
-    }
-    return true;
-}
-
-// --- Parse house number (leading digits) ---
-
-static uint32_t parse_house_number(const char* s) {
-    if (!s) return 0;
-    uint32_t n = 0;
-    while (*s >= '0' && *s <= '9') {
-        n = n * 10 + (*s - '0');
-        s++;
-    }
-    return n;
-}
+// is_included_highway, parse_house_number are in geometry.h
 
 // --- Add an address point ---
 
@@ -1542,7 +1264,7 @@ static ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bb
 
 // --- Write cell index ---
 
-static const uint32_t NO_DATA = 0xFFFFFFFFu;
+// NO_DATA is in types.h
 
 // Write entries file from a hash map (used for addr and interp cell maps).
 static std::vector<uint32_t> write_entries(
@@ -1994,7 +1716,7 @@ int main(int argc, char* argv[]) {
         // Dense array node location index — lockless parallel writes
         // Planet OSM node IDs max ~12.5 billion. 8 bytes per Location = 100GB virtual.
         // MAP_NORESERVE means OS only allocates pages on write (~80GB for 10B nodes).
-        static const size_t MAX_NODE_ID = 15000000000ULL;
+        static const size_t MAX_NODE_ID = MAX_NODE_ID_DEFAULT;
         struct DenseIndex {
             osmium::Location* data;
             size_t capacity;
@@ -2080,7 +1802,7 @@ int main(int argc, char* argv[]) {
                 std::condition_variable queue_cv;
                 std::deque<osmium::memory::Buffer> block_queue;
                 bool reader_done = false;
-                const size_t MAX_QUEUE = 64;
+                const size_t MAX_QUEUE = MAX_BLOCK_QUEUE;
 
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
@@ -2239,7 +1961,7 @@ int main(int argc, char* argv[]) {
                 std::condition_variable way_queue_cv;
                 std::deque<osmium::memory::Buffer> way_block_queue;
                 bool way_reader_done = false;
-                const size_t WAY_MAX_QUEUE = 64;
+                const size_t WAY_MAX_QUEUE = MAX_BLOCK_QUEUE;
 
                 std::vector<ThreadLocalData> tld(num_threads);
                 std::atomic<uint64_t> way_blocks_done{0};
@@ -2273,10 +1995,8 @@ int main(int argc, char* argv[]) {
                                         if (wnodes.size() >= 2) {
                                             bool all_valid = true;
                                             for (const auto& nr : wnodes) {
-                                                try {
-                                                    auto loc = index.get(nr.positive_ref());
-                                                    if (!loc.valid()) { all_valid = false; break; }
-                                                } catch (...) { all_valid = false; break; }
+                                                auto loc = index.get(nr.positive_ref());
+                                                if (!loc.valid()) { all_valid = false; break; }
                                             }
                                             if (all_valid) {
                                                 const char* street = way.tags()["addr:street"];
@@ -2321,14 +2041,12 @@ int main(int argc, char* argv[]) {
                                             double sum_lat = 0, sum_lng = 0;
                                             int valid = 0;
                                             for (const auto& nr : wnodes) {
-                                                try {
-                                                    auto loc = index.get(nr.positive_ref());
-                                                    if (loc.valid()) {
-                                                        sum_lat += loc.lat();
-                                                        sum_lng += loc.lon();
-                                                        valid++;
-                                                    }
-                                                } catch (...) {}
+                                                auto loc = index.get(nr.positive_ref());
+                                                if (loc.valid()) {
+                                                    sum_lat += loc.lat();
+                                                    sum_lng += loc.lon();
+                                                    valid++;
+                                                }
                                             }
                                             if (valid > 0) {
                                                 // Store coords for later S2 cell computation
@@ -2353,10 +2071,8 @@ int main(int argc, char* argv[]) {
                                         if (name && wnodes.size() >= 2) {
                                             bool all_valid = true;
                                             for (const auto& nr : wnodes) {
-                                                try {
-                                                    auto loc = index.get(nr.positive_ref());
-                                                    if (!loc.valid()) { all_valid = false; break; }
-                                                } catch (...) { all_valid = false; break; }
+                                                auto loc = index.get(nr.positive_ref());
+                                                if (!loc.valid()) { all_valid = false; break; }
                                             }
                                             if (all_valid) {
                                                 uint32_t way_id = static_cast<uint32_t>(local.ways.size());
@@ -2386,10 +2102,8 @@ int main(int argc, char* argv[]) {
                                     if (!wnodes.empty() && admin_way_ids.count(way.id())) {
                                         std::vector<std::pair<double,double>> geom;
                                         for (const auto& nr : wnodes) {
-                                            try {
-                                                auto loc = index.get(nr.positive_ref());
-                                                if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
-                                            } catch (...) {}
+                                            auto loc = index.get(nr.positive_ref());
+                                            if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
                                         }
                                         if (!geom.empty()) {
                                             int64_t first_nid = wnodes.front().positive_ref();
@@ -2433,12 +2147,10 @@ int main(int argc, char* argv[]) {
                                                         std::vector<std::pair<double,double>> verts;
                                                         bool all_valid = true;
                                                         for (const auto& nr : wnodes) {
-                                                            try {
-                                                                auto loc = index.get(nr.positive_ref());
-                                                                if (loc.valid()) {
-                                                                    verts.push_back({loc.lat(), loc.lon()});
-                                                                } else { all_valid = false; break; }
-                                                            } catch (...) { all_valid = false; break; }
+                                                            auto loc = index.get(nr.positive_ref());
+                                                            if (loc.valid()) {
+                                                                verts.push_back({loc.lat(), loc.lon()});
+                                                            } else { all_valid = false; break; }
                                                         }
                                                         if (all_valid && verts.size() >= 3) {
                                                             std::string cc;
@@ -2651,13 +2363,8 @@ int main(int argc, char* argv[]) {
                                 // (figure-8 shapes from merging holes with outer boundary).
                                 if (rings.empty()) {
                                     auto retry = assemble_outer_rings(rel.members, data.way_geometries, true);
-                                    auto ck = [](double lat, double lng) -> int64_t {
-                                        int32_t ilat = static_cast<int32_t>(lat * 1e7 + (lat >= 0 ? 0.5 : -0.5));
-                                        int32_t ilng = static_cast<int32_t>(lng * 1e7 + (lng >= 0 ? 0.5 : -0.5));
-                                        return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
-                                    };
                                     for (auto& ring : retry) {
-                                        if (!ring_has_duplicate_coords(ring, ck)) {
+                                        if (!ring_has_duplicate_coords(ring)) {
                                             rings.push_back(std::move(ring));
                                         }
                                     }
