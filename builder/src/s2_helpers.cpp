@@ -18,6 +18,9 @@ int kStreetCellLevel = 17;
 int kAdminCellLevel = 10;
 int kMaxAdminLevel = 0;  // 0 means no filtering
 
+SimplifyMode kSimplifyMode = SimplifyMode::MaxVertices;
+double kSimplifyEpsilonOverride = 0;
+
 // --- cover_edge ---
 
 void cover_edge(double lat1, double lng1, double lat2, double lng2,
@@ -260,7 +263,7 @@ void add_admin_polygon(ParsedData& data,
         vertices.push_back(vertices.front());
     }
 
-    auto simplified = simplify_polygon(vertices);
+    auto simplified = simplify_admin_polygon(vertices, admin_level);
     if (simplified.size() < 3) return;
 
     uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());

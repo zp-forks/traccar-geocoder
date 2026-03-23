@@ -49,6 +49,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
         std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
         std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
+        std::cerr << "  --simplify-epsilon     Use error-bounded simplification (meters per admin level)" << std::endl;
+        std::cerr << "  --simplify-epsilon N   Use fixed epsilon of N meters for all levels" << std::endl;
         return 1;
     }
 
@@ -59,6 +61,8 @@ int main(int argc, char* argv[]) {
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
+    SimplifyMode simplify_mode = SimplifyMode::MaxVertices;
+    double simplify_epsilon_override = 0; // 0 = use per-level defaults
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -80,6 +84,18 @@ int main(int argc, char* argv[]) {
             multi_output = true;
         } else if (arg == "--continents") {
             generate_continents = true;
+        } else if (arg == "--simplify-epsilon") {
+            simplify_mode = SimplifyMode::ErrorBounded;
+            // Optional: next arg might be a number (fixed epsilon in meters)
+            if (i + 1 < argc) {
+                char* end;
+                double val = std::strtod(argv[i+1], &end);
+                if (*end == '\0' && val > 0) {
+                    simplify_epsilon_override = val;
+                    i++;
+                }
+                // else: not a number, use per-level defaults
+            }
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "full") {
@@ -94,6 +110,17 @@ int main(int argc, char* argv[]) {
             }
         } else {
             input_files.push_back(arg);
+        }
+    }
+
+    // Set global simplification mode
+    kSimplifyMode = simplify_mode;
+    kSimplifyEpsilonOverride = simplify_epsilon_override;
+    if (simplify_mode == SimplifyMode::ErrorBounded) {
+        if (simplify_epsilon_override > 0) {
+            std::cerr << "Simplification: error-bounded, fixed " << simplify_epsilon_override << "m epsilon" << std::endl;
+        } else {
+            std::cerr << "Simplification: error-bounded, per-level epsilon (15-500m)" << std::endl;
         }
     }
 
@@ -871,7 +898,7 @@ int main(int argc, char* argv[]) {
                                         vertices.push_back(vertices.front());
                                     }
 
-                                    pp.simplified = simplify_polygon(vertices);
+                                    pp.simplified = simplify_admin_polygon(vertices, ar.admin_level);
                                     if (pp.simplified.size() >= 3) {
                                         pp.area = polygon_area(pp.simplified);
                                     }

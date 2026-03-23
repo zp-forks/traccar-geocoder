@@ -12,6 +12,7 @@
 #include <s2/s2cell_id.h>
 
 #include "types.h"
+#include "geometry.h"
 #include "parsed_data.h"
 
 // --- S2 cell level globals (set by main arg parsing) ---
@@ -19,6 +20,11 @@
 extern int kStreetCellLevel;
 extern int kAdminCellLevel;
 extern int kMaxAdminLevel;
+
+// --- Simplification globals ---
+
+extern SimplifyMode kSimplifyMode;
+extern double kSimplifyEpsilonOverride; // 0 = use per-level defaults
 
 // --- S2 helpers ---
 
@@ -59,6 +65,25 @@ private:
     size_t active_workers_ = 0;
     bool stop_;
 };
+
+// --- Simplification dispatch ---
+
+// Simplify a polygon using the current global mode, taking admin_level into account.
+// In MaxVertices mode: caps at MAX_POLYGON_VERTICES (500).
+// In ErrorBounded mode: uses per-level epsilon in meters, converted to degrees.
+inline std::vector<std::pair<double,double>> simplify_admin_polygon(
+    const std::vector<std::pair<double,double>>& pts, uint8_t admin_level) {
+    if (kSimplifyMode == SimplifyMode::ErrorBounded) {
+        double eps_m = kSimplifyEpsilonOverride > 0
+            ? kSimplifyEpsilonOverride
+            : admin_epsilon_meters(admin_level);
+        // Estimate latitude from first vertex for degree conversion
+        double lat = pts.empty() ? 0.0 : pts[0].first;
+        double eps_deg = meters_to_degrees(eps_m, lat);
+        return simplify_polygon_epsilon(pts, eps_deg);
+    }
+    return simplify_polygon(pts);
+}
 
 // --- Helper functions that depend on S2 ---
 

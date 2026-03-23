@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Polygon Simplification Comparison</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  #map { position: absolute; top: 0; left: 0; right: 300px; bottom: 0; }
+  #panel {
+    position: absolute; top: 0; right: 0; width: 300px; bottom: 0;
+    background: #f8f8f8; padding: 15px; overflow-y: auto; box-sizing: border-box;
+    border-left: 1px solid #ccc;
+  }
+  h2 { margin-top: 0; font-size: 16px; }
+  .legend-item { display: flex; align-items: center; margin: 4px 0; cursor: pointer; }
+  .legend-swatch { width: 20px; height: 4px; margin-right: 8px; flex-shrink: 0; }
+  .city-btn { display: inline-block; padding: 4px 10px; margin: 2px; cursor: pointer;
+    background: #fff; border: 1px solid #999; border-radius: 4px; font-size: 13px; }
+  .city-btn.active { background: #4a90d9; color: white; border-color: #357abd; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  td, th { padding: 4px 6px; text-align: right; border-bottom: 1px solid #ddd; }
+  th { text-align: left; font-weight: 600; }
+  .size-table td:first-child, .size-table th:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h2>Simplification Comparison</h2>
+  <p style="font-size:13px;color:#666">Click a city to zoom. Toggle levels to compare polygon detail.</p>
+  <div id="cities"></div>
+
+  <h3 style="font-size:14px;margin-top:15px;">Visible Levels</h3>
+  <div id="legend"></div>
+
+  <h3 style="font-size:14px;margin-top:15px;">Size Comparison</h3>
+  <table class="size-table" id="size-table"></table>
+  <p style="font-size:11px;color:#999">Overhead = cells + entries + polygons + strings (~78 MiB)</p>
+</div>
+
+<script>
+const GEOJSON_DATA = GEOJSON_PLACEHOLDER;
+
+const map = L.map('map').setView([48.86, 2.35], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors', maxZoom: 18
+}).addTo(map);
+
+// Auto-detect modes from data
+const allModes = new Set();
+GEOJSON_DATA.features.forEach(f => allModes.add(f.properties.mode));
+const modes = [...allModes];
+
+// Generate colors for each mode
+const palette = ['#e41a1c', '#0066ff', '#00cc44', '#ff00ff', '#ff8800', '#888888', '#00cccc', '#cc6600'];
+const modeColors = {};
+modes.forEach((m, i) => modeColors[m] = palette[i % palette.length]);
+
+// Group features by city
+const cities = {};
+GEOJSON_DATA.features.forEach(f => {
+  const name = f.properties.name;
+  if (!cities[name]) cities[name] = [];
+  cities[name].push(f);
+});
+
+// Create layers per mode
+const modeLayers = {};
+modes.forEach(m => {
+  modeLayers[m] = L.layerGroup().addTo(map);
+});
+
+// Add features to layers
+Object.entries(cities).forEach(([name, features]) => {
+  features.forEach(f => {
+    const m = f.properties.mode;
+    const color = f.properties.color || modeColors[m];
+    const layer = L.geoJSON(f, {
+      style: {
+        color: color, weight: 3, opacity: 0.8,
+        fillOpacity: 0.03, dashArray: null
+      },
+      onEachFeature: (feature, layer) => {
+        layer.bindTooltip(`${name}: ${f.properties.mode} (${f.properties.actual_verts} verts)`);
+      }
+    });
+    modeLayers[m].addLayer(layer);
+  });
+});
+
+// City buttons
+const citiesDiv = document.getElementById('cities');
+const cityBounds = {};
+Object.keys(cities).sort().forEach(name => {
+  const bounds = L.geoJSON({type:'FeatureCollection', features: cities[name].filter(f => f.properties.max_verts === 500)}).getBounds();
+  cityBounds[name] = bounds;
+  const btn = document.createElement('span');
+  btn.className = 'city-btn';
+  btn.textContent = name;
+  btn.onclick = () => { map.fitBounds(bounds, {padding: [20,20]}); };
+  citiesDiv.appendChild(btn);
+});
+
+// Legend toggles
+const legendDiv = document.getElementById('legend');
+modes.forEach(m => {
+  const item = document.createElement('div');
+  item.className = 'legend-item';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox'; cb.checked = true;
+  cb.onchange = () => {
+    if (cb.checked) modeLayers[m].addTo(map);
+    else map.removeLayer(modeLayers[m]);
+  };
+  const swatch = document.createElement('div');
+  swatch.className = 'legend-swatch';
+  swatch.style.background = modeColors[m];
+  swatch.style.height = '3px';
+  const label = document.createElement('span');
+  label.style.fontSize = '13px';
+  label.textContent = m;
+  item.appendChild(cb);
+  item.appendChild(swatch);
+  item.appendChild(label);
+  legendDiv.appendChild(item);
+});
+
+// Build size table from data
+const sizeTable = document.getElementById('size-table');
+const vertsByMode = {};
+GEOJSON_DATA.features.forEach(f => {
+  const m = f.properties.mode;
+  if (!vertsByMode[m]) vertsByMode[m] = 0;
+  vertsByMode[m] += f.properties.actual_verts;
+});
+sizeTable.innerHTML = '<tr><th>Mode</th><th>Sample verts</th></tr>' +
+  modes.map(m => `<tr><td style="color:${modeColors[m]}">${m}</td><td>${(vertsByMode[m]||0).toLocaleString()}</td></tr>`).join('');
+</script>
+</body>
+</html>

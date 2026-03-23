@@ -53,6 +53,9 @@ static const uint32_t INTERIOR_FLAG = 0x80000000u;
 static const uint32_t ID_MASK       = 0x7FFFFFFFu;
 static const uint32_t NO_DATA       = 0xFFFFFFFFu;
 
+// Simplification mode
+enum class SimplifyMode { MaxVertices, ErrorBounded };
+
 // Processing limits
 static constexpr size_t MAX_BLOCK_QUEUE         = 64;    // producer-consumer queue depth
 static constexpr int    MAX_NODE_COUNT          = 255;   // uint8_t node_count

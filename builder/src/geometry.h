@@ -144,6 +144,7 @@ inline void dp_simplify(const std::vector<std::pair<double,double>>& pts,
 
 static constexpr size_t MAX_POLYGON_VERTICES = 500;
 
+// Simplify to at most max_vertices (binary search for epsilon). Original behavior.
 inline std::vector<std::pair<double,double>> simplify_polygon(
     const std::vector<std::pair<double,double>>& pts, size_t max_vertices = MAX_POLYGON_VERTICES) {
     if (pts.size() <= max_vertices) return pts;
@@ -178,6 +179,49 @@ inline std::vector<std::pair<double,double>> simplify_polygon(
         if (keep[i]) result.push_back(pts[i]);
     }
     return result;
+}
+
+// Error-bounded simplification: maximum displacement of epsilon_deg (in degrees).
+// Epsilon is in the same coordinate units as the vertices (degrees).
+// Converts meters to degrees using latitude: epsilon_deg = meters / (111320 * cos(lat))
+// Always keeps at least min_vertices (default 4) to preserve basic shape.
+inline std::vector<std::pair<double,double>> simplify_polygon_epsilon(
+    const std::vector<std::pair<double,double>>& pts, double epsilon_deg,
+    size_t min_vertices = 4) {
+    if (pts.size() <= min_vertices) return pts;
+
+    std::vector<bool> keep(pts.size(), false);
+    keep[0] = true;
+    keep[pts.size() - 1] = true;
+    dp_simplify(pts, 0, pts.size() - 1, epsilon_deg, keep);
+
+    std::vector<std::pair<double,double>> result;
+    for (size_t i = 0; i < pts.size(); i++) {
+        if (keep[i]) result.push_back(pts[i]);
+    }
+    return result;
+}
+
+// Convert meters to degrees at a given latitude
+inline double meters_to_degrees(double meters, double latitude_deg) {
+    double cos_lat = std::cos(latitude_deg * M_PI / 180.0);
+    if (cos_lat < 0.01) cos_lat = 0.01; // clamp near poles
+    return meters / (111320.0 * cos_lat);
+}
+
+// Get epsilon in meters for an admin level.
+// Lower levels (country) get larger epsilon, higher levels (city) get finer detail.
+inline double admin_epsilon_meters(uint8_t admin_level) {
+    switch (admin_level) {
+        case 2:  return 500.0;  // country
+        case 3:  return 200.0;  // large region
+        case 4:  return 100.0;  // state/province
+        case 5:  return 50.0;   // district
+        case 6:  return 30.0;   // county
+        case 7:  return 20.0;   // municipality
+        case 8:  return 15.0;   // city/town
+        default: return 15.0;   // postal codes, etc.
+    }
 }
 
 // Parse leading digits from a house number string
