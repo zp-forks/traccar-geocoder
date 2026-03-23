@@ -4,6 +4,7 @@ project(traccar-geocoder-build LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(BZip2 REQUIRED)

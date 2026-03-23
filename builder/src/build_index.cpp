@@ -827,20 +827,94 @@ int main(int argc, char* argv[]) {
                         });
                     }
                     for (auto& w : admin_workers) w.join();
+                    log_phase("    Admin: ring assembly", _pt);
 
-                    // Merge thread-local admin results into ParsedData (sequential, thread-safe)
-                    uint64_t total_admin_rings = 0;
+                    // Flatten all admin results into a single vector for parallel processing
+                    std::vector<AdminResult> all_admin_results;
                     for (auto& local_results : thread_admin_results) {
-                        for (auto& ar : local_results) {
-                            const char* cc = ar.country_code.empty() ? nullptr : ar.country_code.c_str();
-                            add_admin_polygon(data, ar.vertices, ar.name.c_str(),
-                                              ar.admin_level, cc, &admin_pool);
-                            total_admin_rings++;
-                        }
+                        all_admin_results.insert(all_admin_results.end(),
+                            std::make_move_iterator(local_results.begin()),
+                            std::make_move_iterator(local_results.end()));
+                        local_results.clear();
                     }
+                    uint64_t total_admin_rings = all_admin_results.size();
+
+                    // Parallel simplification: the expensive work (normalize, simplify,
+                    // compute area) is done per-polygon with no shared state.
+                    struct PreparedPolygon {
+                        std::vector<std::pair<double,double>> simplified;
+                        std::string name;
+                        uint8_t admin_level;
+                        std::string country_code;
+                        float area;
+                    };
+                    std::vector<PreparedPolygon> prepared(total_admin_rings);
+                    {
+                        std::atomic<size_t> prep_idx{0};
+                        std::vector<std::thread> prep_workers;
+                        for (unsigned int t = 0; t < num_threads; t++) {
+                            prep_workers.emplace_back([&]() {
+                                while (true) {
+                                    size_t i = prep_idx.fetch_add(1);
+                                    if (i >= total_admin_rings) break;
+                                    auto& ar = all_admin_results[i];
+                                    auto& pp = prepared[i];
+
+                                    // Normalize ring rotation
+                                    auto& vertices = ar.vertices;
+                                    if (vertices.size() >= 4 &&
+                                        std::fabs(vertices.front().first - vertices.back().first) < 1e-7 &&
+                                        std::fabs(vertices.front().second - vertices.back().second) < 1e-7) {
+                                        vertices.pop_back();
+                                        auto min_it = std::min_element(vertices.begin(), vertices.end());
+                                        std::rotate(vertices.begin(), min_it, vertices.end());
+                                        vertices.push_back(vertices.front());
+                                    }
+
+                                    pp.simplified = simplify_polygon(vertices);
+                                    if (pp.simplified.size() >= 3) {
+                                        pp.area = polygon_area(pp.simplified);
+                                    }
+                                    pp.name = std::move(ar.name);
+                                    pp.admin_level = ar.admin_level;
+                                    pp.country_code = std::move(ar.country_code);
+                                }
+                            });
+                        }
+                        for (auto& w : prep_workers) w.join();
+                    }
+                    all_admin_results.clear();
+                    log_phase("    Admin: parallel simplify", _pt);
+
+                    // Sequential append + submit to S2 pool (cheap: just vector push + string intern)
+                    for (auto& pp : prepared) {
+                        if (pp.simplified.size() < 3) continue;
+
+                        uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());
+                        uint32_t vertex_offset = static_cast<uint32_t>(data.admin_vertices.size());
+
+                        for (const auto& [lat, lng] : pp.simplified) {
+                            data.admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+                        }
+
+                        AdminPolygon poly{};
+                        poly.vertex_offset = vertex_offset;
+                        poly.vertex_count = static_cast<uint16_t>(std::min(pp.simplified.size(), size_t(MAX_VERTEX_COUNT)));
+                        poly.name_id = data.string_pool.intern(pp.name);
+                        poly.admin_level = pp.admin_level;
+                        poly.area = pp.area;
+                        const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
+                        poly.country_code = (cc && cc[0] && cc[1])
+                            ? static_cast<uint16_t>((cc[0] << 8) | cc[1]) : 0;
+                        data.admin_polygons.push_back(poly);
+
+                        admin_pool.submit(poly_id, std::move(pp.simplified));
+                    }
+
                     std::cerr << "  Parallel admin assembly complete: "
                               << total_admin_rings << " polygon rings from "
                               << data.collected_relations.size() << " relations." << std::endl;
+                    log_phase("    Admin: append + submit S2", _pt);
 
                     // Free collected data
                     data.collected_relations.clear();
@@ -860,6 +934,7 @@ int main(int argc, char* argv[]) {
         // Drain admin polygon thread pool (may still be processing)
         std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
         auto admin_results = admin_pool.drain();
+        log_phase("    Admin: S2 covering drain", _pt);
         for (auto& [cell_id, ids] : admin_results) {
             auto& target = data.cell_to_admin[cell_id];
             target.insert(target.end(), ids.begin(), ids.end());
