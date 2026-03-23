@@ -3099,18 +3099,48 @@ int main(int argc, char* argv[]) {
             // Merge thread-local pairs into single vectors, sort, build cell maps
             std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
             // Concatenate + sort helper for flat CellItem pairs
-            auto concat_and_sort = [](std::vector<std::vector<CellItem>>& thread_pairs) -> std::vector<CellItemPair> {
+            // Parallel sort: each thread's data is already localized. Sort each
+            // thread's vector in parallel, then k-way merge into final sorted array.
+            auto concat_and_sort = [&num_threads](std::vector<std::vector<CellItem>>& thread_pairs) -> std::vector<CellItemPair> {
+                // Convert CellItem to CellItemPair and sort each thread's chunk in parallel
                 size_t total = 0;
                 for (auto& v : thread_pairs) total += v.size();
+
+                std::vector<std::vector<CellItemPair>> sorted_chunks(thread_pairs.size());
+                {
+                    std::vector<std::thread> sort_threads;
+                    for (size_t t = 0; t < thread_pairs.size(); t++) {
+                        sort_threads.emplace_back([&, t]() {
+                            auto& src = thread_pairs[t];
+                            auto& dst = sorted_chunks[t];
+                            dst.reserve(src.size());
+                            for (auto& ci : src) dst.push_back({ci.cell_id, ci.item_id});
+                            src.clear(); src.shrink_to_fit();
+                            std::sort(dst.begin(), dst.end(), [](const CellItemPair& a, const CellItemPair& b) {
+                                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+                            });
+                        });
+                    }
+                    for (auto& t : sort_threads) t.join();
+                }
+
+                // Merge sorted chunks (sequential but cache-friendly)
                 std::vector<CellItemPair> all;
                 all.reserve(total);
-                for (auto& v : thread_pairs) {
-                    for (auto& ci : v) all.push_back({ci.cell_id, ci.item_id});
-                    v.clear(); v.shrink_to_fit();
+                // Simple pairwise merge
+                for (auto& chunk : sorted_chunks) {
+                    if (all.empty()) {
+                        all = std::move(chunk);
+                    } else {
+                        std::vector<CellItemPair> merged;
+                        merged.reserve(all.size() + chunk.size());
+                        std::merge(all.begin(), all.end(), chunk.begin(), chunk.end(),
+                            std::back_inserter(merged), [](const CellItemPair& a, const CellItemPair& b) {
+                                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+                            });
+                        all = std::move(merged);
+                    }
                 }
-                std::sort(all.begin(), all.end(), [](const CellItemPair& a, const CellItemPair& b) {
-                    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                });
                 return all;
             };
 
@@ -3164,17 +3194,42 @@ int main(int argc, char* argv[]) {
         log_phase("S2 cell computation", _pt);
         std::cerr << "Deduplicating + sorting for write..." << std::endl;
         {
-            // Convert addr hash map to sorted pairs (replaces dedup + write extraction)
+            // Convert addr hash map to sorted pairs using parallel chunked sort
             auto f2 = std::async(std::launch::async, [&] {
-                // Extract, sort, dedup in one pass
+                // Extract all pairs
                 std::vector<CellItemPair> pairs;
                 pairs.reserve(data.cell_to_addrs.size() * 2);
                 for (auto& [cell_id, ids] : data.cell_to_addrs) {
                     for (auto id : ids) pairs.push_back({cell_id, id});
                 }
-                std::sort(pairs.begin(), pairs.end(), [](const CellItemPair& a, const CellItemPair& b) {
+
+                // Parallel chunked sort: split into N chunks, sort each, merge
+                auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
                     return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                });
+                };
+                unsigned int nt = std::min(std::thread::hardware_concurrency(), 32u);
+                if (nt < 2 || pairs.size() < 100000) {
+                    std::sort(pairs.begin(), pairs.end(), cmp);
+                } else {
+                    size_t chunk = (pairs.size() + nt - 1) / nt;
+                    std::vector<std::thread> ts;
+                    for (unsigned int t = 0; t < nt; t++) {
+                        size_t s = t * chunk, e = std::min(s + chunk, pairs.size());
+                        if (s >= pairs.size()) break;
+                        ts.emplace_back([&, s, e]{ std::sort(pairs.begin() + s, pairs.begin() + e, cmp); });
+                    }
+                    for (auto& t : ts) t.join();
+                    // Merge sorted chunks pairwise
+                    for (size_t cs = chunk; cs < pairs.size(); cs *= 2) {
+                        std::vector<std::thread> mts;
+                        for (size_t i = 0; i + cs < pairs.size(); i += cs * 2) {
+                            size_t mid = i + cs, end = std::min(mid + cs, pairs.size());
+                            mts.emplace_back([&, i, mid, end]{ std::inplace_merge(pairs.begin() + i, pairs.begin() + mid, pairs.begin() + end, cmp); });
+                        }
+                        for (auto& t : mts) t.join();
+                    }
+                }
+
                 pairs.erase(std::unique(pairs.begin(), pairs.end(), [](const CellItemPair& a, const CellItemPair& b) {
                     return a.cell_id == b.cell_id && a.item_id == b.item_id;
                 }), pairs.end());
