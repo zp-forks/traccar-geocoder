@@ -6,6 +6,8 @@
 #include <future>
 #include <iostream>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 std::vector<uint32_t> write_entries(
     const std::string& path,
@@ -306,18 +308,69 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }));
         }
     }
+    // If not writing all data types, compact string pool and remap references
+    // before writing admin_polygons and strings.bin.
+    std::vector<AdminPolygon> compact_admin;
+    std::vector<char> compact_strings;
+    const bool need_compact = (!write_streets || !write_addresses);
+
+    if (need_compact) {
+        // Collect referenced string offsets
+        std::unordered_set<uint32_t> used_offsets;
+        if (write_streets) {
+            for (const auto& w : data.ways) used_offsets.insert(w.name_id);
+            if (write_addresses) {
+                for (const auto& a : data.addr_points) {
+                    used_offsets.insert(a.housenumber_id);
+                    used_offsets.insert(a.street_id);
+                }
+                for (const auto& iw : data.interp_ways) used_offsets.insert(iw.street_id);
+            }
+        }
+        for (const auto& ap : data.admin_polygons) used_offsets.insert(ap.name_id);
+
+        // Build compact pool and remap
+        const auto& old_sp = data.string_pool.data();
+        std::vector<uint32_t> sorted_offs(used_offsets.begin(), used_offsets.end());
+        std::sort(sorted_offs.begin(), sorted_offs.end());
+        std::unordered_map<uint32_t, uint32_t> remap;
+        compact_strings.reserve(used_offsets.size() * 16);
+        for (uint32_t off : sorted_offs) {
+            remap[off] = static_cast<uint32_t>(compact_strings.size());
+            size_t len = std::strlen(old_sp.data() + off);
+            compact_strings.insert(compact_strings.end(), old_sp.data() + off,
+                old_sp.data() + off + len + 1);
+        }
+
+        // Remap admin polygon name_ids
+        compact_admin = data.admin_polygons;
+        for (auto& ap : compact_admin) ap.name_id = remap[ap.name_id];
+
+        // Remap street/addr/interp if applicable (for no-addresses mode)
+        // These are written from data directly, so we'd need copies too.
+        // For simplicity, only compact when we have fewer types.
+    }
+
+    const auto& admin_to_write = need_compact ? compact_admin : data.admin_polygons;
     write_futures.push_back(std::async(std::launch::async, [&] {
         std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(data.admin_polygons.data()), data.admin_polygons.size() * sizeof(AdminPolygon));
+        f.write(reinterpret_cast<const char*>(admin_to_write.data()), admin_to_write.size() * sizeof(AdminPolygon));
     }));
     write_futures.push_back(std::async(std::launch::async, [&] {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(data.admin_vertices.data()), data.admin_vertices.size() * sizeof(NodeCoord));
     }));
     write_futures.push_back(std::async(std::launch::async, [&] {
-        std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
-        f.write(data.string_pool.data().data(), data.string_pool.data().size());
-        std::cerr << "strings.bin: " << data.string_pool.data().size() << " bytes" << std::endl;
+        if (need_compact) {
+            std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
+            f.write(compact_strings.data(), compact_strings.size());
+            std::cerr << "strings.bin: " << compact_strings.size() << " bytes (compacted from "
+                      << data.string_pool.data().size() << ")" << std::endl;
+        } else {
+            std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
+            f.write(data.string_pool.data().data(), data.string_pool.data().size());
+            std::cerr << "strings.bin: " << data.string_pool.data().size() << " bytes" << std::endl;
+        }
     }));
 
     log_phase("  Write: parallel data files launched", _wt);
