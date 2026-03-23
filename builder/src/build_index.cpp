@@ -948,7 +948,7 @@ int main(int argc, char* argv[]) {
 
                         AdminPolygon poly{};
                         poly.vertex_offset = vertex_offset;
-                        poly.vertex_count = static_cast<uint16_t>(std::min(pp.simplified.size(), size_t(MAX_VERTEX_COUNT)));
+                        poly.vertex_count = static_cast<uint32_t>(pp.simplified.size());
                         poly.name_id = data.string_pool.intern(pp.name);
                         poly.admin_level = pp.admin_level;
                         poly.area = pp.area;

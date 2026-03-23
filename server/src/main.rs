@@ -63,7 +63,7 @@ struct InterpWay {
 #[derive(Clone, Copy)]
 struct AdminPolygon {
     vertex_offset: u32,
-    vertex_count: u16,
+    vertex_count: u32,
     name_id: u32,
     admin_level: u8,
     area: f32,

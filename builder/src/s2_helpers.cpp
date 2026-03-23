@@ -275,7 +275,7 @@ void add_admin_polygon(ParsedData& data,
 
     AdminPolygon poly{};
     poly.vertex_offset = vertex_offset;
-    poly.vertex_count = static_cast<uint16_t>(std::min(simplified.size(), size_t(MAX_VERTEX_COUNT)));
+    poly.vertex_count = static_cast<uint32_t>(simplified.size());
     poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.area = polygon_area(simplified);

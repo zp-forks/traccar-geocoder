@@ -29,7 +29,7 @@ struct InterpWay {
 
 struct AdminPolygon {
     uint32_t vertex_offset;
-    uint16_t vertex_count;
+    uint32_t vertex_count;
     uint32_t name_id;
     uint8_t admin_level;
     float area;
@@ -59,7 +59,7 @@ enum class SimplifyMode { MaxVertices, ErrorBounded };
 // Processing limits
 static constexpr size_t MAX_BLOCK_QUEUE         = 64;    // producer-consumer queue depth
 static constexpr int    MAX_NODE_COUNT          = 255;   // uint8_t node_count
-static constexpr int    MAX_VERTEX_COUNT        = 65535; // uint16_t vertex_count
+static constexpr int    MAX_VERTEX_COUNT        = 0x7FFFFFFF; // uint32_t vertex_count
 static constexpr int    MAX_S2_CELLS_PER_POLY   = 200;   // S2RegionCoverer max_cells
 static constexpr int    BACKTRACK_CALL_BUDGET   = 100000; // per-ring backtracking limit
 static constexpr int    BACKTRACK_TOTAL_BUDGET  = 500000; // per-relation backtracking limit

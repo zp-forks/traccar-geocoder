@@ -11,14 +11,13 @@
 
 struct AdminPolygon {
     uint32_t vertex_offset;
-    uint16_t vertex_count;
-    char _pad1[2];
+    uint32_t vertex_count;
     uint32_t name_id;
     uint8_t admin_level;
-    char _pad2[3];
+    char _pad1[3];
     float area;
     uint16_t country_code;
-    char _pad3[2];
+    char _pad2[2];
 };
 static_assert(sizeof(AdminPolygon) == 24);
 

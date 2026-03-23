@@ -111,7 +111,7 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
           AdminPolygon nap = ap;
           nap.vertex_offset = static_cast<uint32_t>(out.admin_vertices.size());
           out.admin_polygons.push_back(nap);
-          for (uint16_t v = 0; v < ap.vertex_count; v++)
+          for (uint32_t v = 0; v < ap.vertex_count; v++)
               out.admin_vertices.push_back(full.admin_vertices[ap.vertex_offset + v]);
       } }
 
