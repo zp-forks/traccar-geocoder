@@ -20,14 +20,14 @@
 #include <osmium/handler.hpp>
 #include <osmium/io/pbf_input.hpp>
 #include <osmium/visitor.hpp>
-#include <osmium/handler/node_locations_for_ways.hpp>
+// #include <osmium/handler/node_locations_for_ways.hpp>  // removed — no longer using osmium's location handler
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 // FlexMem no longer used — replaced by DenseIndex mmap
-#include <osmium/area/assembler.hpp>
-#include <osmium/area/multipolygon_manager.hpp>
+// #include <osmium/area/assembler.hpp>           // removed — sequential admin assembly removed
+// #include <osmium/area/multipolygon_manager.hpp> // removed — parallel assembly doesn't need this
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -917,8 +917,6 @@ static void add_admin_polygon(ParsedData& data,
         admin_pool->submit(poly_id, std::move(simplified));
     }
 }
-
-// --- OSM handler ---
 
 class BuildHandler : public osmium::handler::Handler {
 public:
@@ -2134,8 +2132,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
         std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
         std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
-        std::cerr << "  --parallel-admin       Use parallel admin boundary assembly (default: on)" << std::endl;
-        std::cerr << "  --no-parallel-admin    Disable parallel admin assembly (use osmium fallback)" << std::endl;
+        // parallel admin assembly is always used (sequential osmium path removed)
         return 1;
     }
 
@@ -2145,7 +2142,6 @@ int main(int argc, char* argv[]) {
     std::string load_cache_path;
     bool multi_output = false;
     bool generate_continents = false;
-    bool parallel_admin = true;
     IndexMode mode = IndexMode::Full;
 
     for (int i = 2; i < argc; i++) {
@@ -2168,10 +2164,8 @@ int main(int argc, char* argv[]) {
             multi_output = true;
         } else if (arg == "--continents") {
             generate_continents = true;
-        } else if (arg == "--parallel-admin") {
-            parallel_admin = true;
-        } else if (arg == "--no-parallel-admin") {
-            parallel_admin = false;
+        } else if (arg == "--parallel-admin" || arg == "--no-parallel-admin") {
+            // Ignored — parallel admin is always used
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "full") {
@@ -2209,7 +2203,8 @@ int main(int argc, char* argv[]) {
         unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() > 4 ? std::thread::hardware_concurrency() - 4 : 1u);
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
         AdminCoverPool admin_pool(num_threads);
-        BuildHandler handler(data, &admin_pool);
+        // BuildHandler no longer used — parallel processing handles everything
+        // BuildHandler handler(data, &admin_pool);
 
         // Dense array node location index — lockless parallel writes
         // Planet OSM node IDs max ~12.5 billion. 8 bytes per Location = 100GB virtual.
@@ -2265,30 +2260,17 @@ int main(int argc, char* argv[]) {
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
-            // --- Pass 1: collect relation members for multipolygon assembly ---
+            // --- Pass 1: collect relation members for parallel admin assembly ---
             std::cerr << "  Pass 1: scanning relations..." << std::endl;
-
-            osmium::area::Assembler::config_type assembler_config;
-            osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
-
-            // Also collect admin/postal relation metadata for parallel assembly
             RelationCollector rel_collector(data.collected_relations);
 
             {
                 osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
-                if (parallel_admin) {
-                    // Run both: mp_manager (for fallback compatibility) and rel_collector
-                    osmium::apply(reader1, mp_manager, rel_collector);
-                } else {
-                    osmium::apply(reader1, mp_manager);
-                }
+                osmium::apply(reader1, rel_collector);
                 reader1.close();
-                mp_manager.prepare_for_lookup();
             }
-            if (parallel_admin) {
-                std::cerr << "  Collected " << data.collected_relations.size()
-                          << " admin/postal relations for parallel assembly." << std::endl;
-            }
+            std::cerr << "  Collected " << data.collected_relations.size()
+                      << " admin/postal relations for parallel assembly." << std::endl;
 
             // --- Combined Pass 2+3: nodes then ways in a single PBF read ---
             // PBF guarantees ordering: nodes → ways → relations.
@@ -2298,14 +2280,12 @@ int main(int argc, char* argv[]) {
 
             // Build admin_way_ids BEFORE the combined pass (needed during way processing)
             std::unordered_set<int64_t> admin_way_ids;
-            if (parallel_admin) {
-                for (const auto& rel : data.collected_relations) {
-                    for (const auto& [way_id, role] : rel.members) {
-                        admin_way_ids.insert(way_id);
-                    }
+            for (const auto& rel : data.collected_relations) {
+                for (const auto& [way_id, role] : rel.members) {
+                    admin_way_ids.insert(way_id);
                 }
-                std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
             }
+            std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
 
             std::cerr << "  Pass 2+3: processing nodes and ways in single read..." << std::endl;
 
@@ -2618,7 +2598,7 @@ int main(int argc, char* argv[]) {
                                     }
 
                                     // Store way geometry only for admin boundary member ways
-                                    if (parallel_admin && !wnodes.empty() && admin_way_ids.count(way.id())) {
+                                    if (!wnodes.empty() && admin_way_ids.count(way.id())) {
                                         std::vector<std::pair<double,double>> geom;
                                         for (const auto& nr : wnodes) {
                                             try {
@@ -2636,7 +2616,7 @@ int main(int argc, char* argv[]) {
                                     // Handle closed ways that are admin boundaries themselves
                                     // Osmium creates areas from closed ways independently of
                                     // multipolygon relations, even if the way is a relation member.
-                                    if (parallel_admin) {
+                                    {
                                         const char* boundary = way.tags()["boundary"];
                                         if (boundary) {
                                             bool is_admin = (std::strcmp(boundary, "administrative") == 0);
@@ -2733,32 +2713,6 @@ int main(int argc, char* argv[]) {
                 std::cerr << "  Parallel way processing complete." << std::endl;
 
                 // Process areas/multipolygons — sequential fallback path
-                if (!parallel_admin) {
-                    // Use a custom location handler that reads from our dense index
-                    std::cerr << "  Processing multipolygon areas (sequential)..." << std::endl;
-                    {
-                        struct DenseLocationHandler : public osmium::handler::Handler {
-                            DenseIndex& idx;
-                            explicit DenseLocationHandler(DenseIndex& i) : idx(i) {}
-                            void node(osmium::Node& node) {
-                                node.set_location(idx.get(node.positive_id()));
-                            }
-                            void way(osmium::Way& way) {
-                                for (auto& nr : way.nodes()) {
-                                    nr.set_location(idx.get(nr.positive_ref()));
-                                }
-                            }
-                        } dense_loc_handler{index};
-
-                        osmium::io::Reader reader_rels{input_file};
-                        osmium::apply(reader_rels, dense_loc_handler,
-                            mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
-                                osmium::apply(buffer, handler);
-                            }));
-                        reader_rels.close();
-                    }
-                }
-
                 // Merge thread-local way/interp data into main ParsedData
                 std::cerr << "  Merging thread-local data..." << std::endl;
                 uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
@@ -2814,8 +2768,8 @@ int main(int argc, char* argv[]) {
                     total_building_addrs += local.building_addr_count;
                     total_interps += local.interp_count;
 
-                    // Merge way geometries for parallel admin assembly
-                    if (parallel_admin) {
+                    // Merge way geometries for admin assembly
+                    {
                         for (auto& wg : local.way_geoms) {
                             ParsedData::WayGeometry g;
                             g.coords = std::move(wg.coords);
@@ -2832,7 +2786,7 @@ int main(int argc, char* argv[]) {
                           << total_interps << " interps from parallel processing." << std::endl;
 
                 // --- Merge closed-way admin polygons ---
-                if (parallel_admin) {
+                {
                     uint64_t closed_way_admin_count = 0;
                     for (auto& local : tld) {
                         for (auto& cwa : local.closed_way_admins) {
@@ -2850,7 +2804,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // --- Parallel admin boundary assembly ---
-                if (parallel_admin) {
+                {
                     log_phase("Pass 2b: way processing", _pt);
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
