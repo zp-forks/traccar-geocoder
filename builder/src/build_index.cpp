@@ -2132,7 +2132,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
         std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
         std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
-        // parallel admin assembly is always used (sequential osmium path removed)
         return 1;
     }
 
@@ -2164,8 +2163,6 @@ int main(int argc, char* argv[]) {
             multi_output = true;
         } else if (arg == "--continents") {
             generate_continents = true;
-        } else if (arg == "--parallel-admin" || arg == "--no-parallel-admin") {
-            // Ignored — parallel admin is always used
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "full") {
