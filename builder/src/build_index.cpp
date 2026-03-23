@@ -3128,54 +3128,51 @@ int main(int argc, char* argv[]) {
                     for (auto& t : sort_threads) t.join();
                 }
 
-                // Step 2: K-way merge using min-heap, directly building hash map + sorted output
+                // Step 2: Concatenate sorted chunks and merge using parallel tree.
+                // Each chunk is already sorted. Record run boundaries, concatenate,
+                // then merge adjacent runs pairwise in parallel at each level.
+                auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
+                    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+                };
+
+                // Record run boundaries before concatenation
+                std::vector<size_t> run_bounds = {0};
                 sorted_out.clear();
                 sorted_out.reserve(total);
-                cell_map.reserve(total / 2);
-
-                // Min-heap: (cell_id, item_id, chunk_index)
-                struct HeapEntry {
-                    uint64_t cell_id;
-                    uint32_t item_id;
-                    uint32_t chunk;
-                    bool operator>(const HeapEntry& o) const {
-                        return cell_id > o.cell_id || (cell_id == o.cell_id && item_id > o.item_id);
-                    }
-                };
-                std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
-                std::vector<size_t> chunk_pos(chunks.size(), 0);
-
-                // Seed heap with first element from each non-empty chunk
-                for (uint32_t c = 0; c < chunks.size(); c++) {
-                    if (!chunks[c].empty()) {
-                        heap.push({chunks[c][0].cell_id, chunks[c][0].item_id, c});
-                        chunk_pos[c] = 1;
-                    }
+                for (auto& chunk : chunks) {
+                    sorted_out.insert(sorted_out.end(), chunk.begin(), chunk.end());
+                    run_bounds.push_back(sorted_out.size());
+                    chunk.clear(); chunk.shrink_to_fit();
                 }
 
-                uint64_t prev_cell = UINT64_MAX;
-                while (!heap.empty()) {
-                    auto top = heap.top();
-                    heap.pop();
-
-                    sorted_out.push_back({top.cell_id, top.item_id});
-
-                    // Build hash map incrementally
-                    if (top.cell_id != prev_cell) {
-                        cell_map[top.cell_id].push_back(top.item_id);
-                        prev_cell = top.cell_id;
-                    } else {
-                        cell_map[top.cell_id].push_back(top.item_id);
+                // Parallel tree merge: at each level, merge adjacent run pairs in parallel.
+                // Level 0: merge runs (0,1), (2,3), ... → N/2 runs
+                // Level 1: merge runs (01,23), (45,67), ... → N/4 runs
+                // ... until one sorted run remains.
+                while (run_bounds.size() > 2) {
+                    std::vector<size_t> new_bounds = {0};
+                    std::vector<std::thread> merge_threads;
+                    for (size_t i = 0; i + 2 < run_bounds.size(); i += 2) {
+                        size_t left = run_bounds[i];
+                        size_t mid = run_bounds[i + 1];
+                        size_t right = run_bounds[i + 2];
+                        merge_threads.emplace_back([&, left, mid, right] {
+                            std::inplace_merge(sorted_out.begin() + left,
+                                               sorted_out.begin() + mid,
+                                               sorted_out.begin() + right, cmp);
+                        });
+                        new_bounds.push_back(right);
                     }
-
-                    // Advance the chunk this entry came from
-                    uint32_t c = top.chunk;
-                    if (chunk_pos[c] < chunks[c].size()) {
-                        auto& next = chunks[c][chunk_pos[c]];
-                        heap.push({next.cell_id, next.item_id, c});
-                        chunk_pos[c]++;
+                    // If odd number of runs, carry the last one forward
+                    if (run_bounds.size() % 2 == 0) {
+                        new_bounds.push_back(run_bounds.back());
                     }
+                    for (auto& t : merge_threads) t.join();
+                    run_bounds = std::move(new_bounds);
                 }
+
+                // Skip building hash map — sorted_out is used directly for writing.
+                // cell_map stays empty (only needed for cache/continent modes).
             };
 
 
@@ -3249,16 +3246,8 @@ int main(int argc, char* argv[]) {
                     return a.cell_id == b.cell_id && a.item_id == b.item_id;
                 }), pairs.end());
                 data.sorted_addr_cells = std::move(pairs);
-                // Rebuild clean hash map from sorted pairs (needed for sorted_geo_cells union)
-                data.cell_to_addrs.clear();
-                for (size_t i = 0; i < data.sorted_addr_cells.size(); ) {
-                    size_t j = i;
-                    while (j < data.sorted_addr_cells.size() && data.sorted_addr_cells[j].cell_id == data.sorted_addr_cells[i].cell_id) j++;
-                    auto& vec = data.cell_to_addrs[data.sorted_addr_cells[i].cell_id];
-                    vec.reserve(j - i);
-                    for (size_t k = i; k < j; k++) vec.push_back(data.sorted_addr_cells[k].item_id);
-                    i = j;
-                }
+                // Skip rebuilding hash map — sorted_addr_cells is used directly
+                // for both sorted_geo_cells construction and entry writing.
             });
             auto f4 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_admin); });
             f2.get(); f4.get();
