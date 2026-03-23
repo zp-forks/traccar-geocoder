@@ -267,8 +267,9 @@ struct ParsedData {
     std::vector<DeferredWay> deferred_ways;
     std::vector<DeferredInterp> deferred_interps;
 
-    // Sorted (cell_id, way_id) pairs from S2 computation — kept for direct entry writing
+    // Sorted (cell_id, item_id) pairs — kept for direct entry writing
     std::vector<CellItemPair> sorted_way_cells;
+    std::vector<CellItemPair> sorted_addr_cells;
 
     // Collected data for parallel admin assembly
     std::vector<CollectedRelation> collected_relations;
@@ -1913,6 +1914,9 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
             });
             if (write_addresses) {
                 auto f2 = std::async(std::launch::async, [&]() {
+                    if (!data.sorted_addr_cells.empty()) {
+                        return write_entries_from_sorted(output_dir + "/addr_entries.bin", sorted_geo_cells, data.sorted_addr_cells);
+                    }
                     return write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, data.cell_to_addrs);
                 });
                 auto f3 = std::async(std::launch::async, [&]() {
@@ -3053,12 +3057,36 @@ int main(int argc, char* argv[]) {
         std::cerr << "Resolving interpolation endpoints..." << std::endl;
         resolve_interpolation_endpoints(data);
 
-        // Deduplicate all cell maps (in parallel)
+        // Deduplicate + convert to sorted pairs for fast writing
         log_phase("S2 cell computation", _pt);
-        std::cerr << "Deduplicating..." << std::endl;
+        std::cerr << "Deduplicating + sorting for write..." << std::endl;
         {
-            // cell_to_ways and cell_to_interps are already sorted from concat_and_sort
-            auto f2 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_addrs); });
+            // Convert addr hash map to sorted pairs (replaces dedup + write extraction)
+            auto f2 = std::async(std::launch::async, [&] {
+                // Extract, sort, dedup in one pass
+                std::vector<CellItemPair> pairs;
+                pairs.reserve(data.cell_to_addrs.size() * 2);
+                for (auto& [cell_id, ids] : data.cell_to_addrs) {
+                    for (auto id : ids) pairs.push_back({cell_id, id});
+                }
+                std::sort(pairs.begin(), pairs.end(), [](const CellItemPair& a, const CellItemPair& b) {
+                    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+                });
+                pairs.erase(std::unique(pairs.begin(), pairs.end(), [](const CellItemPair& a, const CellItemPair& b) {
+                    return a.cell_id == b.cell_id && a.item_id == b.item_id;
+                }), pairs.end());
+                data.sorted_addr_cells = std::move(pairs);
+                // Rebuild clean hash map from sorted pairs (needed for sorted_geo_cells union)
+                data.cell_to_addrs.clear();
+                for (size_t i = 0; i < data.sorted_addr_cells.size(); ) {
+                    size_t j = i;
+                    while (j < data.sorted_addr_cells.size() && data.sorted_addr_cells[j].cell_id == data.sorted_addr_cells[i].cell_id) j++;
+                    auto& vec = data.cell_to_addrs[data.sorted_addr_cells[i].cell_id];
+                    vec.reserve(j - i);
+                    for (size_t k = i; k < j; k++) vec.push_back(data.sorted_addr_cells[k].item_id);
+                    i = j;
+                }
+            });
             auto f4 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_admin); });
             f2.get(); f4.get();
         }
