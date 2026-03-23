@@ -2761,6 +2761,39 @@ int main(int argc, char* argv[]) {
 
                 // Merge thread-local way/interp data into main ParsedData
                 std::cerr << "  Merging thread-local data..." << std::endl;
+
+                // Step 1: Collect all unique strings from all threads in parallel.
+                // Each thread collects its own unique strings into a local set.
+                std::vector<std::unordered_set<std::string>> thread_unique_strings(tld.size());
+                {
+                    std::vector<std::thread> collect_threads;
+                    for (size_t t = 0; t < tld.size(); t++) {
+                        collect_threads.emplace_back([&, t]() {
+                            auto& us = thread_unique_strings[t];
+                            auto& local = tld[t];
+                            for (auto& s : local.way_strings) us.insert(s);
+                            for (auto& [hn, st] : local.addr_strings) { us.insert(hn); us.insert(st); }
+                            for (auto& s : local.interp_strings) us.insert(s);
+                        });
+                    }
+                    for (auto& t : collect_threads) t.join();
+                }
+
+                // Step 2: Merge unique string sets and bulk-intern (sequential but fewer strings).
+                std::unordered_map<std::string, uint32_t> string_lookup;
+                {
+                    std::unordered_set<std::string> all_unique;
+                    for (auto& us : thread_unique_strings) {
+                        all_unique.insert(us.begin(), us.end());
+                        us.clear();
+                    }
+                    string_lookup.reserve(all_unique.size());
+                    for (auto& s : all_unique) {
+                        string_lookup[s] = data.string_pool.intern(s);
+                    }
+                }
+
+                // Step 3: Merge data using pre-computed string lookup (fast hash map of unique strings only)
                 uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
                 for (auto& local : tld) {
                     uint32_t way_base = static_cast<uint32_t>(data.ways.size());
@@ -2768,11 +2801,11 @@ int main(int argc, char* argv[]) {
                     uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());
                     uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
 
-                    // Merge street ways
+                    // Merge street ways (lookup is fast — small unique string set)
                     for (size_t i = 0; i < local.ways.size(); i++) {
                         auto h = local.ways[i];
                         h.node_offset += node_base;
-                        h.name_id = data.string_pool.intern(local.way_strings[i]);
+                        h.name_id = string_lookup[local.way_strings[i]];
                         data.ways.push_back(h);
                     }
                     data.street_nodes.insert(data.street_nodes.end(),
@@ -2787,17 +2820,22 @@ int main(int argc, char* argv[]) {
 
                     // Merge building addresses
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
-                        uint64_t dummy = 0;
-                        add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
-                                       local.addr_strings[i].first.c_str(),
-                                       local.addr_strings[i].second.c_str(), dummy);
+                        uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
+                        data.addr_points.push_back({
+                            local.building_addrs[i].lat,
+                            local.building_addrs[i].lng,
+                            string_lookup[local.addr_strings[i].first],
+                            string_lookup[local.addr_strings[i].second]
+                        });
+                        S2CellId cell = point_to_cell(local.building_addrs[i].lat, local.building_addrs[i].lng);
+                        data.cell_to_addrs[cell.id()].push_back(addr_id);
                     }
 
                     // Merge interpolation ways
                     for (size_t i = 0; i < local.interp_ways.size(); i++) {
                         auto iw = local.interp_ways[i];
                         iw.node_offset += interp_node_base;
-                        iw.street_id = data.string_pool.intern(local.interp_strings[i]);
+                        iw.street_id = string_lookup[local.interp_strings[i]];
                         data.interp_ways.push_back(iw);
                     }
                     data.interp_nodes.insert(data.interp_nodes.end(),
