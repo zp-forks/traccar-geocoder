@@ -1887,19 +1887,67 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
     bool write_addresses = (mode == IndexMode::Full);
 
     if (write_streets) {
-        // Merged geo cell index for streets, addresses, and interpolation
-        // Use sorted vector instead of std::set for faster construction
+        // Build sorted_geo_cells from sorted pairs where available (avoids hash map iteration).
+        // Extract unique cell IDs from each sorted pair vector in parallel, then merge.
         std::vector<uint64_t> sorted_geo_cells;
         {
-            std::unordered_set<uint64_t> all_geo_cells;
-            all_geo_cells.reserve(data.cell_to_ways.size() + data.cell_to_addrs.size());
-            for (const auto& [id, _] : data.cell_to_ways) all_geo_cells.insert(id);
-            if (write_addresses) {
-                for (const auto& [id, _] : data.cell_to_addrs) all_geo_cells.insert(id);
-                for (const auto& [id, _] : data.cell_to_interps) all_geo_cells.insert(id);
+            auto extract_unique_cells = [](const std::vector<CellItemPair>& pairs) {
+                std::vector<uint64_t> cells;
+                cells.reserve(pairs.size() / 2);
+                for (size_t i = 0; i < pairs.size(); ) {
+                    cells.push_back(pairs[i].cell_id);
+                    uint64_t cur = pairs[i].cell_id;
+                    while (i < pairs.size() && pairs[i].cell_id == cur) i++;
+                }
+                return cells;
+            };
+            auto extract_from_map = [](const std::unordered_map<uint64_t, std::vector<uint32_t>>& m) {
+                std::vector<uint64_t> cells;
+                cells.reserve(m.size());
+                for (auto& [id, _] : m) cells.push_back(id);
+                std::sort(cells.begin(), cells.end());
+                return cells;
+            };
+
+            // Extract unique cell IDs in parallel
+            std::vector<uint64_t> way_cells, addr_cells, interp_cells;
+            {
+                auto f1 = std::async(std::launch::async, [&] {
+                    return !data.sorted_way_cells.empty()
+                        ? extract_unique_cells(data.sorted_way_cells)
+                        : extract_from_map(data.cell_to_ways);
+                });
+                if (write_addresses) {
+                    auto f2 = std::async(std::launch::async, [&] {
+                        return !data.sorted_addr_cells.empty()
+                            ? extract_unique_cells(data.sorted_addr_cells)
+                            : extract_from_map(data.cell_to_addrs);
+                    });
+                    auto f3 = std::async(std::launch::async, [&] {
+                        return extract_from_map(data.cell_to_interps);
+                    });
+                    addr_cells = f2.get();
+                    interp_cells = f3.get();
+                }
+                way_cells = f1.get();
             }
-            sorted_geo_cells.assign(all_geo_cells.begin(), all_geo_cells.end());
-            std::sort(sorted_geo_cells.begin(), sorted_geo_cells.end());
+
+            // Merge sorted unique cell ID vectors
+            sorted_geo_cells.reserve(way_cells.size() + addr_cells.size() + interp_cells.size());
+            std::merge(way_cells.begin(), way_cells.end(),
+                       addr_cells.begin(), addr_cells.end(),
+                       std::back_inserter(sorted_geo_cells));
+            if (!interp_cells.empty()) {
+                std::vector<uint64_t> tmp;
+                tmp.reserve(sorted_geo_cells.size() + interp_cells.size());
+                std::merge(sorted_geo_cells.begin(), sorted_geo_cells.end(),
+                           interp_cells.begin(), interp_cells.end(),
+                           std::back_inserter(tmp));
+                sorted_geo_cells = std::move(tmp);
+            }
+            // Deduplicate (merge may have duplicates from overlapping cells)
+            sorted_geo_cells.erase(std::unique(sorted_geo_cells.begin(), sorted_geo_cells.end()),
+                                    sorted_geo_cells.end());
         }
 
         // Write entry files in parallel (returns positional offset vectors, not hash maps)
@@ -1929,23 +1977,35 @@ static void write_index(const ParsedData& data, const std::string& output_dir, I
         }
 
         log_phase("  Write: entry files", _wt);
-        // Build geo_cells.bin in memory buffer (avoids 332M × 4 small writes + hash lookups)
+        // Build geo_cells.bin — parallel buffer fill + single write
         {
             size_t n = sorted_geo_cells.size();
-            size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t); // cell_id + 3 offsets
+            size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t);
             std::vector<char> buf(n * row_size);
-            char* ptr = buf.data();
 
-            // Fill empty offset vectors if not writing addresses
             if (addr_offsets.empty()) addr_offsets.resize(n, NO_DATA);
             if (interp_offsets.empty()) interp_offsets.resize(n, NO_DATA);
 
-            for (size_t i = 0; i < n; i++) {
-                memcpy(ptr, &sorted_geo_cells[i], sizeof(uint64_t)); ptr += sizeof(uint64_t);
-                memcpy(ptr, &street_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                memcpy(ptr, &addr_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                memcpy(ptr, &interp_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+            // Parallel buffer fill — split into chunks across threads
+            unsigned int nthreads = std::thread::hardware_concurrency();
+            if (nthreads == 0) nthreads = 4;
+            size_t chunk = (n + nthreads - 1) / nthreads;
+            std::vector<std::thread> fill_threads;
+            for (unsigned int t = 0; t < nthreads; t++) {
+                size_t start = t * chunk;
+                size_t end = std::min(start + chunk, n);
+                if (start >= n) break;
+                fill_threads.emplace_back([&, start, end]() {
+                    char* ptr = buf.data() + start * row_size;
+                    for (size_t i = start; i < end; i++) {
+                        memcpy(ptr, &sorted_geo_cells[i], sizeof(uint64_t)); ptr += sizeof(uint64_t);
+                        memcpy(ptr, &street_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                        memcpy(ptr, &addr_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                        memcpy(ptr, &interp_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                    }
+                });
             }
+            for (auto& t : fill_threads) t.join();
 
             std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
             f.write(buf.data(), buf.size());
