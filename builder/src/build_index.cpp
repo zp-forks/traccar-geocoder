@@ -1167,6 +1167,22 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // --- Rebuild hash maps from sorted pairs if needed for continent filtering ---
+    if (generate_continents || !save_cache_path.empty()) {
+        auto rebuild_map = [](const std::vector<CellItemPair>& sorted,
+                              std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
+            if (sorted.empty() || !map.empty()) return;
+            for (const auto& p : sorted) {
+                map[p.cell_id].push_back(p.item_id);
+            }
+        };
+        std::cerr << "Rebuilding cell maps for continent filtering..." << std::endl;
+        auto f1 = std::async(std::launch::async, [&]{ rebuild_map(data.sorted_way_cells, data.cell_to_ways); });
+        auto f2 = std::async(std::launch::async, [&]{ rebuild_map(data.sorted_interp_cells, data.cell_to_interps); });
+        f1.get(); f2.get();
+        log_phase("Rebuild cell maps", _pt);
+    }
+
     // --- Write index files ---
     log_phase("Deduplication", _pt);
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
