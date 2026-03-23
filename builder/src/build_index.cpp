@@ -20,14 +20,11 @@
 #include <osmium/handler.hpp>
 #include <osmium/io/pbf_input.hpp>
 #include <osmium/visitor.hpp>
-// #include <osmium/handler/node_locations_for_ways.hpp>  // removed — no longer using osmium's location handler
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 // FlexMem no longer used — replaced by DenseIndex mmap
-// #include <osmium/area/assembler.hpp>           // removed — sequential admin assembly removed
-// #include <osmium/area/multipolygon_manager.hpp> // removed — parallel assembly doesn't need this
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -917,214 +914,6 @@ static void add_admin_polygon(ParsedData& data,
         admin_pool->submit(poly_id, std::move(simplified));
     }
 }
-
-class BuildHandler : public osmium::handler::Handler {
-public:
-    explicit BuildHandler(ParsedData& data, AdminCoverPool* admin_pool = nullptr)
-        : data_(data), admin_pool_(admin_pool) {}
-
-    void node(const osmium::Node& node) {
-        const char* housenumber = node.tags()["addr:housenumber"];
-        if (!housenumber) return;
-        const char* street = node.tags()["addr:street"];
-        if (!street) return;
-        if (!node.location().valid()) return;
-
-        add_addr_point(data_, node.location().lat(), node.location().lon(),
-                       housenumber, street, addr_count_total_);
-    }
-
-    void way(const osmium::Way& way) {
-        // Address interpolation
-        const char* interpolation = way.tags()["addr:interpolation"];
-        if (interpolation) {
-            process_interpolation_way(way, interpolation);
-            return;
-        }
-
-        // Building addresses
-        const char* housenumber = way.tags()["addr:housenumber"];
-        if (housenumber) {
-            const char* street = way.tags()["addr:street"];
-            if (street) {
-                process_building_address(way, housenumber, street);
-            }
-        }
-
-        // Highway ways
-        const char* highway = way.tags()["highway"];
-        if (highway && is_included_highway(highway)) {
-            const char* name = way.tags()["name"];
-            if (name) {
-                process_highway(way, name);
-            }
-        }
-    }
-
-    void area(const osmium::Area& area) {
-        const char* boundary = area.tags()["boundary"];
-        if (!boundary) return;
-
-        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
-        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
-        if (!is_admin && !is_postal) return;
-
-        uint8_t admin_level = 0;
-        if (is_admin) {
-            const char* level_str = area.tags()["admin_level"];
-            if (!level_str) return;
-            admin_level = static_cast<uint8_t>(std::atoi(level_str));
-            if (admin_level < 2 || admin_level > 10) return;
-        } else {
-            admin_level = 11; // use 11 for postal codes
-        }
-        if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) return;
-
-        const char* name = area.tags()["name"];
-        if (!name && is_admin) return;
-
-        // For postal codes, use postal_code tag as name
-        std::string name_str;
-        if (is_postal) {
-            const char* postal_code = area.tags()["postal_code"];
-            if (!postal_code) postal_code = name;
-            if (!postal_code) return;
-            name_str = postal_code;
-        } else {
-            name_str = name;
-        }
-
-        // Extract country code for level 2 boundaries
-        const char* country_code = (admin_level == 2)
-            ? area.tags()["ISO3166-1:alpha2"]
-            : nullptr;
-        // Extract outer ring vertices
-        for (const auto& outer_ring : area.outer_rings()) {
-            std::vector<std::pair<double,double>> vertices;
-            for (const auto& node_ref : outer_ring) {
-                if (node_ref.location().valid()) {
-                    vertices.emplace_back(node_ref.location().lat(), node_ref.location().lon());
-                }
-            }
-            if (vertices.size() >= 3) {
-                add_admin_polygon(data_, vertices, name_str.c_str(), admin_level, country_code, admin_pool_);
-            }
-        }
-
-        admin_count_++;
-        if (admin_count_ % 10000 == 0) {
-            std::cerr << "Processed " << admin_count_ / 1000 << "K admin boundaries..." << std::endl;
-        }
-    }
-
-    uint64_t way_count() const { return way_count_; }
-    uint64_t building_addr_count() const { return building_addr_count_; }
-    uint64_t interp_count() const { return interp_count_; }
-    uint64_t admin_count() const { return admin_count_; }
-    uint64_t addr_count_total() const { return addr_count_total_; }
-
-private:
-    ParsedData& data_;
-    AdminCoverPool* admin_pool_ = nullptr;
-    uint64_t way_count_ = 0;
-    uint64_t building_addr_count_ = 0;
-    uint64_t interp_count_ = 0;
-    uint64_t admin_count_ = 0;
-    uint64_t addr_count_total_ = 0;
-
-    void process_building_address(const osmium::Way& way, const char* housenumber, const char* street) {
-        const auto& wnodes = way.nodes();
-        if (wnodes.empty()) return;
-
-        double sum_lat = 0, sum_lng = 0;
-        int valid = 0;
-        for (const auto& nr : wnodes) {
-            if (!nr.location().valid()) continue;
-            sum_lat += nr.location().lat();
-            sum_lng += nr.location().lon();
-            valid++;
-        }
-        if (valid == 0) return;
-
-        add_addr_point(data_, sum_lat / valid, sum_lng / valid,
-                       housenumber, street, addr_count_total_);
-        building_addr_count_++;
-    }
-
-    void process_interpolation_way(const osmium::Way& way, const char* interpolation) {
-        const auto& wnodes = way.nodes();
-        if (wnodes.size() < 2) return;
-
-        for (const auto& nr : wnodes) {
-            if (!nr.location().valid()) return;
-        }
-
-        const char* street = way.tags()["addr:street"];
-        if (!street) return;
-
-        uint8_t interp_type = 0;
-        if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
-        else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
-
-        uint32_t interp_id = static_cast<uint32_t>(data_.interp_ways.size());
-        uint32_t node_offset = static_cast<uint32_t>(data_.interp_nodes.size());
-
-        for (const auto& nr : wnodes) {
-            data_.interp_nodes.push_back({
-                static_cast<float>(nr.location().lat()),
-                static_cast<float>(nr.location().lon())
-            });
-        }
-
-        InterpWay iw{};
-        iw.node_offset = node_offset;
-        iw.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-        iw.street_id = data_.string_pool.intern(street);
-        iw.start_number = 0;
-        iw.end_number = 0;
-        iw.interpolation = interp_type;
-        data_.interp_ways.push_back(iw);
-
-        // Defer S2 cell computation to parallel phase
-        data_.deferred_interps.push_back({interp_id, node_offset,
-            static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)))});
-
-        interp_count_++;
-    }
-
-    void process_highway(const osmium::Way& way, const char* name) {
-        const auto& wnodes = way.nodes();
-        if (wnodes.size() < 2) return;
-
-        for (const auto& nr : wnodes) {
-            if (!nr.location().valid()) return;
-        }
-
-        uint32_t way_id = static_cast<uint32_t>(data_.ways.size());
-        uint32_t node_offset = static_cast<uint32_t>(data_.street_nodes.size());
-
-        for (const auto& nr : wnodes) {
-            data_.street_nodes.push_back({
-                static_cast<float>(nr.location().lat()),
-                static_cast<float>(nr.location().lon())
-            });
-        }
-
-        WayHeader header{};
-        header.node_offset = node_offset;
-        header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-        header.name_id = data_.string_pool.intern(name);
-        data_.ways.push_back(header);
-
-        // Defer S2 cell computation to parallel phase
-        data_.deferred_ways.push_back({way_id, node_offset, header.node_count});
-
-        way_count_++;
-        if (way_count_ % 1000000 == 0) {
-            std::cerr << "Collected " << way_count_ / 1000000 << "M street ways..." << std::endl;
-        }
-    }
-};
 
 // --- Relation collector for parallel admin assembly (runs during pass 1) ---
 
@@ -2201,7 +1990,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
         AdminCoverPool admin_pool(num_threads);
         // BuildHandler no longer used — parallel processing handles everything
-        // BuildHandler handler(data, &admin_pool);
 
         // Dense array node location index — lockless parallel writes
         // Planet OSM node IDs max ~12.5 billion. 8 bytes per Location = 100GB virtual.
