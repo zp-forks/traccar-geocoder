@@ -69,7 +69,7 @@ name differs.
 
 | Phase | Sequential baseline | Parallel (initial) | Parallel (optimized) |
 |---|---|---|---|
-| Total build (planet) | ~5 hours | ~40 minutes | **~18 minutes** |
+| Total build (planet) | ~5 hours | ~40 minutes | **~14 minutes** |
 | Admin assembly | ~2 hours | ~5 minutes | ~2.6 minutes |
 | S2 cell computation | — | ~17 minutes | ~5.8 minutes |
 | Index writing | ~25-30 minutes | ~10 minutes | ~4.2 minutes |
