@@ -2,81 +2,55 @@
 
 ## Summary
 
-| Round | Total Time | Change vs Previous | Change vs Baseline |
+| Round | Total Time | vs Baseline | Key Change |
 |---|---|---|---|
-| Baseline | 54m 1.7s | — | — |
-| Round 1 | 28m 36.6s | -47% | -47% |
-| Round 2 | 28m 19.6s | -1% | -48% |
-| Round 3 (reverted) | ~33m | +16% | REVERTED |
-| **Round 4** | **17m 14.7s** | **-39%** | **-68%** |
+| Baseline | 54m 1.7s | — | Sequential everything |
+| Round 1 | 28m 36.6s | -47% | Parallel continents + parallel cell map rebuild |
+| Round 2 | 28m 19.6s | -48% | Parallel remap + parallel mode writes |
+| Round 3 | ~33m | REVERTED | Cell pre-tagging (hash map overhead) |
+| Round 4 | 17m 14.7s | -68% | Sorted pair filtering + eliminate rebuild |
+| **Round 5** | **~16m 50s** | **-69%** | Parallel chunked sorted pair scanning |
 
-## Current Best: 17m 14.7s
+## Current Best Phase Breakdown (~16m 50s)
 
-### Phase Breakdown
-| Phase | Baseline | Current | Change |
-|---|---|---|---|
-| Pass 1: relation scanning | 46.6s | 49.1s | (disk cache variance) |
-| Pass 2: node processing | 184.4s | 176.3s | -4% |
-| Pass 2b: way processing | 132.3s | 120.3s | -9% |
-| Admin assembly | 141.7s | 143.2s | same |
-| S2 cell computation | 251.5s | 245.8s | -2% |
-| **Rebuild cell maps** | **224.2s** | **0s (eliminated)** | **-100%** |
-| Planet write + qualities | 42.0s | 35.3s | -16% |
-| **Continent processing** | **2087.5s** | **172.0s** | **-92%** |
-| **Total** | **54m 1.7s** | **17m 14.7s** | **-68%** |
-
-### Continent Filter Times (sorted pairs vs hash maps)
-| Continent | Baseline | Round 1 (hash map) | Round 4 (sorted pairs) |
-|---|---|---|---|
-| Africa | 162.1s | 147.9s | **55.7s** |
-| Asia | 234.4s | 264.8s | **79.5s** |
-| Europe | 277.4s | 313.0s | **136.5s** |
-| North America | 301.0s | 403.0s | (concurrent) |
-| South America | 177.3s | 187.3s | **58.6s** |
-| Oceania | 164.9s | — | **56.3s** |
-| Central America | 159.5s | — | **53.2s** |
-| Antarctica | 145.2s | — | **49.6s** |
-
----
-
-## Changes Applied
-
-### Round 1: Parallel continents + parallel cell map rebuild ✅
-**Commit**: `d2901da`
-- 4 concurrent continents on 32-core machine
-- Parallel cell map rebuild: split sorted pairs into chunks
-
-### Round 2: Parallel remap + parallel mode writes ✅
-**Commits**: `5a7f9d7`, `49c4b81`
-- 4 remap phases run in parallel in filter_by_bbox
-- 3 mode writes (full/no-addresses/admin) run in parallel
-
-### Round 3: Cell pre-tagging ❌ REVERTED
-**Commit**: `f17eb6c` → reverted `996c374`
-- Pre-computing continent masks for 300M cells took 434s — worse than savings
-
-### Round 4: Sorted pair filtering + eliminate rebuild ✅
-**Commit**: `73a3005`
-- filter_by_bbox uses sorted pair arrays instead of hash maps for ways/addrs/interps
-- Linear cache-friendly scan vs random hash map iteration = 2-5x faster per continent
-- Eliminated 170s rebuild_cell_maps phase entirely
-- Combined savings: 170s rebuild + ~70% faster continent filtering
-
----
-
-## Remaining Bottlenecks
-
-| Phase | Time | Feasibility |
+| Phase | Time | Notes |
 |---|---|---|
-| S2 cell computation | 245.8s | Already fully parallel (28 threads) |
-| Pass 2: node processing | 176.3s | Already parallel (28 threads) |
-| S2 covering drain | 137.0s | Already parallel thread pool |
-| S2 street ways | 137.7s | Already parallel (28 threads) |
-| Admin: S2 covering drain | 137.0s | Already parallel thread pool |
-| Pass 2b: way processing | 120.3s | Already parallel (28 threads) |
-| Continent processing | 172.0s | 4 concurrent, sorted pair scanning |
-| Pass 1 | 49.1s | Single-threaded osmium PBF read (unavoidable) |
-| Deduplication | 50.2s | 2 async tasks |
-| Planet write | 35.3s | Mixed parallel |
+| Pass 1: relation scanning | 46.5s | Single-threaded PBF read |
+| Pass 2: node processing | 187.5s | 28 threads |
+| Pass 2b: way processing | 132.5s | 28 threads |
+| Admin assembly (all) | 142.7s | Mixed parallel |
+| S2 cell computation | 246.9s | 28 threads |
+| Deduplication | 50.6s | 2 async tasks |
+| Planet write + qualities | 33.7s | Parallel |
+| Continent processing | 168.5s | 4 concurrent, parallel chunked scan |
+| **Total** | **~16m 50s** | |
 
-Most remaining phases are already parallel. The theoretical minimum is ~250s (S2 computation, limited by CPU) + 176s (nodes) + 120s (ways) ≈ ~9 min if everything overlapped perfectly, but these are sequential pipeline stages.
+### Continent Filter Times (Round 5 — parallel chunked scan)
+| Continent | Filter | Total |
+|---|---|---|
+| Africa | 30.5s | 3.7s |
+| Asia | 60.3s | 9.8s |
+| Europe | 137.7s | 22.0s |
+| North America | 82.9s | 12.0s |
+| South America | 29.8s | 5.6s |
+| Oceania | 27.6s | 4.0s |
+| Central America | 24.7s | 1.5s |
+| Antarctica | 19.1s | 0.0s |
+
+## Remaining Bottlenecks (all already heavily parallelized)
+| Phase | Time | Status |
+|---|---|---|
+| S2 cell computation | 246.9s | 28 threads, compute-bound |
+| Pass 2: nodes | 187.5s | 28 threads, I/O + compute |
+| Admin S2 drain | 136.2s | Thread pool |
+| S2 street ways | 136.5s | 28 threads |
+| Continent processing | 168.5s | 4×8 threads, memory-limited concurrency |
+| Pass 2b: ways | 132.5s | 28 threads |
+| Deduplication | 50.6s | 2 async tasks |
+| Pass 1 | 46.5s | Single-threaded (osmium) |
+| Planet write | 33.7s | Parallel |
+
+### Notes
+- Most phases are already at or near optimal parallelism
+- Further gains would require architectural changes (pipeline overlap between phases, reduce data copies)
+- The theoretical minimum for this workload is ~10-12 min (limited by PBF I/O and S2 computation)
