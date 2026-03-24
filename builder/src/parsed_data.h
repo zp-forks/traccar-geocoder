@@ -7,6 +7,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
+#include <iomanip>
+#include <thread>
+#include <unistd.h>
 #include <sys/stat.h>
 
 #include "types.h"
@@ -24,8 +30,57 @@ inline void ensure_dir(const std::string& path) {
     mkdir(path.c_str(), 0755);
 }
 
-// --- Phase timer ---
+// --- CPU tick reading (all threads via getrusage) ---
 
+#include <sys/resource.h>
+
+struct CpuTicks {
+    long long process_us = 0;  // user+system microseconds (all threads)
+
+    static CpuTicks now() {
+        CpuTicks ct;
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
+            ct.process_us = (long long)ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec
+                          + (long long)ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec;
+        }
+        return ct;
+    }
+};
+
+// --- Phase timer with CPU utilization ---
+
+inline long get_rss_mb() {
+    long rss_pages = 0;
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (f) {
+        long size;
+        if (fscanf(f, "%ld %ld", &size, &rss_pages) != 2) rss_pages = 0;
+        fclose(f);
+    }
+    return rss_pages * sysconf(_SC_PAGESIZE) / (1024 * 1024);
+}
+
+inline void log_phase(const char* name, std::chrono::steady_clock::time_point& t,
+                       CpuTicks& prev_cpu) {
+    auto now = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count();
+    auto cpu_now = CpuTicks::now();
+    double cpu_sec = (cpu_now.process_us - prev_cpu.process_us) / 1e6;
+    double wall_sec = ms / 1000.0;
+    double cores_used = (wall_sec > 0.1) ? cpu_sec / wall_sec : 0;
+    unsigned ncpu = std::thread::hardware_concurrency();
+    int pct = (wall_sec > 0.1 && ncpu > 0) ? (int)(cores_used * 100.0 / ncpu) : 0;
+    long rss = get_rss_mb();
+    std::cerr << "  [" << ms/1000 << "." << (ms%1000)/100 << "s"
+              << " " << std::fixed << std::setprecision(1) << cores_used << "/" << ncpu << "cores"
+              << " " << pct << "%"
+              << " " << rss << "MiB] " << name << std::endl;
+    t = now;
+    prev_cpu = cpu_now;
+}
+
+// Backward compat overload (no CPU tracking)
 inline void log_phase(const char* name, std::chrono::steady_clock::time_point& t) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t).count();

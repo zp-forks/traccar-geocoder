@@ -8,6 +8,7 @@
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -174,6 +175,7 @@ int main(int argc, char* argv[]) {
 
     ParsedData data;
     auto _pt = std::chrono::steady_clock::now();
+    auto _cpu = CpuTicks::now();
 
     if (!load_cache_path.empty()) {
         // Load from cache
@@ -264,7 +266,7 @@ int main(int argc, char* argv[]) {
             // PBF guarantees ordering: nodes → ways → relations.
             // We read everything in one pass, processing nodes first, then
             // transitioning to way processing when the first way block arrives.
-            log_phase("Pass 1: relation scanning", _pt);
+            log_phase("Pass 1: relation scanning", _pt, _cpu);
 
             // Build admin_way_ids BEFORE the combined pass (needed during way processing)
             std::unordered_set<int64_t> admin_way_ids;
@@ -397,7 +399,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::cerr << "  Node processing complete: " << total_addrs
                           << " address points collected." << std::endl;
-                log_phase("Pass 2: node processing", _pt);
+                log_phase("Pass 2: node processing", _pt, _cpu);
                 std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
 
                 // --- Phase 2: Way processing using same reader ---
@@ -783,7 +785,7 @@ int main(int argc, char* argv[]) {
 
                 // --- Parallel admin boundary assembly ---
                 {
-                    log_phase("Pass 2b: way processing", _pt);
+                    log_phase("Pass 2b: way processing", _pt, _cpu);
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
                               << data.way_geometries.size() << " way geometries)..." << std::endl;
@@ -902,7 +904,7 @@ int main(int argc, char* argv[]) {
                         });
                     }
                     for (auto& w : admin_workers) w.join();
-                    log_phase("    Admin: ring assembly", _pt);
+                    log_phase("    Admin: ring assembly", _pt, _cpu);
 
                     // Flatten all admin results into a single vector for parallel processing
                     std::vector<AdminResult> all_admin_results;
@@ -959,7 +961,7 @@ int main(int argc, char* argv[]) {
                         for (auto& w : prep_workers) w.join();
                     }
                     all_admin_results.clear();
-                    log_phase("    Admin: parallel simplify", _pt);
+                    log_phase("    Admin: parallel simplify", _pt, _cpu);
 
                     // Sequential append + submit to S2 pool (cheap: just vector push + string intern)
                     for (auto& pp : prepared) {
@@ -989,7 +991,7 @@ int main(int argc, char* argv[]) {
                     std::cerr << "  Parallel admin assembly complete: "
                               << total_admin_rings << " polygon rings from "
                               << data.collected_relations.size() << " relations." << std::endl;
-                    log_phase("    Admin: append + submit S2", _pt);
+                    log_phase("    Admin: append + submit S2", _pt, _cpu);
 
                     // Free collected data
                     data.collected_relations.clear();
@@ -1009,16 +1011,59 @@ int main(int argc, char* argv[]) {
         // Drain admin polygon thread pool (may still be processing)
         std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
         auto admin_results = admin_pool.drain();
-        log_phase("    Admin: S2 covering drain", _pt);
+        log_phase("    Admin: S2 covering drain", _pt, _cpu);
         for (auto& [cell_id, ids] : admin_results) {
             auto& target = data.cell_to_admin[cell_id];
             target.insert(target.end(), ids.begin(), ids.end());
         }
         std::cerr << "Admin polygon S2 covering complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
 
+        // Sort admin polygons largest-first (by vertex count descending).
+        // This ensures the work-stealing loops in S2 computation and quality
+        // variant simplification process expensive polygons first, avoiding
+        // stragglers at the end.
+        {
+            size_t n = data.admin_polygons.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0u);
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                return data.admin_polygons[a].vertex_count > data.admin_polygons[b].vertex_count;
+            });
+
+            // Build old→new ID mapping
+            std::vector<uint32_t> old_to_new(n);
+            for (uint32_t new_id = 0; new_id < n; new_id++)
+                old_to_new[order[new_id]] = new_id;
+
+            // Reorder polygons and vertices
+            std::vector<AdminPolygon> new_polys(n);
+            std::vector<NodeCoord> new_verts;
+            new_verts.reserve(data.admin_vertices.size());
+            for (uint32_t new_id = 0; new_id < n; new_id++) {
+                auto p = data.admin_polygons[order[new_id]];
+                uint32_t old_offset = p.vertex_offset;
+                p.vertex_offset = static_cast<uint32_t>(new_verts.size());
+                new_polys[new_id] = p;
+                for (uint32_t v = 0; v < p.vertex_count; v++)
+                    new_verts.push_back(data.admin_vertices[old_offset + v]);
+            }
+            data.admin_polygons = std::move(new_polys);
+            data.admin_vertices = std::move(new_verts);
+
+            // Remap poly_ids in cell_to_admin (preserving INTERIOR_FLAG)
+            for (auto& [cell_id, ids] : data.cell_to_admin) {
+                for (auto& id : ids) {
+                    uint32_t flags = id & INTERIOR_FLAG;
+                    uint32_t old_id = id & ID_MASK;
+                    id = old_to_new[old_id] | flags;
+                }
+            }
+            std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
+        }
+
         // --- Parallel S2 cell computation for ways and interpolation ---
         {
-            log_phase("Admin assembly", _pt);
+            log_phase("Admin assembly", _pt, _cpu);
             std::cerr << "Computing S2 cells for ways with " << num_threads << " threads..." << std::endl;
 
             // Flat-array approach: threads emit (cell_id, item_id) pairs into
@@ -1028,6 +1073,7 @@ int main(int argc, char* argv[]) {
             struct CellItem { uint64_t cell_id; uint32_t item_id; };
 
             auto _s2t = std::chrono::steady_clock::now();
+            auto _s2cpu = CpuTicks::now();
 
             // Process streets: emit (cell_id, way_id) pairs
             std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
@@ -1062,7 +1108,7 @@ int main(int argc, char* argv[]) {
                 }
                 for (auto& t : threads) t.join();
             }
-            log_phase("  S2: street ways (parallel)", _s2t);
+            log_phase("  S2: street ways (parallel)", _s2t, _s2cpu);
 
             // Process interpolations: emit (cell_id, interp_id) pairs
             std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
@@ -1096,7 +1142,7 @@ int main(int argc, char* argv[]) {
                 }
                 for (auto& t : threads) t.join();
             }
-            log_phase("  S2: interp ways (parallel)", _s2t);
+            log_phase("  S2: interp ways (parallel)", _s2t, _s2cpu);
 
             // Merge thread-local pairs into single vectors, sort, build cell maps
             std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
@@ -1188,7 +1234,7 @@ int main(int argc, char* argv[]) {
             });
             f_ways.get();
             f_interps.get();
-            log_phase("  S2: sort + group into cell maps", _s2t);
+            log_phase("  S2: sort + group into cell maps", _s2t, _s2cpu);
 
             // Free deferred work items
             data.deferred_ways.clear();
@@ -1204,7 +1250,7 @@ int main(int argc, char* argv[]) {
         resolve_interpolation_endpoints(data);
 
         // Deduplicate + convert to sorted pairs for fast writing
-        log_phase("S2 cell computation", _pt);
+        log_phase("S2 cell computation", _pt, _cpu);
         std::cerr << "Deduplicating + sorting for write..." << std::endl;
         {
             // Convert addr hash map to sorted pairs.
@@ -1315,11 +1361,11 @@ int main(int argc, char* argv[]) {
         auto f1 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_way_cells, data.cell_to_ways); });
         auto f2 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_interp_cells, data.cell_to_interps); });
         f1.get(); f2.get();
-        log_phase("Rebuild cell maps", _pt);
+        log_phase("Rebuild cell maps", _pt, _cpu);
     }
 
     // --- Write index files ---
-    log_phase("Deduplication", _pt);
+    log_phase("Deduplication", _pt, _cpu);
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
 
     auto quality_dir_name = [](double scale) -> std::string {
@@ -1328,13 +1374,32 @@ int main(int argc, char* argv[]) {
         return buf;
     };
 
-    // Write quality variants into a directory that already has admin base files
+    // Write quality variants in parallel (bounded concurrency).
+    // Each variant does parallel simplification internally, so limit
+    // concurrency to avoid over-subscribing CPU.
     auto write_qualities = [&](const ParsedData& d, const std::string& admin_dir) {
+        constexpr unsigned max_concurrent_qualities = 3;
+        std::atomic<unsigned> active{0};
+        std::mutex qmtx;
+        std::condition_variable qcv;
+        std::vector<std::future<void>> qfutures;
+
         for (double scale : quality_scales) {
+            {
+                std::unique_lock<std::mutex> lock(qmtx);
+                qcv.wait(lock, [&]{ return active.load() < max_concurrent_qualities; });
+            }
+            active.fetch_add(1);
+
             std::string qname = quality_dir_name(scale);
             std::string qdir = admin_dir + "/" + qname;
-            write_quality_variant(d, admin_dir, qdir, scale);
+            qfutures.push_back(std::async(std::launch::async, [&, qdir, scale]() {
+                write_quality_variant(d, admin_dir, qdir, scale);
+                active.fetch_sub(1);
+                qcv.notify_one();
+            }));
         }
+        for (auto& f : qfutures) f.get();
     };
 
     // Write one region: modes + quality variants
@@ -1386,11 +1451,12 @@ int main(int argc, char* argv[]) {
             futures.push_back(std::async(std::launch::async, [&, ci]() {
                 const auto& continent = kContinents[ci];
                 auto _ct = std::chrono::steady_clock::now();
+                auto _cc = CpuTicks::now();
                 std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
                 auto subset = filter_by_bbox(data, continent);
-                log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct);
+                log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
                 write_region(subset, output_dir + "/" + continent.name);
-                log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct);
+                log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
 
                 active.fetch_sub(1);
                 cv.notify_one();
@@ -1401,7 +1467,7 @@ int main(int argc, char* argv[]) {
 
     // Wait for planet write if not already done
     planet_future.get();
-    log_phase("All index writing (total)", _pt);
+    log_phase("All index writing (total)", _pt, _cpu);
 
     // --- Generate manifest.json ---
     {
