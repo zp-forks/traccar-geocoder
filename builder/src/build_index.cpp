@@ -1243,16 +1243,58 @@ int main(int argc, char* argv[]) {
 
     // --- Rebuild hash maps from sorted pairs if needed for continent filtering ---
     if (generate_continents || !save_cache_path.empty()) {
-        auto rebuild_map = [](const std::vector<CellItemPair>& sorted,
-                              std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
+        // Parallel rebuild: split sorted pairs into chunks, each thread builds
+        // a partial map, then merge. Sorted pairs are grouped by cell_id so we
+        // can split at cell boundaries for zero-conflict parallel insertion.
+        auto rebuild_map_parallel = [](const std::vector<CellItemPair>& sorted,
+                                        std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
             if (sorted.empty() || !map.empty()) return;
-            for (const auto& p : sorted) {
-                map[p.cell_id].push_back(p.item_id);
+            unsigned nthreads = std::thread::hardware_concurrency();
+            if (nthreads == 0) nthreads = 4;
+            size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
+
+            // Find cell boundaries for clean splits
+            std::vector<size_t> boundaries = {0};
+            for (unsigned t = 1; t < nthreads; t++) {
+                size_t target = t * chunk;
+                if (target >= sorted.size()) break;
+                // Advance to next cell boundary
+                while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id)
+                    target++;
+                if (target < sorted.size()) boundaries.push_back(target);
+            }
+            boundaries.push_back(sorted.size());
+
+            // Each thread builds its own sub-map
+            std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> sub_maps(boundaries.size() - 1);
+            std::vector<std::thread> threads;
+            for (size_t t = 0; t + 1 < boundaries.size(); t++) {
+                threads.emplace_back([&, t]() {
+                    auto& sub = sub_maps[t];
+                    // Pre-estimate capacity
+                    size_t n = boundaries[t+1] - boundaries[t];
+                    sub.reserve(n / 3); // rough estimate of unique cells
+                    for (size_t i = boundaries[t]; i < boundaries[t+1]; i++) {
+                        sub[sorted[i].cell_id].push_back(sorted[i].item_id);
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+
+            // Merge sub-maps into main map (no conflicts since splits are at cell boundaries)
+            size_t total_cells = 0;
+            for (auto& sub : sub_maps) total_cells += sub.size();
+            map.reserve(total_cells);
+            for (auto& sub : sub_maps) {
+                for (auto& [k, v] : sub) {
+                    map[k] = std::move(v);
+                }
             }
         };
+
         std::cerr << "Rebuilding cell maps for continent filtering..." << std::endl;
-        auto f1 = std::async(std::launch::async, [&]{ rebuild_map(data.sorted_way_cells, data.cell_to_ways); });
-        auto f2 = std::async(std::launch::async, [&]{ rebuild_map(data.sorted_interp_cells, data.cell_to_interps); });
+        auto f1 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_way_cells, data.cell_to_ways); });
+        auto f2 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_interp_cells, data.cell_to_interps); });
         f1.get(); f2.get();
         log_phase("Rebuild cell maps", _pt);
     }
@@ -1301,17 +1343,43 @@ int main(int argc, char* argv[]) {
     write_region(data, output_dir);
     log_phase("Planet index + qualities", _pt);
 
-    // Write continents sequentially — each uses all cores for its phases
+    // Process continents with bounded concurrency.
+    // Each continent uses ~8 threads for filtering + more for writing.
+    // Run up to N concurrent to saturate cores without OOM.
     if (generate_continents) {
+        // Each filter_by_bbox copies data (~5-20 GiB per continent).
+        // Limit concurrency based on available memory.
+        unsigned max_concurrent = std::max(1u, std::min(4u,
+            std::thread::hardware_concurrency() / 8));
+        std::cerr << "Processing " << kContinentCount << " continents ("
+                  << max_concurrent << " concurrent)..." << std::endl;
+
+        std::atomic<unsigned> active{0};
+        std::mutex cv_mutex;
+        std::condition_variable cv;
+        std::vector<std::future<void>> futures;
+
         for (size_t ci = 0; ci < kContinentCount; ci++) {
-            const auto& continent = kContinents[ci];
-            auto _ct = std::chrono::steady_clock::now();
-            std::cerr << "Continent: " << continent.name << "..." << std::endl;
-            auto subset = filter_by_bbox(data, continent);
-            log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct);
-            write_region(subset, output_dir + "/" + continent.name);
-            log_phase(("  " + std::string(continent.name) + ": write").c_str(), _ct);
+            {
+                std::unique_lock<std::mutex> lock(cv_mutex);
+                cv.wait(lock, [&]{ return active.load() < max_concurrent; });
+            }
+            active.fetch_add(1);
+
+            futures.push_back(std::async(std::launch::async, [&, ci]() {
+                const auto& continent = kContinents[ci];
+                auto _ct = std::chrono::steady_clock::now();
+                std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
+                auto subset = filter_by_bbox(data, continent);
+                log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct);
+                write_region(subset, output_dir + "/" + continent.name);
+                log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct);
+
+                active.fetch_sub(1);
+                cv.notify_one();
+            }));
         }
+        for (auto& f : futures) f.get();
     }
 
     log_phase("All index writing (total)", _pt);
