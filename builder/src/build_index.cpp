@@ -189,7 +189,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Create thread pool for concurrent admin polygon S2 covering
-        unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() > 4 ? std::thread::hardware_concurrency() - 4 : 1u);
+        unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
         AdminCoverPool admin_pool(num_threads);
         // BuildHandler no longer used — parallel processing handles everything
