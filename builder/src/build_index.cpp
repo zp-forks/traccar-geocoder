@@ -1429,40 +1429,49 @@ int main(int argc, char* argv[]) {
         write_region(data, output_dir);
     });
 
-    // Process continents with bounded concurrency (starts while planet writes).
+    // Pipeline: filter one continent at a time using all cores, write previous
+    // continent in the background (I/O bound, barely uses CPU).
+    // Sort continents largest-first so the biggest filters run first.
     if (generate_continents) {
-        unsigned max_concurrent = std::max(1u, std::min(4u,
-            std::thread::hardware_concurrency() / 8));
-        std::cerr << "Processing " << kContinentCount << " continents ("
-                  << max_concurrent << " concurrent)..." << std::endl;
+        // Sort by bbox area descending
+        std::vector<size_t> continent_order(kContinentCount);
+        std::iota(continent_order.begin(), continent_order.end(), 0u);
+        std::sort(continent_order.begin(), continent_order.end(), [](size_t a, size_t b) {
+            auto area = [](const ContinentBBox& c) {
+                return (c.max_lat - c.min_lat) * (c.max_lng - c.min_lng);
+            };
+            return area(kContinents[a]) > area(kContinents[b]);
+        });
 
-        std::atomic<unsigned> active{0};
-        std::mutex cv_mutex;
-        std::condition_variable cv;
-        std::vector<std::future<void>> futures;
+        std::cerr << "Processing " << kContinentCount
+                  << " continents (pipeline: filter all cores, write in background)..."
+                  << std::endl;
 
-        for (size_t ci = 0; ci < kContinentCount; ci++) {
-            {
-                std::unique_lock<std::mutex> lock(cv_mutex);
-                cv.wait(lock, [&]{ return active.load() < max_concurrent; });
-            }
-            active.fetch_add(1);
+        std::future<void> prev_write;
 
-            futures.push_back(std::async(std::launch::async, [&, ci]() {
-                const auto& continent = kContinents[ci];
-                auto _ct = std::chrono::steady_clock::now();
-                auto _cc = CpuTicks::now();
-                std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
-                auto subset = filter_by_bbox(data, continent);
-                log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
-                write_region(subset, output_dir + "/" + continent.name);
-                log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
+        for (size_t i = 0; i < kContinentCount; i++) {
+            const auto& continent = kContinents[continent_order[i]];
+            auto _ct = std::chrono::steady_clock::now();
+            auto _cc = CpuTicks::now();
+            std::cerr << "Continent: " << continent.name << " (filter)..." << std::endl;
 
-                active.fetch_sub(1);
-                cv.notify_one();
-            }));
+            // Filter uses all cores (no concurrent continent filters competing)
+            auto subset = std::make_shared<ParsedData>(filter_by_bbox(data, continent));
+            log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
+
+            // Wait for previous continent's write to finish before starting new one
+            // (avoid memory pressure from multiple subsets in flight)
+            if (prev_write.valid()) prev_write.get();
+
+            // Launch write in background — I/O bound, overlaps with next filter
+            std::string dir = output_dir + "/" + continent.name;
+            prev_write = std::async(std::launch::async, [this_subset = subset, dir, &write_region]() {
+                write_region(*this_subset, dir);
+            });
+            log_phase(("  " + std::string(continent.name) + ": write launched").c_str(), _ct, _cc);
         }
-        for (auto& f : futures) f.get();
+        // Wait for last write
+        if (prev_write.valid()) prev_write.get();
     }
 
     // Wait for planet write if not already done
