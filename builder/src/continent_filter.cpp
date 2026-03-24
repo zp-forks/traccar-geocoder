@@ -46,23 +46,57 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
         return ids;
     };
 
-    // Filter from sorted pairs (linear scan, cache-friendly — much faster than hash map)
+    // Filter from sorted pairs — parallel chunked scan.
+    // Split the sorted array into N chunks at cell boundaries, each thread
+    // builds its own ID set, then merge.
     auto filter_cells_sorted = [&](const std::vector<CellItemPair>& sorted,
                                    bool mask_interior = false) {
-        std::unordered_set<uint32_t> ids;
-        for (size_t i = 0; i < sorted.size(); ) {
-            uint64_t cell_id = sorted[i].cell_id;
-            bool match = cell_in_bbox(cell_id, bbox);
-            // Process all items in this cell
-            while (i < sorted.size() && sorted[i].cell_id == cell_id) {
-                if (match) {
-                    uint32_t id = sorted[i].item_id;
-                    ids.insert(mask_interior ? (id & ID_MASK) : id);
-                }
-                i++;
-            }
+        if (sorted.empty()) return std::unordered_set<uint32_t>{};
+
+        unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 4);
+        size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
+
+        // Find chunk boundaries at cell_id transitions
+        std::vector<size_t> bounds = {0};
+        for (unsigned t = 1; t < nthreads; t++) {
+            size_t target = t * chunk;
+            if (target >= sorted.size()) break;
+            while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id)
+                target++;
+            if (target < sorted.size()) bounds.push_back(target);
         }
-        return ids;
+        bounds.push_back(sorted.size());
+
+        std::vector<std::unordered_set<uint32_t>> thread_ids(bounds.size() - 1);
+        std::vector<std::thread> threads;
+        for (size_t t = 0; t + 1 < bounds.size(); t++) {
+            threads.emplace_back([&, t]() {
+                auto& local = thread_ids[t];
+                for (size_t i = bounds[t]; i < bounds[t+1]; ) {
+                    uint64_t cell_id = sorted[i].cell_id;
+                    bool match = cell_in_bbox(cell_id, bbox);
+                    while (i < bounds[t+1] && sorted[i].cell_id == cell_id) {
+                        if (match) {
+                            uint32_t id = sorted[i].item_id;
+                            local.insert(mask_interior ? (id & ID_MASK) : id);
+                        }
+                        i++;
+                    }
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+
+        // Merge thread-local sets
+        size_t largest = 0;
+        for (size_t t = 0; t < thread_ids.size(); t++)
+            if (thread_ids[t].size() > thread_ids[largest].size()) largest = t;
+        auto& merged = thread_ids[largest];
+        for (size_t t = 0; t < thread_ids.size(); t++) {
+            if (t == largest) continue;
+            for (auto id : thread_ids[t]) merged.insert(id);
+        }
+        return std::move(merged);
     };
 
     // Use sorted pairs where available (faster linear scan), fall back to hash maps
