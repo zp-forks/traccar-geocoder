@@ -1,4 +1,5 @@
 #include "continent_filter.h"
+#include "parsed_data.h"
 
 #include <algorithm>
 #include <cstring>
@@ -32,10 +33,22 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
 
 ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
     ParsedData out;
+    auto _ft = std::chrono::steady_clock::now();
+    auto _fc = CpuTicks::now();
+
+    std::cerr << "    data: ways_sorted=" << full.sorted_way_cells.size()
+              << " addrs_sorted=" << full.sorted_addr_cells.size()
+              << " interps_sorted=" << full.sorted_interp_cells.size()
+              << " ways_map=" << full.cell_to_ways.size()
+              << " addrs_map=" << full.cell_to_addrs.size()
+              << " interps_map=" << full.cell_to_interps.size()
+              << " admin_map=" << full.cell_to_admin.size()
+              << std::endl;
 
     // Filter from hash map
     auto filter_cells_map = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
                                 bool mask_interior = false) {
+        std::cerr << "    DEBUG filter_cells_map: size=" << cell_map.size() << std::endl;
         std::unordered_set<uint32_t> ids;
         for (const auto& [cell_id, cell_ids] : cell_map) {
             if (cell_in_bbox(cell_id, bbox)) {
@@ -55,6 +68,8 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
 
         unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 4);
         size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
+        std::cerr << "    DEBUG filter_cells_sorted: size=" << sorted.size()
+                  << " nthreads=" << nthreads << " chunk=" << chunk << std::endl;
 
         // Find chunk boundaries at cell_id transitions
         std::vector<size_t> bounds = {0};
@@ -85,6 +100,8 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
                 }
             });
         }
+        std::cerr << "    DEBUG: spawned " << threads.size() << " threads, "
+                  << bounds.size() - 1 << " chunks" << std::endl;
         for (auto& t : threads) t.join();
 
         // Merge thread-local sets
@@ -123,6 +140,7 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
     auto used_addr_ids = f_addrs.get();
     auto used_interp_ids = f_interps.get();
     auto used_admin_ids = f_admin.get();
+    log_phase("      filter: ID collection", _ft, _fc);
 
     // Remap all 4 data types in parallel — each builds its own vectors and remap table
     std::unordered_map<uint32_t, uint32_t> way_remap, addr_remap, interp_remap, admin_remap;
@@ -230,12 +248,13 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
         out.admin_polygons = std::move(polys);
         out.admin_vertices = std::move(verts);
     }
+    log_phase("      filter: data remap", _ft, _fc);
 
-    // Remap cell maps in parallel (each builds an independent output map)
-    auto remap_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& src,
-                           const std::unordered_map<uint32_t, uint32_t>& remap,
-                           std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
-                           bool handle_flags = false) {
+    // Remap cell maps — use sorted pairs where available (parallel), hash maps otherwise
+    auto remap_cells_map = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& src,
+                               const std::unordered_map<uint32_t, uint32_t>& remap,
+                               std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
+                               bool handle_flags = false) {
         for (const auto& [cell_id, ids] : src) {
             if (!cell_in_bbox(cell_id, bbox)) continue;
             std::vector<uint32_t> new_ids;
@@ -249,13 +268,66 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
         }
     };
 
+    // Parallel remap from sorted pairs — split into chunks, each thread builds a partial map
+    auto remap_cells_sorted = [&](const std::vector<CellItemPair>& sorted,
+                                   const std::unordered_map<uint32_t, uint32_t>& remap,
+                                   std::unordered_map<uint64_t, std::vector<uint32_t>>& dst) {
+        if (sorted.empty()) return;
+        unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
+        size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
+
+        // Find chunk boundaries at cell_id transitions
+        std::vector<size_t> bounds = {0};
+        for (unsigned t = 1; t < nthreads; t++) {
+            size_t target = t * chunk;
+            if (target >= sorted.size()) break;
+            while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id)
+                target++;
+            if (target < sorted.size()) bounds.push_back(target);
+        }
+        bounds.push_back(sorted.size());
+
+        // Each thread builds its own partial map
+        std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> partial(bounds.size() - 1);
+        std::vector<std::thread> threads;
+        for (size_t t = 0; t + 1 < bounds.size(); t++) {
+            threads.emplace_back([&, t]() {
+                auto& local = partial[t];
+                for (size_t i = bounds[t]; i < bounds[t+1]; ) {
+                    uint64_t cell_id = sorted[i].cell_id;
+                    bool match = cell_in_bbox(cell_id, bbox);
+                    std::vector<uint32_t> new_ids;
+                    while (i < bounds[t+1] && sorted[i].cell_id == cell_id) {
+                        if (match) {
+                            auto it = remap.find(sorted[i].item_id);
+                            if (it != remap.end()) new_ids.push_back(it->second);
+                        }
+                        i++;
+                    }
+                    if (!new_ids.empty()) local[cell_id] = std::move(new_ids);
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+
+        // Merge partial maps (no conflicts — cell boundaries are clean splits)
+        size_t total = 0;
+        for (auto& p : partial) total += p.size();
+        dst.reserve(total);
+        for (auto& p : partial) {
+            for (auto& [k, v] : p) dst[k] = std::move(v);
+        }
+    };
+
     {
-        auto f1 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_ways, way_remap, out.cell_to_ways); });
-        auto f2 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_addrs, addr_remap, out.cell_to_addrs); });
-        auto f3 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_interps, interp_remap, out.cell_to_interps); });
-        auto f4 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_admin, admin_remap, out.cell_to_admin, true); });
+        // Use sorted pairs for ways/addrs/interps (parallel), hash map for admin (has flags)
+        auto f1 = std::async(std::launch::async, [&]{ remap_cells_sorted(full.sorted_way_cells, way_remap, out.cell_to_ways); });
+        auto f2 = std::async(std::launch::async, [&]{ remap_cells_sorted(full.sorted_addr_cells, addr_remap, out.cell_to_addrs); });
+        auto f3 = std::async(std::launch::async, [&]{ remap_cells_sorted(full.sorted_interp_cells, interp_remap, out.cell_to_interps); });
+        auto f4 = std::async(std::launch::async, [&]{ remap_cells_map(full.cell_to_admin, admin_remap, out.cell_to_admin, true); });
         f1.get(); f2.get(); f3.get(); f4.get();
     }
+    log_phase("      filter: cell map remap", _ft, _fc);
 
     // Rebuild compact string pool
     std::unordered_set<uint32_t> used_offsets;
@@ -283,6 +355,7 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
     for (auto& a : out.addr_points) { a.housenumber_id = string_remap[a.housenumber_id]; a.street_id = string_remap[a.street_id]; }
     for (auto& iw : out.interp_ways) iw.street_id = string_remap[iw.street_id];
     for (auto& ap : out.admin_polygons) ap.name_id = string_remap[ap.name_id];
+    log_phase("      filter: string pool rebuild", _ft, _fc);
 
     return out;
 }
