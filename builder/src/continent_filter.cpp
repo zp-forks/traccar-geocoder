@@ -56,60 +56,112 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
     auto used_interp_ids = f_interps.get();
     auto used_admin_ids = f_admin.get();
 
-    // Remap ways
-    std::unordered_map<uint32_t, uint32_t> way_remap;
-    { std::vector<uint32_t> sorted_ids(used_way_ids.begin(), used_way_ids.end());
-      std::sort(sorted_ids.begin(), sorted_ids.end());
-      for (uint32_t old_id : sorted_ids) {
-          uint32_t new_id = static_cast<uint32_t>(out.ways.size());
-          way_remap[old_id] = new_id;
-          const auto& w = full.ways[old_id];
-          WayHeader nw = w;
-          nw.node_offset = static_cast<uint32_t>(out.street_nodes.size());
-          out.ways.push_back(nw);
-          for (uint8_t n = 0; n < w.node_count; n++)
-              out.street_nodes.push_back(full.street_nodes[w.node_offset + n]);
-      } }
+    // Remap all 4 data types in parallel — each builds its own vectors and remap table
+    std::unordered_map<uint32_t, uint32_t> way_remap, addr_remap, interp_remap, admin_remap;
 
-    // Remap addrs
-    std::unordered_map<uint32_t, uint32_t> addr_remap;
-    { std::vector<uint32_t> sorted_ids(used_addr_ids.begin(), used_addr_ids.end());
-      std::sort(sorted_ids.begin(), sorted_ids.end());
-      for (uint32_t old_id : sorted_ids) {
-          uint32_t new_id = static_cast<uint32_t>(out.addr_points.size());
-          addr_remap[old_id] = new_id;
-          out.addr_points.push_back(full.addr_points[old_id]);
-      } }
+    // Ways
+    auto f_remap_ways = std::async(std::launch::async, [&]() {
+        std::vector<uint32_t> sorted_ids(used_way_ids.begin(), used_way_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        std::vector<WayHeader> ways;
+        std::vector<NodeCoord> nodes;
+        ways.reserve(sorted_ids.size());
+        nodes.reserve(sorted_ids.size() * 5);
+        std::unordered_map<uint32_t, uint32_t> remap;
+        remap.reserve(sorted_ids.size());
+        for (uint32_t old_id : sorted_ids) {
+            remap[old_id] = static_cast<uint32_t>(ways.size());
+            const auto& w = full.ways[old_id];
+            WayHeader nw = w;
+            nw.node_offset = static_cast<uint32_t>(nodes.size());
+            ways.push_back(nw);
+            for (uint8_t n = 0; n < w.node_count; n++)
+                nodes.push_back(full.street_nodes[w.node_offset + n]);
+        }
+        return std::make_tuple(std::move(remap), std::move(ways), std::move(nodes));
+    });
 
-    // Remap interps
-    std::unordered_map<uint32_t, uint32_t> interp_remap;
-    { std::vector<uint32_t> sorted_ids(used_interp_ids.begin(), used_interp_ids.end());
-      std::sort(sorted_ids.begin(), sorted_ids.end());
-      for (uint32_t old_id : sorted_ids) {
-          uint32_t new_id = static_cast<uint32_t>(out.interp_ways.size());
-          interp_remap[old_id] = new_id;
-          const auto& iw = full.interp_ways[old_id];
-          InterpWay niw = iw;
-          niw.node_offset = static_cast<uint32_t>(out.interp_nodes.size());
-          out.interp_ways.push_back(niw);
-          for (uint8_t n = 0; n < iw.node_count; n++)
-              out.interp_nodes.push_back(full.interp_nodes[iw.node_offset + n]);
-      } }
+    // Addrs
+    auto f_remap_addrs = std::async(std::launch::async, [&]() {
+        std::vector<uint32_t> sorted_ids(used_addr_ids.begin(), used_addr_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        std::vector<AddrPoint> addrs;
+        addrs.reserve(sorted_ids.size());
+        std::unordered_map<uint32_t, uint32_t> remap;
+        remap.reserve(sorted_ids.size());
+        for (uint32_t old_id : sorted_ids) {
+            remap[old_id] = static_cast<uint32_t>(addrs.size());
+            addrs.push_back(full.addr_points[old_id]);
+        }
+        return std::make_tuple(std::move(remap), std::move(addrs));
+    });
 
-    // Remap admins
-    std::unordered_map<uint32_t, uint32_t> admin_remap;
-    { std::vector<uint32_t> sorted_ids(used_admin_ids.begin(), used_admin_ids.end());
-      std::sort(sorted_ids.begin(), sorted_ids.end());
-      for (uint32_t old_id : sorted_ids) {
-          uint32_t new_id = static_cast<uint32_t>(out.admin_polygons.size());
-          admin_remap[old_id] = new_id;
-          const auto& ap = full.admin_polygons[old_id];
-          AdminPolygon nap = ap;
-          nap.vertex_offset = static_cast<uint32_t>(out.admin_vertices.size());
-          out.admin_polygons.push_back(nap);
-          for (uint32_t v = 0; v < ap.vertex_count; v++)
-              out.admin_vertices.push_back(full.admin_vertices[ap.vertex_offset + v]);
-      } }
+    // Interps
+    auto f_remap_interps = std::async(std::launch::async, [&]() {
+        std::vector<uint32_t> sorted_ids(used_interp_ids.begin(), used_interp_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        std::vector<InterpWay> iways;
+        std::vector<NodeCoord> inodes;
+        iways.reserve(sorted_ids.size());
+        std::unordered_map<uint32_t, uint32_t> remap;
+        remap.reserve(sorted_ids.size());
+        for (uint32_t old_id : sorted_ids) {
+            remap[old_id] = static_cast<uint32_t>(iways.size());
+            const auto& iw = full.interp_ways[old_id];
+            InterpWay niw = iw;
+            niw.node_offset = static_cast<uint32_t>(inodes.size());
+            iways.push_back(niw);
+            for (uint8_t n = 0; n < iw.node_count; n++)
+                inodes.push_back(full.interp_nodes[iw.node_offset + n]);
+        }
+        return std::make_tuple(std::move(remap), std::move(iways), std::move(inodes));
+    });
+
+    // Admins
+    auto f_remap_admins = std::async(std::launch::async, [&]() {
+        std::vector<uint32_t> sorted_ids(used_admin_ids.begin(), used_admin_ids.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        std::vector<AdminPolygon> polys;
+        std::vector<NodeCoord> verts;
+        polys.reserve(sorted_ids.size());
+        std::unordered_map<uint32_t, uint32_t> remap;
+        remap.reserve(sorted_ids.size());
+        for (uint32_t old_id : sorted_ids) {
+            remap[old_id] = static_cast<uint32_t>(polys.size());
+            const auto& ap = full.admin_polygons[old_id];
+            AdminPolygon nap = ap;
+            nap.vertex_offset = static_cast<uint32_t>(verts.size());
+            polys.push_back(nap);
+            for (uint32_t v = 0; v < ap.vertex_count; v++)
+                verts.push_back(full.admin_vertices[ap.vertex_offset + v]);
+        }
+        return std::make_tuple(std::move(remap), std::move(polys), std::move(verts));
+    });
+
+    // Collect results
+    {
+        auto [wr, ways, nodes] = f_remap_ways.get();
+        way_remap = std::move(wr);
+        out.ways = std::move(ways);
+        out.street_nodes = std::move(nodes);
+    }
+    {
+        auto [ar, addrs] = f_remap_addrs.get();
+        addr_remap = std::move(ar);
+        out.addr_points = std::move(addrs);
+    }
+    {
+        auto [ir, iways, inodes] = f_remap_interps.get();
+        interp_remap = std::move(ir);
+        out.interp_ways = std::move(iways);
+        out.interp_nodes = std::move(inodes);
+    }
+    {
+        auto [ar, polys, verts] = f_remap_admins.get();
+        admin_remap = std::move(ar);
+        out.admin_polygons = std::move(polys);
+        out.admin_vertices = std::move(verts);
+    }
 
     // Remap cell maps in parallel (each builds an independent output map)
     auto remap_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& src,
