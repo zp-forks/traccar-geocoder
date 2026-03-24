@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 
 #include <s2/s2cell_id.h>
+#include <s2/s2latlng.h>
 
 #include "types.h"
 #include "string_pool.h"
@@ -1345,15 +1346,70 @@ int main(int argc, char* argv[]) {
     log_phase("Planet index + qualities", _pt);
 
     // Process continents with bounded concurrency.
-    // Each continent uses ~8 threads for filtering + more for writing.
-    // Run up to N concurrent to saturate cores without OOM.
     if (generate_continents) {
-        // Each filter_by_bbox copies data (~5-20 GiB per continent).
-        // Limit concurrency based on available memory.
         unsigned max_concurrent = std::max(1u, std::min(4u,
             std::thread::hardware_concurrency() / 8));
         std::cerr << "Processing " << kContinentCount << " continents ("
                   << max_concurrent << " concurrent)..." << std::endl;
+
+        // Pre-tag cells: for each unique cell_id, compute which continents it belongs to.
+        // This avoids redundant cell_in_bbox calls (8 continents × 300M cells each).
+        // Single pass over all cells → bitmap per cell.
+        auto _pre = std::chrono::steady_clock::now();
+        std::unordered_map<uint64_t, uint8_t> cell_continent_mask;
+        {
+            // Collect all unique cell IDs from all maps
+            std::unordered_set<uint64_t> all_cells;
+            for (auto& [id, _] : data.cell_to_ways) all_cells.insert(id);
+            for (auto& [id, _] : data.cell_to_addrs) all_cells.insert(id);
+            for (auto& [id, _] : data.cell_to_interps) all_cells.insert(id);
+            for (auto& [id, _] : data.cell_to_admin) all_cells.insert(id);
+
+            // Tag each cell with continent bitmask (parallel)
+            std::vector<uint64_t> cell_vec(all_cells.begin(), all_cells.end());
+            cell_continent_mask.reserve(cell_vec.size());
+            // Pre-fill with 0
+            for (auto id : cell_vec) cell_continent_mask[id] = 0;
+
+            std::atomic<size_t> idx{0};
+            unsigned nthreads = std::thread::hardware_concurrency();
+            // Thread-local masks to avoid contention on shared map
+            std::vector<std::vector<std::pair<uint64_t, uint8_t>>> thread_results(nthreads);
+            std::vector<std::thread> tag_threads;
+            for (unsigned t = 0; t < nthreads; t++) {
+                tag_threads.emplace_back([&, t]() {
+                    auto& local = thread_results[t];
+                    while (true) {
+                        size_t i = idx.fetch_add(4096);
+                        if (i >= cell_vec.size()) break;
+                        size_t end = std::min(i + 4096, cell_vec.size());
+                        for (size_t j = i; j < end; j++) {
+                            S2CellId cell(cell_vec[j]);
+                            S2LatLng center = cell.ToLatLng();
+                            double lat = center.lat().degrees();
+                            double lng = center.lng().degrees();
+                            uint8_t mask = 0;
+                            for (size_t ci = 0; ci < kContinentCount; ci++) {
+                                if (lat >= kContinents[ci].min_lat && lat <= kContinents[ci].max_lat &&
+                                    lng >= kContinents[ci].min_lng && lng <= kContinents[ci].max_lng) {
+                                    mask |= (1u << ci);
+                                }
+                            }
+                            if (mask) local.push_back({cell_vec[j], mask});
+                        }
+                    }
+                });
+            }
+            for (auto& t : tag_threads) t.join();
+
+            // Merge thread-local results
+            for (auto& local : thread_results) {
+                for (auto& [id, mask] : local) {
+                    cell_continent_mask[id] = mask;
+                }
+            }
+        }
+        log_phase("Pre-tag cells for continents", _pre);
 
         std::atomic<unsigned> active{0};
         std::mutex cv_mutex;
@@ -1371,7 +1427,8 @@ int main(int argc, char* argv[]) {
                 const auto& continent = kContinents[ci];
                 auto _ct = std::chrono::steady_clock::now();
                 std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
-                auto subset = filter_by_bbox(data, continent);
+                uint8_t cmask = 1u << ci;
+                auto subset = filter_by_bbox(data, continent, &cell_continent_mask, cmask);
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct);
                 write_region(subset, output_dir + "/" + continent.name);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct);

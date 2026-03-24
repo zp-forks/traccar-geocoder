@@ -30,15 +30,26 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
            lng >= bbox.min_lng && lng <= bbox.max_lng;
 }
 
-ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
+ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox,
+                          const std::unordered_map<uint64_t, uint8_t>* cell_mask,
+                          uint8_t continent_bit) {
     ParsedData out;
+
+    // Fast cell-in-continent test: use pre-computed bitmask if available
+    auto cell_matches = [&](uint64_t cell_id) -> bool {
+        if (cell_mask && continent_bit) {
+            auto it = cell_mask->find(cell_id);
+            return it != cell_mask->end() && (it->second & continent_bit);
+        }
+        return cell_in_bbox(cell_id, bbox);
+    };
 
     // Filter cell maps in parallel — each builds an independent ID set
     auto filter_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
                             bool mask_interior = false) {
         std::unordered_set<uint32_t> ids;
         for (const auto& [cell_id, cell_ids] : cell_map) {
-            if (cell_in_bbox(cell_id, bbox)) {
+            if (cell_matches(cell_id)) {
                 for (uint32_t id : cell_ids)
                     ids.insert(mask_interior ? (id & ID_MASK) : id);
             }
@@ -169,7 +180,7 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
                            std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
                            bool handle_flags = false) {
         for (const auto& [cell_id, ids] : src) {
-            if (!cell_in_bbox(cell_id, bbox)) continue;
+            if (!cell_matches(cell_id)) continue;
             std::vector<uint32_t> new_ids;
             for (uint32_t id : ids) {
                 uint32_t raw_id = handle_flags ? (id & ID_MASK) : id;
