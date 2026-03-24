@@ -105,8 +105,6 @@ int main(int argc, char* argv[]) {
             kEpsilonScale = std::strtod(argv[++i], nullptr);
         } else if (arg == "--multi-quality") {
             multi_quality = true;
-            simplify_mode = SimplifyMode::ErrorBounded;
-            simplify_epsilon_override = 0.1; // effectively uncapped
             // Optional: next arg might be comma-separated scales
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 std::string vals = argv[++i];
@@ -122,6 +120,10 @@ int main(int argc, char* argv[]) {
             if (quality_scales.empty()) {
                 quality_scales = {0, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5};
             }
+            // Build with uncapped polygons — quality variants simplify at write time.
+            // We need full vertex detail to produce all quality levels accurately.
+            simplify_mode = SimplifyMode::ErrorBounded;
+            simplify_epsilon_override = 0.1; // effectively uncapped
         } else if (arg == "--epsilon-levels" && i + 1 < argc) {
             // Parse comma-separated values: L2,L3,L4,L5,L6,L7,L8
             std::string vals = argv[++i];
@@ -1259,59 +1261,60 @@ int main(int argc, char* argv[]) {
     log_phase("Deduplication", _pt);
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
 
-    // Helper: write quality variants for a dataset into base_dir/admin/qN/
-    auto write_qualities = [&](const ParsedData& d, const std::string& base_dir) {
-        if (!multi_quality) return;
-        std::string admin_dir = base_dir + "/admin";
+    auto quality_dir_name = [](double scale) -> std::string {
+        if (scale == 0) return "uncapped";
+        char buf[32]; snprintf(buf, sizeof(buf), "q%.4g", scale);
+        return buf;
+    };
+
+    // Write quality variants into a directory that already has admin base files
+    auto write_qualities = [&](const ParsedData& d, const std::string& admin_dir) {
         for (double scale : quality_scales) {
-            std::string qname = (scale == 0) ? "uncapped" : "q" + std::to_string(scale);
-            // Clean up trailing zeros: "q1.000000" -> "q1"
-            if (scale > 0) {
-                char buf[32]; snprintf(buf, sizeof(buf), "q%.4g", scale);
-                qname = buf;
-            }
+            std::string qname = quality_dir_name(scale);
             std::string qdir = admin_dir + "/" + qname;
-            std::cerr << "    Quality: " << qname << "..." << std::endl;
             write_quality_variant(d, admin_dir, qdir, scale);
         }
     };
 
-    // Helper: write one region (planet or continent subset) in S3-friendly layout
+    // Write one region: modes + quality variants
     auto write_region = [&](const ParsedData& d, const std::string& base_dir) {
         ensure_dir(base_dir);
 
         if (multi_output) {
-            // S3-friendly layout: separate directories for each data type
-            auto wf1 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/full", IndexMode::Full); });
-            auto wf2 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses); });
-            auto wf3 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/admin", IndexMode::AdminOnly); });
-            wf1.get(); wf2.get(); wf3.get();
+            // Write all 3 modes
+            write_index(d, base_dir + "/full", IndexMode::Full);
+            write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses);
+            write_index(d, base_dir + "/admin", IndexMode::AdminOnly);
         } else {
             write_index(d, base_dir, mode);
         }
 
-        write_qualities(d, base_dir);
+        // Write quality variants under admin/ (or base_dir if not multi_output)
+        if (multi_quality) {
+            std::string admin_dir = multi_output ? base_dir + "/admin" : base_dir;
+            std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
+            write_qualities(d, admin_dir);
+        }
     };
 
     // Write planet
     write_region(data, output_dir);
-    log_phase("Planet index writing", _pt);
+    log_phase("Planet index + qualities", _pt);
 
-    // Write continents
+    // Write continents sequentially — each uses all cores for its phases
     if (generate_continents) {
-        std::mutex cerr_mutex;
-        // Process continents sequentially to avoid memory explosion
-        // (each filter_by_bbox creates a full copy)
         for (size_t ci = 0; ci < kContinentCount; ci++) {
             const auto& continent = kContinents[ci];
-            std::cerr << "Filtering for continent: " << continent.name << "..." << std::endl;
+            auto _ct = std::chrono::steady_clock::now();
+            std::cerr << "Continent: " << continent.name << "..." << std::endl;
             auto subset = filter_by_bbox(data, continent);
+            log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct);
             write_region(subset, output_dir + "/" + continent.name);
-            std::cerr << "Done continent: " << continent.name << std::endl;
+            log_phase(("  " + std::string(continent.name) + ": write").c_str(), _ct);
         }
     }
 
-    log_phase("Index file writing (total)", _pt);
+    log_phase("All index writing (total)", _pt);
 
     // --- Generate manifest.json ---
     {

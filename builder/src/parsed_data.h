@@ -15,6 +15,12 @@
 // --- Directory creation ---
 
 inline void ensure_dir(const std::string& path) {
+    // Recursive mkdir — create all parent directories
+    for (size_t i = 1; i < path.size(); i++) {
+        if (path[i] == '/') {
+            mkdir(path.substr(0, i).c_str(), 0755);
+        }
+    }
     mkdir(path.c_str(), 0755);
 }
 

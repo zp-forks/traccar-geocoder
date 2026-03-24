@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <future>
 #include <unordered_set>
 
 #include <s2/s2cell_id.h>
@@ -32,33 +33,28 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
 ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
     ParsedData out;
 
-    std::unordered_set<uint32_t> used_way_ids;
-    for (const auto& [cell_id, ids] : full.cell_to_ways) {
-        if (cell_in_bbox(cell_id, bbox)) {
-            for (uint32_t id : ids) used_way_ids.insert(id);
+    // Filter cell maps in parallel — each builds an independent ID set
+    auto filter_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
+                            bool mask_interior = false) {
+        std::unordered_set<uint32_t> ids;
+        for (const auto& [cell_id, cell_ids] : cell_map) {
+            if (cell_in_bbox(cell_id, bbox)) {
+                for (uint32_t id : cell_ids)
+                    ids.insert(mask_interior ? (id & ID_MASK) : id);
+            }
         }
-    }
+        return ids;
+    };
 
-    std::unordered_set<uint32_t> used_addr_ids;
-    for (const auto& [cell_id, ids] : full.cell_to_addrs) {
-        if (cell_in_bbox(cell_id, bbox)) {
-            for (uint32_t id : ids) used_addr_ids.insert(id);
-        }
-    }
+    auto f_ways = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_ways); });
+    auto f_addrs = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_addrs); });
+    auto f_interps = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_interps); });
+    auto f_admin = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_admin, true); });
 
-    std::unordered_set<uint32_t> used_interp_ids;
-    for (const auto& [cell_id, ids] : full.cell_to_interps) {
-        if (cell_in_bbox(cell_id, bbox)) {
-            for (uint32_t id : ids) used_interp_ids.insert(id);
-        }
-    }
-
-    std::unordered_set<uint32_t> used_admin_ids;
-    for (const auto& [cell_id, ids] : full.cell_to_admin) {
-        if (cell_in_bbox(cell_id, bbox)) {
-            for (uint32_t id : ids) used_admin_ids.insert(id & ID_MASK);
-        }
-    }
+    auto used_way_ids = f_ways.get();
+    auto used_addr_ids = f_addrs.get();
+    auto used_interp_ids = f_interps.get();
+    auto used_admin_ids = f_admin.get();
 
     // Remap ways
     std::unordered_map<uint32_t, uint32_t> way_remap;
@@ -115,35 +111,30 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
               out.admin_vertices.push_back(full.admin_vertices[ap.vertex_offset + v]);
       } }
 
-    // Remap cell maps
-    for (const auto& [cell_id, ids] : full.cell_to_ways) {
-        if (!cell_in_bbox(cell_id, bbox)) continue;
-        std::vector<uint32_t> new_ids;
-        for (uint32_t id : ids) { auto it = way_remap.find(id); if (it != way_remap.end()) new_ids.push_back(it->second); }
-        if (!new_ids.empty()) out.cell_to_ways[cell_id] = std::move(new_ids);
-    }
-    for (const auto& [cell_id, ids] : full.cell_to_addrs) {
-        if (!cell_in_bbox(cell_id, bbox)) continue;
-        std::vector<uint32_t> new_ids;
-        for (uint32_t id : ids) { auto it = addr_remap.find(id); if (it != addr_remap.end()) new_ids.push_back(it->second); }
-        if (!new_ids.empty()) out.cell_to_addrs[cell_id] = std::move(new_ids);
-    }
-    for (const auto& [cell_id, ids] : full.cell_to_interps) {
-        if (!cell_in_bbox(cell_id, bbox)) continue;
-        std::vector<uint32_t> new_ids;
-        for (uint32_t id : ids) { auto it = interp_remap.find(id); if (it != interp_remap.end()) new_ids.push_back(it->second); }
-        if (!new_ids.empty()) out.cell_to_interps[cell_id] = std::move(new_ids);
-    }
-    for (const auto& [cell_id, ids] : full.cell_to_admin) {
-        if (!cell_in_bbox(cell_id, bbox)) continue;
-        std::vector<uint32_t> new_ids;
-        for (uint32_t id : ids) {
-            uint32_t raw_id = id & ID_MASK;
-            uint32_t flags = id & INTERIOR_FLAG;
-            auto it = admin_remap.find(raw_id);
-            if (it != admin_remap.end()) new_ids.push_back(it->second | flags);
+    // Remap cell maps in parallel (each builds an independent output map)
+    auto remap_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& src,
+                           const std::unordered_map<uint32_t, uint32_t>& remap,
+                           std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
+                           bool handle_flags = false) {
+        for (const auto& [cell_id, ids] : src) {
+            if (!cell_in_bbox(cell_id, bbox)) continue;
+            std::vector<uint32_t> new_ids;
+            for (uint32_t id : ids) {
+                uint32_t raw_id = handle_flags ? (id & ID_MASK) : id;
+                uint32_t flags = handle_flags ? (id & INTERIOR_FLAG) : 0;
+                auto it = remap.find(raw_id);
+                if (it != remap.end()) new_ids.push_back(it->second | flags);
+            }
+            if (!new_ids.empty()) dst[cell_id] = std::move(new_ids);
         }
-        if (!new_ids.empty()) out.cell_to_admin[cell_id] = std::move(new_ids);
+    };
+
+    {
+        auto f1 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_ways, way_remap, out.cell_to_ways); });
+        auto f2 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_addrs, addr_remap, out.cell_to_addrs); });
+        auto f3 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_interps, interp_remap, out.cell_to_interps); });
+        auto f4 = std::async(std::launch::async, [&]{ remap_cells(full.cell_to_admin, admin_remap, out.cell_to_admin, true); });
+        f1.get(); f2.get(); f3.get(); f4.get();
     }
 
     // Rebuild compact string pool
