@@ -1257,14 +1257,21 @@ int main(int argc, char* argv[]) {
             // Sort cell IDs only (30M unique), then build pairs in sorted order.
             // Much faster than sorting all 160M pairs.
             auto f2 = std::async(std::launch::async, [&] {
-                // Extract cell IDs and sort
+                auto _dt = std::chrono::steady_clock::now();
+                auto _dc = CpuTicks::now();
+
+                // Step 1: Extract cell IDs from hash map
                 std::vector<uint64_t> sorted_cells;
                 sorted_cells.reserve(data.cell_to_addrs.size());
                 for (auto& [cell_id, ids] : data.cell_to_addrs)
                     sorted_cells.push_back(cell_id);
-                std::sort(sorted_cells.begin(), sorted_cells.end());
+                log_phase("    Dedup: extract cell IDs", _dt, _dc);
 
-                // Parallel dedup: sort within each cell across threads
+                // Step 2: Sort cell IDs
+                std::sort(sorted_cells.begin(), sorted_cells.end());
+                log_phase("    Dedup: sort cell IDs", _dt, _dc);
+
+                // Step 3: Parallel dedup within each cell
                 {
                     unsigned nthreads = std::thread::hardware_concurrency();
                     size_t chunk = (sorted_cells.size() + nthreads - 1) / nthreads;
@@ -1283,10 +1290,14 @@ int main(int argc, char* argv[]) {
                     }
                     for (auto& t : threads) t.join();
                 }
+                log_phase("    Dedup: per-cell sort+dedup", _dt, _dc);
 
-                // Build sorted pairs sequentially (just concatenation, fast)
+                // Step 4: Count total pairs
                 size_t total_pairs = 0;
                 for (auto& [_, ids] : data.cell_to_addrs) total_pairs += ids.size();
+                log_phase("    Dedup: count pairs", _dt, _dc);
+
+                // Step 5: Build sorted pairs
                 std::vector<CellItemPair> pairs;
                 pairs.reserve(total_pairs);
                 for (uint64_t cell_id : sorted_cells) {
@@ -1294,6 +1305,7 @@ int main(int argc, char* argv[]) {
                     for (auto id : ids) pairs.push_back({cell_id, id});
                 }
                 data.sorted_addr_cells = std::move(pairs);
+                log_phase("    Dedup: build sorted pairs", _dt, _dc);
             });
             auto f4 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_admin); });
             f2.get(); f4.get();
@@ -1429,11 +1441,9 @@ int main(int argc, char* argv[]) {
         write_region(data, output_dir);
     });
 
-    // Pipeline: filter one continent at a time using all cores, write previous
-    // continent in the background (I/O bound, barely uses CPU).
-    // Sort continents largest-first so the biggest filters run first.
+    // Process continents with bounded concurrency, largest first.
     if (generate_continents) {
-        // Sort by bbox area descending
+        // Sort by bbox area descending — largest continents first
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
         std::sort(continent_order.begin(), continent_order.end(), [](size_t a, size_t b) {
@@ -1443,35 +1453,38 @@ int main(int argc, char* argv[]) {
             return area(kContinents[a]) > area(kContinents[b]);
         });
 
-        std::cerr << "Processing " << kContinentCount
-                  << " continents (pipeline: filter all cores, write in background)..."
-                  << std::endl;
+        unsigned max_concurrent = std::max(1u, std::min(4u,
+            std::thread::hardware_concurrency() / 8));
+        std::cerr << "Processing " << kContinentCount << " continents ("
+                  << max_concurrent << " concurrent, largest first)..." << std::endl;
 
-        std::future<void> prev_write;
+        std::atomic<unsigned> active{0};
+        std::mutex cv_mutex;
+        std::condition_variable cv;
+        std::vector<std::future<void>> futures;
 
         for (size_t i = 0; i < kContinentCount; i++) {
-            const auto& continent = kContinents[continent_order[i]];
-            auto _ct = std::chrono::steady_clock::now();
-            auto _cc = CpuTicks::now();
-            std::cerr << "Continent: " << continent.name << " (filter)..." << std::endl;
+            {
+                std::unique_lock<std::mutex> lock(cv_mutex);
+                cv.wait(lock, [&]{ return active.load() < max_concurrent; });
+            }
+            active.fetch_add(1);
 
-            // Filter uses all cores (no concurrent continent filters competing)
-            auto subset = std::make_shared<ParsedData>(filter_by_bbox(data, continent));
-            log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
+            futures.push_back(std::async(std::launch::async, [&, i]() {
+                const auto& continent = kContinents[continent_order[i]];
+                auto _ct = std::chrono::steady_clock::now();
+                auto _cc = CpuTicks::now();
+                std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
+                auto subset = filter_by_bbox(data, continent);
+                log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
+                write_region(subset, output_dir + "/" + continent.name);
+                log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
 
-            // Wait for previous continent's write to finish before starting new one
-            // (avoid memory pressure from multiple subsets in flight)
-            if (prev_write.valid()) prev_write.get();
-
-            // Launch write in background — I/O bound, overlaps with next filter
-            std::string dir = output_dir + "/" + continent.name;
-            prev_write = std::async(std::launch::async, [this_subset = subset, dir, &write_region]() {
-                write_region(*this_subset, dir);
-            });
-            log_phase(("  " + std::string(continent.name) + ": write launched").c_str(), _ct, _cc);
+                active.fetch_sub(1);
+                cv.notify_one();
+            }));
         }
-        // Wait for last write
-        if (prev_write.valid()) prev_write.get();
+        for (auto& f : futures) f.get();
     }
 
     // Wait for planet write if not already done
