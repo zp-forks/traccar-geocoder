@@ -1242,8 +1242,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // --- Rebuild hash maps from sorted pairs if needed for continent filtering ---
-    if (generate_continents || !save_cache_path.empty()) {
+    // --- Rebuild hash maps from sorted pairs if needed for cache saving ---
+    // (Continent filtering now uses sorted pairs directly, so no rebuild needed for that.)
+    if (!save_cache_path.empty()) {
         // Parallel rebuild: split sorted pairs into chunks, each thread builds
         // a partial map, then merge. Sorted pairs are grouped by cell_id so we
         // can split at cell boundaries for zero-conflict parallel insertion.

@@ -30,26 +30,15 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
            lng >= bbox.min_lng && lng <= bbox.max_lng;
 }
 
-ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox,
-                          const std::unordered_map<uint64_t, uint8_t>* cell_mask,
-                          uint8_t continent_bit) {
+ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
     ParsedData out;
 
-    // Fast cell-in-continent test: use pre-computed bitmask if available
-    auto cell_matches = [&](uint64_t cell_id) -> bool {
-        if (cell_mask && continent_bit) {
-            auto it = cell_mask->find(cell_id);
-            return it != cell_mask->end() && (it->second & continent_bit);
-        }
-        return cell_in_bbox(cell_id, bbox);
-    };
-
-    // Filter cell maps in parallel — each builds an independent ID set
-    auto filter_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
-                            bool mask_interior = false) {
+    // Filter from hash map
+    auto filter_cells_map = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
+                                bool mask_interior = false) {
         std::unordered_set<uint32_t> ids;
         for (const auto& [cell_id, cell_ids] : cell_map) {
-            if (cell_matches(cell_id)) {
+            if (cell_in_bbox(cell_id, bbox)) {
                 for (uint32_t id : cell_ids)
                     ids.insert(mask_interior ? (id & ID_MASK) : id);
             }
@@ -57,10 +46,44 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox,
         return ids;
     };
 
-    auto f_ways = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_ways); });
-    auto f_addrs = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_addrs); });
-    auto f_interps = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_interps); });
-    auto f_admin = std::async(std::launch::async, [&]{ return filter_cells(full.cell_to_admin, true); });
+    // Filter from sorted pairs (linear scan, cache-friendly — much faster than hash map)
+    auto filter_cells_sorted = [&](const std::vector<CellItemPair>& sorted,
+                                   bool mask_interior = false) {
+        std::unordered_set<uint32_t> ids;
+        for (size_t i = 0; i < sorted.size(); ) {
+            uint64_t cell_id = sorted[i].cell_id;
+            bool match = cell_in_bbox(cell_id, bbox);
+            // Process all items in this cell
+            while (i < sorted.size() && sorted[i].cell_id == cell_id) {
+                if (match) {
+                    uint32_t id = sorted[i].item_id;
+                    ids.insert(mask_interior ? (id & ID_MASK) : id);
+                }
+                i++;
+            }
+        }
+        return ids;
+    };
+
+    // Use sorted pairs where available (faster linear scan), fall back to hash maps
+    auto f_ways = std::async(std::launch::async, [&]{
+        return !full.sorted_way_cells.empty()
+            ? filter_cells_sorted(full.sorted_way_cells)
+            : filter_cells_map(full.cell_to_ways);
+    });
+    auto f_addrs = std::async(std::launch::async, [&]{
+        return !full.sorted_addr_cells.empty()
+            ? filter_cells_sorted(full.sorted_addr_cells)
+            : filter_cells_map(full.cell_to_addrs);
+    });
+    auto f_interps = std::async(std::launch::async, [&]{
+        return !full.sorted_interp_cells.empty()
+            ? filter_cells_sorted(full.sorted_interp_cells)
+            : filter_cells_map(full.cell_to_interps);
+    });
+    auto f_admin = std::async(std::launch::async, [&]{
+        return filter_cells_map(full.cell_to_admin, true);
+    });
 
     auto used_way_ids = f_ways.get();
     auto used_addr_ids = f_addrs.get();
@@ -180,7 +203,7 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox,
                            std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
                            bool handle_flags = false) {
         for (const auto& [cell_id, ids] : src) {
-            if (!cell_matches(cell_id)) continue;
+            if (!cell_in_bbox(cell_id, bbox)) continue;
             std::vector<uint32_t> new_ids;
             for (uint32_t id : ids) {
                 uint32_t raw_id = handle_flags ? (id & ID_MASK) : id;
