@@ -268,12 +268,16 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
         }
     };
 
-    // Parallel remap from sorted pairs — split into chunks, each thread builds a partial map
+    // Remap from sorted pairs — builds output cell map by scanning sorted pairs.
+    // Uses same parallel chunked pattern as filter_cells_sorted.
     auto remap_cells_sorted = [&](const std::vector<CellItemPair>& sorted,
                                    const std::unordered_map<uint32_t, uint32_t>& remap,
                                    std::unordered_map<uint64_t, std::vector<uint32_t>>& dst) {
         if (sorted.empty()) return;
-        unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
+        auto _rt = std::chrono::steady_clock::now();
+        auto _rc = CpuTicks::now();
+
+        unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 4);
         size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
 
         // Find chunk boundaries at cell_id transitions
@@ -286,6 +290,9 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
             if (target < sorted.size()) bounds.push_back(target);
         }
         bounds.push_back(sorted.size());
+
+        std::cerr << "        remap_sorted: " << sorted.size() << " pairs, "
+                  << bounds.size()-1 << " chunks, " << nthreads << " threads" << std::endl;
 
         // Each thread builds its own partial map
         std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> partial(bounds.size() - 1);
@@ -309,6 +316,7 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
             });
         }
         for (auto& t : threads) t.join();
+        log_phase("        remap_sorted: scan", _rt, _rc);
 
         // Merge partial maps (no conflicts — cell boundaries are clean splits)
         size_t total = 0;
@@ -317,6 +325,7 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
         for (auto& p : partial) {
             for (auto& [k, v] : p) dst[k] = std::move(v);
         }
+        log_phase("        remap_sorted: merge", _rt, _rc);
     };
 
     {
