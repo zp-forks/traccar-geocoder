@@ -18,13 +18,32 @@ void resolve_interpolation_endpoints(ParsedData& data) {
         }
     };
 
+    const auto& sp = data.string_pool.data();
+    auto get_str = [&](uint32_t off) -> const char* {
+        return sp.data() + off;
+    };
+
+    // Deterministic ordering: compare housenumber first, then street name
+    auto addr_less = [&](uint32_t a, uint32_t b) -> bool {
+        int cmp = strcmp(get_str(data.addr_points[a].housenumber_id),
+                         get_str(data.addr_points[b].housenumber_id));
+        if (cmp != 0) return cmp < 0;
+        return strcmp(get_str(data.addr_points[a].street_id),
+                      get_str(data.addr_points[b].street_id)) < 0;
+    };
+
     std::unordered_map<CoordKey, uint32_t, CoordHash> addr_by_coord;
     for (uint32_t i = 0; i < data.addr_points.size(); i++) {
         CoordKey key{
             static_cast<int32_t>(data.addr_points[i].lat * 100000),
             static_cast<int32_t>(data.addr_points[i].lng * 100000)
         };
-        addr_by_coord[key] = i;
+        auto [it, inserted] = addr_by_coord.emplace(key, i);
+        if (!inserted) {
+            // Collision: keep the deterministically "smallest" address
+            if (addr_less(i, it->second))
+                it->second = i;
+        }
     }
 
     uint32_t resolved = 0;
