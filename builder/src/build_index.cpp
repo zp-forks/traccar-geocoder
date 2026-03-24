@@ -1323,10 +1323,11 @@ int main(int argc, char* argv[]) {
         ensure_dir(base_dir);
 
         if (multi_output) {
-            // Write all 3 modes
-            write_index(d, base_dir + "/full", IndexMode::Full);
-            write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses);
-            write_index(d, base_dir + "/admin", IndexMode::AdminOnly);
+            // Write all 3 modes in parallel (they read shared data, write to separate dirs)
+            auto wf1 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/full", IndexMode::Full); });
+            auto wf2 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses); });
+            auto wf3 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/admin", IndexMode::AdminOnly); });
+            wf1.get(); wf2.get(); wf3.get();
         } else {
             write_index(d, base_dir, mode);
         }
