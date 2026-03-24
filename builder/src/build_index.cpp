@@ -1211,23 +1211,40 @@ int main(int argc, char* argv[]) {
             // Sort cell IDs only (30M unique), then build pairs in sorted order.
             // Much faster than sorting all 160M pairs.
             auto f2 = std::async(std::launch::async, [&] {
-                // Extract and sort unique cell IDs
+                // Extract cell IDs and sort
                 std::vector<uint64_t> sorted_cells;
                 sorted_cells.reserve(data.cell_to_addrs.size());
-                size_t total_pairs = 0;
-                for (auto& [cell_id, ids] : data.cell_to_addrs) {
+                for (auto& [cell_id, ids] : data.cell_to_addrs)
                     sorted_cells.push_back(cell_id);
-                    total_pairs += ids.size();
-                }
                 std::sort(sorted_cells.begin(), sorted_cells.end());
 
-                // Build sorted pairs by iterating sorted cell IDs
+                // Parallel dedup: sort within each cell across threads
+                {
+                    unsigned nthreads = std::thread::hardware_concurrency();
+                    size_t chunk = (sorted_cells.size() + nthreads - 1) / nthreads;
+                    std::vector<std::thread> threads;
+                    for (unsigned t = 0; t < nthreads; t++) {
+                        size_t start = t * chunk;
+                        size_t end = std::min(start + chunk, sorted_cells.size());
+                        if (start >= sorted_cells.size()) break;
+                        threads.emplace_back([&, start, end]() {
+                            for (size_t i = start; i < end; i++) {
+                                auto& ids = data.cell_to_addrs[sorted_cells[i]];
+                                std::sort(ids.begin(), ids.end());
+                                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                            }
+                        });
+                    }
+                    for (auto& t : threads) t.join();
+                }
+
+                // Build sorted pairs sequentially (just concatenation, fast)
+                size_t total_pairs = 0;
+                for (auto& [_, ids] : data.cell_to_addrs) total_pairs += ids.size();
                 std::vector<CellItemPair> pairs;
                 pairs.reserve(total_pairs);
                 for (uint64_t cell_id : sorted_cells) {
                     auto& ids = data.cell_to_addrs[cell_id];
-                    std::sort(ids.begin(), ids.end()); // sort within cell
-                    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
                     for (auto id : ids) pairs.push_back({cell_id, id});
                 }
                 data.sorted_addr_cells = std::move(pairs);
