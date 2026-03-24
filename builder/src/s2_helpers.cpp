@@ -209,14 +209,7 @@ void AdminCoverPool::worker_loop() {
             active_workers_++;
         }
 
-        // Simplify large polygons for S2 covering — the covering is conservative
-        // so a slightly simplified shape produces a valid (slightly larger) covering.
-        // This avoids O(n log n) S2Polygon construction for 200K+ vertex polygons.
-        auto& verts = item.vertices;
-        if (verts.size() > 500) {
-            verts = simplify_polygon(verts, 500);
-        }
-        auto cell_ids = cover_polygon(verts);
+        auto cell_ids = cover_polygon(item.vertices);
         auto& local = thread_results_[my_idx];
         for (const auto& [cell_id, is_interior] : cell_ids) {
             uint32_t entry = is_interior ? (item.poly_id | INTERIOR_FLAG) : item.poly_id;
