@@ -328,11 +328,65 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
         log_phase("        remap_sorted: merge", _rt, _rc);
     };
 
+    // Build sorted pairs for continent by filtering + remapping in one pass.
+    // Much faster than building hash maps — write_index uses sorted pairs directly.
+    auto filter_and_remap_sorted = [&](const std::vector<CellItemPair>& sorted,
+                                        const std::unordered_map<uint32_t, uint32_t>& remap,
+                                        std::vector<CellItemPair>& dst) {
+        if (sorted.empty()) return;
+        auto _rt = std::chrono::steady_clock::now();
+        auto _rc = CpuTicks::now();
+
+        unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 4);
+        size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
+
+        std::vector<size_t> bounds = {0};
+        for (unsigned t = 1; t < nthreads; t++) {
+            size_t target = t * chunk;
+            if (target >= sorted.size()) break;
+            while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id)
+                target++;
+            if (target < sorted.size()) bounds.push_back(target);
+        }
+        bounds.push_back(sorted.size());
+
+        // Each thread produces a local vector of filtered+remapped pairs
+        std::vector<std::vector<CellItemPair>> thread_pairs(bounds.size() - 1);
+        std::vector<std::thread> threads;
+        for (size_t t = 0; t + 1 < bounds.size(); t++) {
+            threads.emplace_back([&, t]() {
+                auto& local = thread_pairs[t];
+                for (size_t i = bounds[t]; i < bounds[t+1]; ) {
+                    uint64_t cell_id = sorted[i].cell_id;
+                    bool match = cell_in_bbox(cell_id, bbox);
+                    while (i < bounds[t+1] && sorted[i].cell_id == cell_id) {
+                        if (match) {
+                            auto it = remap.find(sorted[i].item_id);
+                            if (it != remap.end())
+                                local.push_back({cell_id, it->second});
+                        }
+                        i++;
+                    }
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+        log_phase("        sorted remap: scan", _rt, _rc);
+
+        // Concatenate (already in sorted cell_id order since chunks are at cell boundaries)
+        size_t total = 0;
+        for (auto& v : thread_pairs) total += v.size();
+        dst.reserve(total);
+        for (auto& v : thread_pairs) dst.insert(dst.end(), v.begin(), v.end());
+        log_phase("        sorted remap: concat", _rt, _rc);
+    };
+
     {
-        // Use sorted pairs for ways/addrs/interps (parallel), hash map for admin (has flags)
-        auto f1 = std::async(std::launch::async, [&]{ remap_cells_sorted(full.sorted_way_cells, way_remap, out.cell_to_ways); });
-        auto f2 = std::async(std::launch::async, [&]{ remap_cells_sorted(full.sorted_addr_cells, addr_remap, out.cell_to_addrs); });
-        auto f3 = std::async(std::launch::async, [&]{ remap_cells_sorted(full.sorted_interp_cells, interp_remap, out.cell_to_interps); });
+        // Build sorted pairs for ways/addrs/interps (write_index uses these directly)
+        auto f1 = std::async(std::launch::async, [&]{ filter_and_remap_sorted(full.sorted_way_cells, way_remap, out.sorted_way_cells); });
+        auto f2 = std::async(std::launch::async, [&]{ filter_and_remap_sorted(full.sorted_addr_cells, addr_remap, out.sorted_addr_cells); });
+        auto f3 = std::async(std::launch::async, [&]{ filter_and_remap_sorted(full.sorted_interp_cells, interp_remap, out.sorted_interp_cells); });
+        // Admin still uses hash map (has interior flags)
         auto f4 = std::async(std::launch::async, [&]{ remap_cells_map(full.cell_to_admin, admin_remap, out.cell_to_admin, true); });
         f1.get(); f2.get(); f3.get(); f4.get();
     }
