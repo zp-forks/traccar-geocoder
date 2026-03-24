@@ -1359,11 +1359,12 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // Write planet
-    write_region(data, output_dir);
-    log_phase("Planet index + qualities", _pt);
+    // Write planet (async — overlaps with continent filtering start)
+    auto planet_future = std::async(std::launch::async, [&]() {
+        write_region(data, output_dir);
+    });
 
-    // Process continents with bounded concurrency.
+    // Process continents with bounded concurrency (starts while planet writes).
     if (generate_continents) {
         unsigned max_concurrent = std::max(1u, std::min(4u,
             std::thread::hardware_concurrency() / 8));
@@ -1398,6 +1399,8 @@ int main(int argc, char* argv[]) {
         for (auto& f : futures) f.get();
     }
 
+    // Wait for planet write if not already done
+    planet_future.get();
     log_phase("All index writing (total)", _pt);
 
     // --- Generate manifest.json ---
