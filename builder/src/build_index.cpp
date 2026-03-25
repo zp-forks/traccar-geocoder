@@ -432,16 +432,6 @@ int main(int argc, char* argv[]) {
                 std::vector<ThreadLocalData> tld(num_threads);
                 std::atomic<unsigned> next_tl_way{0};
 
-                // Tag lookup helper for streaming callback
-                auto stag = [](const uint32_t* keys, const uint32_t* vals, size_t ntags,
-                               const std::vector<std::string>& st, const char* key) -> const char* {
-                    for (size_t i = 0; i < ntags; i++) {
-                        if (keys[i] < st.size() && st[keys[i]] == key)
-                            return vals[i] < st.size() ? st[vals[i]].c_str() : nullptr;
-                    }
-                    return nullptr;
-                };
-
                 pbf.read_ways_streaming([&](int64_t way_id,
                     const int64_t* refs_data, size_t refs_size,
                     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
@@ -452,6 +442,38 @@ int main(int argc, char* argv[]) {
                         tl_way_data = &tld[idx % tld.size()];
                     }
                     auto& local = *tl_way_data;
+
+                    // Single-pass tag extraction — avoid repeated linear scans
+                    const char* t_interpolation = nullptr;
+                    const char* t_housenumber = nullptr;
+                    const char* t_street = nullptr;
+                    const char* t_highway = nullptr;
+                    const char* t_name = nullptr;
+                    const char* t_boundary = nullptr;
+                    const char* t_admin_level = nullptr;
+                    const char* t_postal_code = nullptr;
+                    const char* t_iso = nullptr;
+                    for (size_t i = 0; i < ntags; i++) {
+                        if (tag_keys[i] >= st.size()) continue;
+                        const auto& k = st[tag_keys[i]];
+                        const char* v = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
+                        if (k == "addr:interpolation") t_interpolation = v;
+                        else if (k == "addr:housenumber") t_housenumber = v;
+                        else if (k == "addr:street") t_street = v;
+                        else if (k == "highway") t_highway = v;
+                        else if (k == "name") t_name = v;
+                        else if (k == "boundary") t_boundary = v;
+                        else if (k == "admin_level") t_admin_level = v;
+                        else if (k == "postal_code") t_postal_code = v;
+                        else if (k == "ISO3166-1:alpha2") t_iso = v;
+                    }
+
+                    // Early exit: if no relevant tags, skip expensive node resolution
+                    bool need_nodes = t_interpolation || t_housenumber ||
+                        (t_highway && is_included_highway(t_highway) && t_name) ||
+                        (refs_size > 0 && admin_way_ids.count(way_id)) ||
+                        t_boundary;
+                    if (!need_nodes) return;
 
                     // Pre-resolve all node locations
                     thread_local std::vector<PackedLocation> resolved_locs;
@@ -464,21 +486,18 @@ int main(int argc, char* argv[]) {
                         if (!loc.valid()) all_valid = false;
                     }
 
-                    auto tag = [&](const char* key) { return stag(tag_keys, tag_vals, ntags, st, key); };
-
                     // Address interpolation
-                    const char* interpolation = tag("addr:interpolation");
-                    if (interpolation) {
+                    if (t_interpolation) {
                         if (refs_size >= 2 && all_valid) {
-                            const char* street = tag("addr:street");
+                            const char* street = t_street;
                             if (street) {
                                 uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
                                 uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
                                 for (const auto& loc : resolved_locs)
                                     local.interp_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
                                 uint8_t interp_type = 0;
-                                if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
-                                else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
+                                if (std::strcmp(t_interpolation, "even") == 0) interp_type = 1;
+                                else if (std::strcmp(t_interpolation, "odd") == 0) interp_type = 2;
                                 InterpWay iw{}; iw.node_offset = node_offset;
                                 iw.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
                                 iw.interpolation = interp_type;
@@ -492,9 +511,9 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Building addresses
-                    const char* housenumber = tag("addr:housenumber");
+                    const char* housenumber = t_housenumber;
                     if (housenumber) {
-                        const char* street = tag("addr:street");
+                        const char* street = t_street;
                         if (street && refs_size > 0) {
                             double sum_lat = 0, sum_lng = 0; int valid = 0;
                             for (const auto& loc : resolved_locs) {
@@ -510,10 +529,8 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Highway ways
-                    const char* highway = tag("highway");
-                    if (highway && is_included_highway(highway)) {
-                        const char* name = tag("name");
-                        if (name && refs_size >= 2 && all_valid) {
+                    if (t_highway && is_included_highway(t_highway)) {
+                        if (t_name && refs_size >= 2 && all_valid) {
                             uint32_t wid = static_cast<uint32_t>(local.ways.size());
                             uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
                             for (const auto& loc : resolved_locs)
@@ -521,7 +538,7 @@ int main(int argc, char* argv[]) {
                             WayHeader header{}; header.node_offset = noff;
                             header.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
                             local.ways.push_back(header);
-                            local.way_strings.push_back(name);
+                            local.way_strings.push_back(t_name);
                             local.deferred_ways.push_back({wid, noff, header.node_count});
                             local.way_count++;
                         }
@@ -537,25 +554,25 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Closed way admin boundaries
-                    const char* boundary = tag("boundary");
+                    const char* boundary = t_boundary;
                     if (boundary) {
                         bool is_admin = (std::strcmp(boundary, "administrative") == 0);
                         bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
                         if ((is_admin || is_postal) && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             uint8_t al = 0;
-                            if (is_admin) { const char* ls = tag("admin_level"); if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
+                            if (is_admin) { const char* ls = t_admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
                             else al = 11;
                             int max_al = is_postal ? 11 : 10;
                             if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
-                                const char* aname = tag("name");
+                                const char* aname = t_name;
                                 if (aname || !is_admin) {
                                     std::string name_str;
-                                    if (is_postal) { const char* pc = tag("postal_code"); if (!pc) pc = aname; if (pc) name_str = pc; }
+                                    if (is_postal) { const char* pc = t_postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
                                     else if (aname) name_str = aname;
                                     if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
                                         std::vector<std::pair<double,double>> verts;
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
-                                        std::string cc; if (al == 2) { const char* iso = tag("ISO3166-1:alpha2"); if (iso) cc = iso; }
+                                        std::string cc; if (al == 2) { const char* iso = t_iso; if (iso) cc = iso; }
                                         local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc)});
                                     }
                                 }
