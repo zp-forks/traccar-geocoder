@@ -332,10 +332,8 @@ int main(int argc, char* argv[]) {
                 };
                 std::vector<NodeThreadLocal> ntld(num_threads);
 
-                // Ordered mode: decompression is parallel, but callback is sequential
-                // in file order — preserves node ID locality for mmap writes.
-                pbf.read_blocks([&](PbfBlock&& block, unsigned) {
-                    auto& local = ntld[0]; // single consumer in ordered mode
+                pbf.read_blocks([&](PbfBlock&& block, unsigned t) {
+                    auto& local = ntld[t];
                     for (auto& node : block.nodes) {
                         if (node.id > 0) {
                             index.set(static_cast<uint64_t>(node.id), node.lat, node.lng);
@@ -351,7 +349,7 @@ int main(int argc, char* argv[]) {
                             }
                         }
                     }
-                }, "n", true /* ordered */);
+                }, "n");
 
                 // Merge address points
                 uint64_t total_addrs = 0;
