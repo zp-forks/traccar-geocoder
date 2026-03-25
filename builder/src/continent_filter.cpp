@@ -433,12 +433,16 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     auto _ft = std::chrono::steady_clock::now();
     auto _fc = CpuTicks::now();
 
-    // Fast mask-based filter for sorted pairs (no cell_in_bbox calls!)
+    // Fast mask-based filter using bitset → sorted vector directly
+    // Eliminates hash set entirely. O(1) bit set, O(n) scan to extract sorted IDs.
     auto filter_sorted_masked = [&](const std::vector<CellItemPair>& sorted,
-                                     const std::vector<uint8_t>& masks) {
-        std::unordered_set<uint32_t> ids;
-        if (sorted.empty()) return ids;
+                                     const std::vector<uint8_t>& masks,
+                                     uint32_t max_id) {
+        std::vector<uint32_t> result;
+        if (sorted.empty()) return result;
+
         unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 4);
+        size_t bitset_bytes = (max_id + 8) / 8;
         size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
         std::vector<size_t> bounds = {0};
         for (unsigned t = 1; t < nthreads; t++) {
@@ -449,26 +453,26 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         }
         bounds.push_back(sorted.size());
 
-        std::vector<std::unordered_set<uint32_t>> thread_ids(bounds.size() - 1);
+        std::vector<uint8_t> bitset(bitset_bytes, 0);
         std::vector<std::thread> threads;
         for (size_t t = 0; t + 1 < bounds.size(); t++) {
             threads.emplace_back([&, t]() {
-                auto& local = thread_ids[t];
                 for (size_t i = bounds[t]; i < bounds[t+1]; i++) {
-                    if (masks[i] & continent_bit) local.insert(sorted[i].item_id);
+                    if (masks[i] & continent_bit) {
+                        uint32_t id = sorted[i].item_id;
+                        if (id < max_id)
+                            bitset[id / 8] |= (1 << (id % 8));
+                    }
                 }
             });
         }
         for (auto& t : threads) t.join();
-        size_t largest = 0;
-        for (size_t t = 0; t < thread_ids.size(); t++)
-            if (thread_ids[t].size() > thread_ids[largest].size()) largest = t;
-        auto& merged = thread_ids[largest];
-        for (size_t t = 0; t < thread_ids.size(); t++) {
-            if (t == largest) continue;
-            for (auto id : thread_ids[t]) merged.insert(id);
+
+        // Extract sorted IDs from bitset (already in ascending order)
+        for (uint32_t id = 0; id < max_id; id++) {
+            if (bitset[id / 8] & (1 << (id % 8))) result.push_back(id);
         }
-        return std::move(merged);
+        return result;
     };
 
     // Filter from hash map (admin only — no precomputed masks)
@@ -484,15 +488,20 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         return ids;
     };
 
-    auto f_ways = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_way_cells, way_masks); });
-    auto f_addrs = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_addr_cells, addr_masks); });
-    auto f_interps = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_interp_cells, interp_masks); });
+    // Pass max_id for each data type to size the bitset
+    uint32_t max_way_id = static_cast<uint32_t>(full.ways.size());
+    uint32_t max_addr_id = static_cast<uint32_t>(full.addr_points.size());
+    uint32_t max_interp_id = static_cast<uint32_t>(full.interp_ways.size());
+
+    auto f_ways = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_way_cells, way_masks, max_way_id); });
+    auto f_addrs = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_addr_cells, addr_masks, max_addr_id); });
+    auto f_interps = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_interp_cells, interp_masks, max_interp_id); });
     auto f_admin = std::async(std::launch::async, [&]{ return filter_cells_map(full.cell_to_admin, true); });
 
-    auto used_way_ids = f_ways.get();
-    auto used_addr_ids = f_addrs.get();
-    auto used_interp_ids = f_interps.get();
-    auto used_admin_ids = f_admin.get();
+    auto used_way_ids = f_ways.get();     // sorted vector<uint32_t>
+    auto used_addr_ids = f_addrs.get();   // sorted vector<uint32_t>
+    auto used_interp_ids = f_interps.get(); // sorted vector<uint32_t>
+    auto used_admin_ids = f_admin.get();  // unordered_set<uint32_t> (admin still uses hash map)
     log_phase("      filter: ID collection (masked)", _ft, _fc);
 
     // Reuse the same remap + cell remap + string pool logic from filter_by_bbox
@@ -500,8 +509,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     std::unordered_map<uint32_t, uint32_t> way_remap, addr_remap, interp_remap, admin_remap;
 
     auto f_remap_ways = std::async(std::launch::async, [&]() {
-        std::vector<uint32_t> sorted_ids(used_way_ids.begin(), used_way_ids.end());
-        std::sort(sorted_ids.begin(), sorted_ids.end());
+        auto& sorted_ids = used_way_ids; // already sorted from bitset scan
         std::vector<WayHeader> ways; std::vector<NodeCoord> nodes;
         ways.reserve(sorted_ids.size()); nodes.reserve(sorted_ids.size() * 5);
         std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(sorted_ids.size());
@@ -514,16 +522,14 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         return std::make_tuple(std::move(remap), std::move(ways), std::move(nodes));
     });
     auto f_remap_addrs = std::async(std::launch::async, [&]() {
-        std::vector<uint32_t> sorted_ids(used_addr_ids.begin(), used_addr_ids.end());
-        std::sort(sorted_ids.begin(), sorted_ids.end());
+        auto& sorted_ids = used_addr_ids;
         std::vector<AddrPoint> addrs; addrs.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) { remap[old_id] = static_cast<uint32_t>(addrs.size()); addrs.push_back(full.addr_points[old_id]); }
         return std::make_tuple(std::move(remap), std::move(addrs));
     });
     auto f_remap_interps = std::async(std::launch::async, [&]() {
-        std::vector<uint32_t> sorted_ids(used_interp_ids.begin(), used_interp_ids.end());
-        std::sort(sorted_ids.begin(), sorted_ids.end());
+        auto& sorted_ids = used_interp_ids;
         std::vector<InterpWay> iways; std::vector<NodeCoord> inodes;
         iways.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(sorted_ids.size());
