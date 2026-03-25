@@ -125,6 +125,9 @@ public:
     const char* file_data() const { return file_data_; }
     size_t file_size() const { return file_size_; }
 
+    // Release mmap pages back to OS (keeps mapping, frees physical memory)
+    void release_pages();
+
     // Read all blocks containing the specified entity types in parallel.
     // Callback is called from worker threads with (block, thread_index).
     // The callback must be thread-safe OR use the thread_index for thread-local storage.

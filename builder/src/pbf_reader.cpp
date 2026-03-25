@@ -725,6 +725,12 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
     blobs_ = scan_pbf_blobs(filename_);
 }
 
+void PbfFile::release_pages() {
+    if (file_data_ && file_data_ != MAP_FAILED) {
+        madvise(const_cast<char*>(file_data_), file_size_, MADV_DONTNEED);
+    }
+}
+
 PbfFile::~PbfFile() {
     if (file_data_ && file_data_ != MAP_FAILED) munmap(const_cast<char*>(file_data_), file_size_);
     if (file_fd_ >= 0) close(file_fd_);

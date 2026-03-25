@@ -366,6 +366,7 @@ int main(int argc, char* argv[]) {
                           << " address points collected." << std::endl;
             }
             log_phase("Pass 2: node processing", _pt, _cpu);
+            pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
 
             // --- Pass 2b: Way processing (fully parallel) ---
             std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
