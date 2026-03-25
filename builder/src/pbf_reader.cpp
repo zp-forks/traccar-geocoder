@@ -916,21 +916,24 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
     classify_blobs();
     if (way_blobs_.empty()) return;
 
-    std::atomic<size_t> next_idx{0};
+    // Each thread processes a contiguous chunk of way blocks.
+    // Nearby blocks reference similar node IDs → better cache locality
+    // for the dense index reads (vs random interleaved dispatch).
+    size_t total = way_blobs_.size();
     std::atomic<size_t> blocks_done{0};
     std::vector<std::thread> threads;
 
     for (unsigned t = 0; t < num_threads_; t++) {
-        threads.emplace_back([&]() {
+        size_t start = t * total / num_threads_;
+        size_t end = (t + 1) * total / num_threads_;
+        threads.emplace_back([&, start, end]() {
             std::string decomp;
-            while (true) {
-                size_t j = next_idx.fetch_add(1);
-                if (j >= way_blobs_.size()) break;
+            for (size_t j = start; j < end; j++) {
                 decompress_blob_from_mmap(file_data_, blobs_[way_blobs_[j]], decomp);
                 decode_ways_streaming(decomp.data(), decomp.size(), callback);
                 size_t done = blocks_done.fetch_add(1) + 1;
                 if (done % 1000 == 0)
-                    std::cerr << "  Processed " << done << "/" << way_blobs_.size() << " way blocks..." << std::endl;
+                    std::cerr << "  Processed " << done << "/" << total << " way blocks..." << std::endl;
             }
         });
     }
