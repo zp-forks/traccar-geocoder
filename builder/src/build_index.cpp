@@ -236,6 +236,12 @@ int main(int argc, char* argv[]) {
                 return data[id];
             }
 
+            void prefetch(osmium::unsigned_object_id_type id) const {
+                if (id < capacity) {
+                    __builtin_prefetch(&data[id], 0, 0); // read, no temporal locality
+                }
+            }
+
             void set_batch(const std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>>& batch) {
                 for (const auto& [id, loc] : batch) {
                     if (id >= capacity) {
@@ -467,50 +473,56 @@ int main(int argc, char* argv[]) {
                             for (const auto& item : block) {
                                 if (item.type() == osmium::item_type::way) {
                                     const auto& way = static_cast<const osmium::Way&>(item);
-
-                                    // Resolve node locations (read-only from shared index)
-                                    // We need to check if nodes have valid locations
                                     const auto& wnodes = way.nodes();
+
+                                    // Prefetch all node locations from dense index.
+                                    // Hides ~100ns memory latency per TLB miss across 111 GiB mmap.
+                                    for (const auto& nr : wnodes) {
+                                        index.prefetch(nr.positive_ref());
+                                    }
+
+                                    // Pre-resolve all node locations in one pass (from prefetched cache)
+                                    thread_local std::vector<osmium::Location> resolved_locs;
+                                    resolved_locs.clear();
+                                    resolved_locs.reserve(wnodes.size());
+                                    bool all_valid = true;
+                                    for (const auto& nr : wnodes) {
+                                        auto loc = index.get(nr.positive_ref());
+                                        resolved_locs.push_back(loc);
+                                        if (!loc.valid()) all_valid = false;
+                                    }
 
                                     // Address interpolation
                                     const char* interpolation = way.tags()["addr:interpolation"];
                                     if (interpolation) {
-                                        if (wnodes.size() >= 2) {
-                                            bool all_valid = true;
-                                            for (const auto& nr : wnodes) {
-                                                auto loc = index.get(nr.positive_ref());
-                                                if (!loc.valid()) { all_valid = false; break; }
-                                            }
-                                            if (all_valid) {
-                                                const char* street = way.tags()["addr:street"];
-                                                if (street) {
-                                                    uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
-                                                    uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
+                                        if (wnodes.size() >= 2 && all_valid) {
+                                            const char* street = way.tags()["addr:street"];
+                                            if (street) {
+                                                uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
+                                                uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
 
-                                                    for (const auto& nr : wnodes) {
-                                                        auto loc = index.get(nr.positive_ref());
-                                                        local.interp_nodes.push_back({
-                                                            static_cast<float>(loc.lat()),
-                                                            static_cast<float>(loc.lon())
-                                                        });
-                                                    }
-
-                                                    uint8_t interp_type = 0;
-                                                    if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
-                                                    else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
-
-                                                    InterpWay iw{};
-                                                    iw.node_offset = node_offset;
-                                                    iw.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-                                                    iw.street_id = 0; // placeholder, intern later
-                                                    iw.start_number = 0;
-                                                    iw.end_number = 0;
-                                                    iw.interpolation = interp_type;
-                                                    local.interp_ways.push_back(iw);
-                                                    local.interp_strings.push_back(street);
-                                                    local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
-                                                    local.interp_count++;
+                                                for (const auto& loc : resolved_locs) {
+                                                    local.interp_nodes.push_back({
+                                                        static_cast<float>(loc.lat()),
+                                                        static_cast<float>(loc.lon())
+                                                    });
                                                 }
+
+                                                uint8_t interp_type = 0;
+                                                if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
+                                                else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
+
+                                                InterpWay iw{};
+                                                iw.node_offset = node_offset;
+                                                iw.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
+                                                iw.street_id = 0;
+                                                iw.start_number = 0;
+                                                iw.end_number = 0;
+                                                iw.interpolation = interp_type;
+                                                local.interp_ways.push_back(iw);
+                                                local.interp_strings.push_back(street);
+                                                local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
+                                                local.interp_count++;
                                             }
                                         }
                                         continue;
@@ -523,8 +535,7 @@ int main(int argc, char* argv[]) {
                                         if (street && !wnodes.empty()) {
                                             double sum_lat = 0, sum_lng = 0;
                                             int valid = 0;
-                                            for (const auto& nr : wnodes) {
-                                                auto loc = index.get(nr.positive_ref());
+                                            for (const auto& loc : resolved_locs) {
                                                 if (loc.valid()) {
                                                     sum_lat += loc.lat();
                                                     sum_lng += loc.lon();
@@ -532,60 +543,48 @@ int main(int argc, char* argv[]) {
                                                 }
                                             }
                                             if (valid > 0) {
-                                                // Store coords for later S2 cell computation
                                                 local.building_addr_coords.push_back({sum_lat / valid, sum_lng / valid});
-                                                // Placeholder addr point — string IDs filled in during merge
                                                 local.building_addrs.push_back({
                                                     static_cast<float>(sum_lat / valid),
                                                     static_cast<float>(sum_lng / valid),
-                                                    0, 0 // placeholder string IDs
+                                                    0, 0
                                                 });
-                                                // Store strings for later interning
                                                 local.addr_strings.push_back({housenumber, street});
                                                 local.building_addr_count++;
                                             }
                                         }
                                     }
 
-                                    // Highway ways
+                                    // Highway ways (single pass using pre-resolved locations)
                                     const char* highway = way.tags()["highway"];
                                     if (highway && is_included_highway(highway)) {
                                         const char* name = way.tags()["name"];
-                                        if (name && wnodes.size() >= 2) {
-                                            bool all_valid = true;
-                                            for (const auto& nr : wnodes) {
-                                                auto loc = index.get(nr.positive_ref());
-                                                if (!loc.valid()) { all_valid = false; break; }
-                                            }
-                                            if (all_valid) {
-                                                uint32_t way_id = static_cast<uint32_t>(local.ways.size());
-                                                uint32_t node_offset = static_cast<uint32_t>(local.street_nodes.size());
+                                        if (name && wnodes.size() >= 2 && all_valid) {
+                                            uint32_t way_id = static_cast<uint32_t>(local.ways.size());
+                                            uint32_t node_offset = static_cast<uint32_t>(local.street_nodes.size());
 
-                                                for (const auto& nr : wnodes) {
-                                                    auto loc = index.get(nr.positive_ref());
-                                                    local.street_nodes.push_back({
-                                                        static_cast<float>(loc.lat()),
-                                                        static_cast<float>(loc.lon())
-                                                    });
-                                                }
-
-                                                WayHeader header{};
-                                                header.node_offset = node_offset;
-                                                header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-                                                header.name_id = 0; // placeholder, intern later
-                                                local.ways.push_back(header);
-                                                local.way_strings.push_back(name);
-                                                local.deferred_ways.push_back({way_id, node_offset, header.node_count});
-                                                local.way_count++;
+                                            for (const auto& loc : resolved_locs) {
+                                                local.street_nodes.push_back({
+                                                    static_cast<float>(loc.lat()),
+                                                    static_cast<float>(loc.lon())
+                                                });
                                             }
+
+                                            WayHeader header{};
+                                            header.node_offset = node_offset;
+                                            header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
+                                            header.name_id = 0;
+                                            local.ways.push_back(header);
+                                            local.way_strings.push_back(name);
+                                            local.deferred_ways.push_back({way_id, node_offset, header.node_count});
+                                            local.way_count++;
                                         }
                                     }
 
                                     // Store way geometry only for admin boundary member ways
                                     if (!wnodes.empty() && admin_way_ids.count(way.id())) {
                                         std::vector<std::pair<double,double>> geom;
-                                        for (const auto& nr : wnodes) {
-                                            auto loc = index.get(nr.positive_ref());
+                                        for (const auto& loc : resolved_locs) {
                                             if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
                                         }
                                         if (!geom.empty()) {
