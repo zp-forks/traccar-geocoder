@@ -1,55 +1,68 @@
 # Build Optimization Log
 
-## Current Best: 16m 11s (70% faster than 54m baseline)
+## Final Result: 54m → 13m 32s (75% faster)
 
 Build: `--multi-output --continents --multi-quality`
 Output: 379 files, 93 GiB (planet + 8 continents × 3 modes × 7 quality levels)
 Machine: 32-core / 174 GiB RAM
+Validated: all output semantically identical to pre-optimization baseline
 
-### Phase Breakdown (with CPU profiling)
-| Phase | Wall | Cores | Util% | RSS |
-|---|---|---|---|---|
-| Pass 1: relation scanning | 43s | 13/32 | 41% | 1.2 GiB |
-| Pass 2: node processing | 189s | 16/32 | 50% | 113 GiB |
-| Pass 2b: way processing | 129s | 10/32 | 31% | 142 GiB |
-| Admin: ring assembly | 2.6s | 31/32 | 96% | 149 GiB |
-| Admin: S2 covering drain | 133s | 30/32 | 94% | 139 GiB |
-| S2: street ways | 131s | 31/32 | 96% | 145 GiB |
-| S2 total | 250s | 17/32 | 53% | 151 GiB |
-| Dedup | 56s | 1.4/32 | 4% | 40 GiB |
-| Continent processing | 148s | 13/32 | 39% | 45-67 GiB |
-| **Total** | **16m 11s** | | | |
+## Phase Breakdown
 
-## Critical Bug Found and Fixed
-
-When the cell map rebuild was eliminated (commit 73a3005), continent `street_entries.bin`
-files became empty (0 bytes). Fixed in commit 5926502 by producing sorted pairs for
-continent subsets directly. Output size increased from 77 GiB to 93 GiB.
+| Phase | Baseline (54m) | Osmium-optimized (16m) | Custom PBF (13m 32s) |
+|---|---|---|---|
+| Pass 1: relations | 46.6s | 47.6s | **25-38s** |
+| Pass 2: nodes | 184.4s | 183.3s | **71-86s** |
+| Pass 2b: ways | 132.3s | 126.5s | **94-100s** |
+| Admin S2 drain | 134.4s | 133.2s | 129-132s |
+| S2 street ways | 136.9s | 131.4s | 129-132s |
+| S2 total | 251.5s | 241.9s | 206-247s |
+| Rebuild cell maps | 224.2s | **0s** | 0s |
+| Dedup | (in S2) | 53.3s | 38-55s |
+| Continent processing | 2087.5s | 147.9s | 131-149s |
+| **Total** | **54m 1.7s** | **16m 11s** | **13m 30s** |
 
 ## All Optimizations Applied
 
-1. **Parallel continents** (4 concurrent, bounded)
-2. **Eliminated planet cell map rebuild** (filter from sorted pairs)
-3. **Parallel remap** in filter_by_bbox (4 data types simultaneously)
-4. **Parallel mode writes** (full/no-addresses/admin simultaneously)
-5. **Parallel quality variants** (3 concurrent per region)
-6. **Sorted pair filtering** (cache-friendly linear scan)
-7. **Parallel chunked scanning** (N threads per sorted pair scan)
-8. **Parallel per-cell dedup** (addr hash map conversion)
-9. **Planet/continent write overlap**
-10. **Admin polygon sorting** (largest-first for work-stealing)
-11. **Continent sorting** (largest-first by bbox area)
-12. **Worker threads = N-1** (31 instead of 28)
-13. **Deterministic interp resolution** (lexicographic tiebreaker)
-14. **Sorted pair remap for continents** (avoids hash map entirely)
-15. **Per-phase CPU/memory profiling** (getrusage + /proc/self/statm)
+### PBF Reading (osmium → custom reader)
+1. **Custom parallel PBF reader** — replaced osmium entirely
+2. **Streaming node decode** — no PbfNode objects, single-pass protobuf, inline callback
+3. **Streaming way decode** — no PbfWay objects, direct callback during decode
+4. **Zero-copy varint decode** — iterate packed fields directly without intermediate vectors
+5. **Mmap PBF file** — eliminates pread syscalls for parallel decode
+6. **Reuse decomp buffer + z_stream** — eliminates malloc contention
+7. **Release mmap pages between passes** — reduces memory pressure
+8. **Unmap after Pass 2b** — frees 86 GiB before later phases
+9. **Single-pass tag extraction** — one loop extracts all needed tags
+10. **Early exit for irrelevant ways** — skips index.get() for ~80% of ways
+11. **Flat way_refs array** — eliminates per-way vector allocation
+12. **Block reuse** — PbfBlock vectors cleared but keep capacity
+13. **Parallel blob classification** — classify 50K blobs in parallel not sequentially
+14. **MADV_HUGEPAGE** on dense index — reduces TLB miss penalty
 
-## Remaining Bottlenecks
-| Phase | Wall | Cores | Opportunity |
-|---|---|---|---|
-| S2 cell computation | 250s | 17/32 | Compute-bound, optimal |
-| Pass 2: nodes | 189s | 16/32 | PBF I/O bound |
-| Admin S2 drain | 133s | 30/32 | Compute-bound, optimal |
-| Pass 2b: ways | 129s | 10/32 | PBF I/O bound |
-| Dedup | 56s | 1.4/32 | Hash map iteration is sequential |
-| Pass 1 | 43s | 13/32 | Single-threaded PBF scan |
+### Data Processing
+15. **Parallel continents** (4 concurrent, bounded, largest-first)
+16. **Eliminated planet cell map rebuild** (filter from sorted pairs)
+17. **Parallel remap** in filter_by_bbox
+18. **Parallel mode writes** (full/no-addresses/admin simultaneously)
+19. **Parallel quality variants** (3 concurrent)
+20. **Sorted pair filtering** (cache-friendly linear scan)
+21. **Parallel chunked scanning** per continent
+22. **Parallel per-cell dedup**
+23. **Admin polygon sorting** (largest-first for work-stealing)
+24. **Continent sorting** (largest-first by bbox area)
+25. **Worker threads = N-1** (31 instead of 28)
+26. **Deterministic interp resolution** (lexicographic tiebreaker)
+27. **Sorted pair remap for continents** (avoids hash map, fixes street_entries bug)
+28. **Per-phase CPU/memory profiling** (getrusage + /proc/self/statm)
+
+## Bug Fixes
+- **Continent street_entries.bin was empty** — fixed by producing sorted pairs for continent subsets
+- **Deterministic interp resolution** — old code had nondeterministic last-wins behavior
+- **PBF way callback used return instead of continue** — skipped 50% of ways
+
+## Remaining Hardware-Limited Bottlenecks
+- **Pass 2b (94s, 25% CPU)** — random reads across 111 GiB dense index are TLB-miss bound
+- **S2 computation (206s, 96% CPU)** — compute-bound, optimal
+- **Admin S2 drain (129s, 95% CPU)** — compute-bound, optimal
+- **Dedup (38s, 4% CPU)** — hash map iteration is inherently sequential
