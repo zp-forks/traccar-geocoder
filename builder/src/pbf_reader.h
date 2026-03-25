@@ -96,8 +96,11 @@ public:
     // Read all blocks containing the specified entity types in parallel.
     // Callback is called from worker threads with (block, thread_index).
     // The callback must be thread-safe OR use the thread_index for thread-local storage.
+    // If ordered=true: decompresses in parallel but calls callback in file order
+    // (useful for nodes where sequential ID locality matters for mmap performance).
     void read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> callback,
-                     const std::string& entity_filter = "nwr");
+                     const std::string& entity_filter = "nwr",
+                     bool ordered = false);
 
     // Convenience: read only relations, only nodes, only ways
     unsigned thread_count() const { return num_threads_; }

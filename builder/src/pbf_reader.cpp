@@ -565,7 +565,8 @@ void PbfFile::classify_blobs() {
 }
 
 void PbfFile::read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> callback,
-                           const std::string& entity_filter) {
+                           const std::string& entity_filter,
+                           bool ordered) {
     classify_blobs();
 
     // Collect which blob indices to process
@@ -579,7 +580,59 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> c
 
     if (indices.empty()) return;
 
-    // Parallel decode — no callback mutex, caller uses thread_idx for thread-local data
+    if (ordered) {
+        // Ordered mode: decompress in parallel, process in file order.
+        // Pipeline: N decompressor threads fill a ring buffer, main thread
+        // consumes in order.
+        const size_t WINDOW = num_threads_ * 2; // look-ahead window
+        std::vector<std::string> decompressed(indices.size());
+        std::vector<std::atomic<bool>> ready(indices.size());
+        for (auto& r : ready) r.store(false);
+
+        std::atomic<size_t> next_decompress{0};
+        std::vector<std::thread> decomp_threads;
+
+        for (unsigned t = 0; t < num_threads_; t++) {
+            decomp_threads.emplace_back([&]() {
+                int local_fd = open(filename_.c_str(), O_RDONLY);
+                if (local_fd < 0) return;
+                while (true) {
+                    size_t j = next_decompress.fetch_add(1);
+                    if (j >= indices.size()) break;
+                    decompressed[j] = read_and_decompress_blob(local_fd, blobs_[indices[j]]);
+                    ready[j].store(true, std::memory_order_release);
+                }
+                close(local_fd);
+            });
+        }
+
+        // Consume in order on main thread
+        for (size_t j = 0; j < indices.size(); j++) {
+            // Spin-wait for this block to be ready
+            while (!ready[j].load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+
+            PbfBlock block = decode_pbf_blob(decompressed[j].data(), decompressed[j].size());
+            decompressed[j].clear(); // free memory
+            decompressed[j].shrink_to_fit();
+
+            if (entity_filter.find('n') == std::string::npos) block.nodes.clear();
+            if (entity_filter.find('w') == std::string::npos) block.ways.clear();
+            if (entity_filter.find('r') == std::string::npos) block.relations.clear();
+
+            callback(std::move(block), 0); // thread_idx=0, single consumer
+
+            if ((j + 1) % 1000 == 0) {
+                std::cerr << "  Processed " << (j + 1) << "/" << indices.size() << " blocks..." << std::endl;
+            }
+        }
+
+        for (auto& t : decomp_threads) t.join();
+        return;
+    }
+
+    // Unordered mode: full parallel decode + callback
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
     std::vector<std::thread> threads;
