@@ -502,44 +502,61 @@ PbfFile::~PbfFile() = default;
 void PbfFile::classify_blobs() {
     if (classified_) return;
 
-    // PBF files are ordered: node blocks, then way blocks, then relation blocks.
-    // Peek at each data blob to classify by content type.
-    int fd = open(filename_.c_str(), O_RDONLY);
-    if (fd < 0) throw std::runtime_error("cannot open " + filename_);
-
+    // PBF files are ordered: node blocks → way blocks → relation blocks.
+    // Use parallel classification: each thread peeks at assigned blobs.
+    std::vector<size_t> data_indices;
     for (size_t i = 0; i < blobs_.size(); i++) {
-        if (blobs_[i].type != "OSMData") continue;
-
-        std::string data = read_and_decompress_blob(fd, blobs_[i]);
-        protozero::pbf_reader pb(data);
-
-        bool has_nodes = false, has_ways = false, has_relations = false;
-        while (pb.next()) {
-            if (pb.tag() == PrimitiveBlockTag::PRIMITIVEGROUP) {
-                protozero::pbf_reader group = pb.get_message();
-                while (group.next()) {
-                    switch (group.tag()) {
-                        case PrimitiveGroupTag::NODES:
-                        case PrimitiveGroupTag::DENSE:
-                            has_nodes = true; group.skip(); break;
-                        case PrimitiveGroupTag::WAYS:
-                            has_ways = true; group.skip(); break;
-                        case PrimitiveGroupTag::RELATIONS:
-                            has_relations = true; group.skip(); break;
-                        default: group.skip();
-                    }
-                }
-            } else {
-                pb.skip();
-            }
-        }
-
-        if (has_nodes) node_blobs_.push_back(i);
-        if (has_ways) way_blobs_.push_back(i);
-        if (has_relations) relation_blobs_.push_back(i);
+        if (blobs_[i].type == "OSMData") data_indices.push_back(i);
     }
 
-    close(fd);
+    // Classify in parallel
+    struct BlobType { bool nodes = false, ways = false, relations = false; };
+    std::vector<BlobType> types(data_indices.size());
+    std::atomic<size_t> next_idx{0};
+    std::vector<std::thread> threads;
+
+    for (unsigned t = 0; t < num_threads_; t++) {
+        threads.emplace_back([&]() {
+            int local_fd = open(filename_.c_str(), O_RDONLY);
+            if (local_fd < 0) return;
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= data_indices.size()) break;
+                size_t blob_idx = data_indices[j];
+                std::string data = read_and_decompress_blob(local_fd, blobs_[blob_idx]);
+                protozero::pbf_reader pb(data);
+                auto& bt = types[j];
+                while (pb.next()) {
+                    if (pb.tag() == PrimitiveBlockTag::PRIMITIVEGROUP) {
+                        protozero::pbf_reader group = pb.get_message();
+                        while (group.next()) {
+                            switch (group.tag()) {
+                                case PrimitiveGroupTag::NODES:
+                                case PrimitiveGroupTag::DENSE:
+                                    bt.nodes = true; group.skip(); break;
+                                case PrimitiveGroupTag::WAYS:
+                                    bt.ways = true; group.skip(); break;
+                                case PrimitiveGroupTag::RELATIONS:
+                                    bt.relations = true; group.skip(); break;
+                                default: group.skip();
+                            }
+                        }
+                    } else {
+                        pb.skip();
+                    }
+                }
+            }
+            close(local_fd);
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    for (size_t j = 0; j < data_indices.size(); j++) {
+        if (types[j].nodes) node_blobs_.push_back(data_indices[j]);
+        if (types[j].ways) way_blobs_.push_back(data_indices[j]);
+        if (types[j].relations) relation_blobs_.push_back(data_indices[j]);
+    }
+
     classified_ = true;
 
     std::cerr << "  PBF classified: " << node_blobs_.size() << " node blocks, "
