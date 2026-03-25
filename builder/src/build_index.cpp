@@ -315,14 +315,24 @@ int main(int argc, char* argv[]) {
                       << " admin/postal relations for parallel assembly." << std::endl;
             log_phase("Pass 1: relation scanning", _pt, _cpu);
 
-            // Build admin_way_ids BEFORE way processing
-            std::unordered_set<int64_t> admin_way_ids;
+            // Build admin_way_ids as a bitset for O(1) lookup
+            // Max way ID ~1.3B → ~162 MiB bitset (much faster than unordered_set)
+            static constexpr size_t MAX_WAY_ID = 2000000000ULL; // 2B, ~250 MiB
+            std::vector<uint8_t> admin_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            size_t admin_way_count = 0;
             for (const auto& rel : data.collected_relations) {
                 for (const auto& [way_id, role] : rel.members) {
-                    admin_way_ids.insert(way_id);
+                    if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID) {
+                        admin_way_bits[way_id / 8] |= (1 << (way_id % 8));
+                        admin_way_count++;
+                    }
                 }
             }
-            std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
+            auto is_admin_way = [&](int64_t id) -> bool {
+                if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return false;
+                return admin_way_bits[id / 8] & (1 << (id % 8));
+            };
+            std::cerr << "  Admin assembly needs " << admin_way_count << " way geometries." << std::endl;
 
             // --- Pass 2: Node processing (streaming — no PbfNode objects) ---
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
@@ -457,22 +467,27 @@ int main(int argc, char* argv[]) {
                         if (tag_keys[i] >= st.size()) continue;
                         const auto& k = st[tag_keys[i]];
                         const char* v = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
-                        if (k == "addr:interpolation") t_interpolation = v;
-                        else if (k == "addr:housenumber") t_housenumber = v;
-                        else if (k == "addr:street") t_street = v;
-                        else if (k == "highway") t_highway = v;
-                        else if (k == "name") t_name = v;
-                        else if (k == "boundary") t_boundary = v;
-                        else if (k == "admin_level") t_admin_level = v;
-                        else if (k == "postal_code") t_postal_code = v;
-                        else if (k == "ISO3166-1:alpha2") t_iso = v;
+                        // Fast dispatch by first character to avoid 9 string comparisons
+                        switch (k.size() > 0 ? k[0] : 0) {
+                            case 'a':
+                                if (k == "addr:interpolation") t_interpolation = v;
+                                else if (k == "addr:housenumber") t_housenumber = v;
+                                else if (k == "addr:street") t_street = v;
+                                else if (k == "admin_level") t_admin_level = v;
+                                break;
+                            case 'h': if (k == "highway") t_highway = v; break;
+                            case 'n': if (k == "name") t_name = v; break;
+                            case 'b': if (k == "boundary") t_boundary = v; break;
+                            case 'p': if (k == "postal_code") t_postal_code = v; break;
+                            case 'I': if (k == "ISO3166-1:alpha2") t_iso = v; break;
+                        }
                     }
 
                     // Early exit: if no relevant tags, skip expensive node resolution
                     bool need_nodes = t_interpolation || t_housenumber ||
                         (t_highway && is_included_highway(t_highway) && t_name) ||
-                        (refs_size > 0 && admin_way_ids.count(way_id)) ||
-                        t_boundary;
+                        t_boundary ||
+                        (refs_size > 0 && is_admin_way(way_id));
                     if (!need_nodes) return;
 
                     // Pre-resolve all node locations
@@ -545,7 +560,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Admin boundary member ways
-                    if (refs_size > 0 && admin_way_ids.count(way_id)) {
+                    if (refs_size > 0 && is_admin_way(way_id)) {
                         std::vector<std::pair<double,double>> geom;
                         for (const auto& loc : resolved_locs)
                             if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});

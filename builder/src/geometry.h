@@ -251,12 +251,14 @@ inline uint32_t parse_house_number(const char* s) {
 
 // Highway types excluded from street indexing
 inline bool is_included_highway(const char* value) {
-    static const char* kExcluded[] = {
-        "footway", "path", "track", "steps", "cycleway",
-        "service", "pedestrian", "bridleway", "construction"
-    };
-    for (const char* excluded : kExcluded) {
-        if (std::strcmp(excluded, value) == 0) return false;
+    // Fast rejection by first character — avoids 8 strcmp calls for most values
+    switch (value[0]) {
+        case 'f': return std::strcmp(value, "footway") != 0;
+        case 'p': return std::strcmp(value, "path") != 0 && std::strcmp(value, "pedestrian") != 0;
+        case 't': return std::strcmp(value, "track") != 0;
+        case 's': return std::strcmp(value, "steps") != 0 && std::strcmp(value, "service") != 0;
+        case 'c': return std::strcmp(value, "cycleway") != 0 && std::strcmp(value, "construction") != 0;
+        case 'b': return std::strcmp(value, "bridleway") != 0;
+        default: return true;
     }
-    return true;
 }
