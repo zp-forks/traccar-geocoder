@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <sys/mman.h>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -200,6 +201,46 @@ std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
     }
 
     throw std::runtime_error("blob has neither raw nor zlib data");
+}
+
+// Decompress from mmap'd file (no syscalls)
+static std::string decompress_blob_from_mmap(const char* file_data, const BlobInfo& info) {
+    const char* blob_ptr = file_data + info.offset + 4 + info.header_size;
+    size_t blob_size = info.data_size;
+
+    protozero::pbf_reader blob_pbf(blob_ptr, blob_size);
+    protozero::data_view raw_view, zlib_view;
+    int32_t raw_size = 0;
+
+    while (blob_pbf.next()) {
+        switch (blob_pbf.tag()) {
+            case BlobTag::RAW: raw_view = blob_pbf.get_view(); break;
+            case BlobTag::RAW_SIZE: raw_size = blob_pbf.get_int32(); break;
+            case BlobTag::ZLIB: zlib_view = blob_pbf.get_view(); break;
+            default: blob_pbf.skip();
+        }
+    }
+
+    if (raw_view.size() > 0) {
+        return std::string(raw_view.data(), raw_view.size());
+    }
+
+    if (zlib_view.size() > 0) {
+        std::string decompressed(raw_size, '\0');
+        z_stream strm{};
+        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(zlib_view.data()));
+        strm.avail_in = zlib_view.size();
+        strm.next_out = reinterpret_cast<Bytef*>(decompressed.data());
+        strm.avail_out = decompressed.size();
+        if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
+        int ret = inflate(&strm, Z_FINISH);
+        inflateEnd(&strm);
+        if (ret != Z_STREAM_END) throw std::runtime_error("zlib inflate failed");
+        decompressed.resize(strm.total_out);
+        return decompressed;
+    }
+
+    throw std::runtime_error("blob has no data");
 }
 
 // --- PrimitiveBlock decoding ---
@@ -660,10 +701,26 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
     : filename_(filename), num_threads_(num_threads) {
     if (num_threads_ == 0) num_threads_ = std::thread::hardware_concurrency();
     if (num_threads_ == 0) num_threads_ = 4;
+
+    // Mmap the entire file read-only — eliminates pread syscalls during parallel decode
+    file_fd_ = open(filename_.c_str(), O_RDONLY);
+    if (file_fd_ < 0) throw std::runtime_error("cannot open " + filename_);
+    file_size_ = lseek(file_fd_, 0, SEEK_END);
+    file_data_ = static_cast<const char*>(
+        mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE | MAP_POPULATE, file_fd_, 0));
+    if (file_data_ == MAP_FAILED) {
+        close(file_fd_);
+        throw std::runtime_error("mmap failed for " + filename_);
+    }
+    std::cerr << "  PBF file mmap'd: " << (file_size_ / (1024*1024)) << " MiB" << std::endl;
+
     blobs_ = scan_pbf_blobs(filename_);
 }
 
-PbfFile::~PbfFile() = default;
+PbfFile::~PbfFile() {
+    if (file_data_ && file_data_ != MAP_FAILED) munmap(const_cast<char*>(file_data_), file_size_);
+    if (file_fd_ >= 0) close(file_fd_);
+}
 
 void PbfFile::classify_blobs() {
     if (classified_) return;
@@ -683,13 +740,11 @@ void PbfFile::classify_blobs() {
 
     for (unsigned t = 0; t < num_threads_; t++) {
         threads.emplace_back([&]() {
-            int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
             while (true) {
                 size_t j = next_idx.fetch_add(1);
                 if (j >= data_indices.size()) break;
                 size_t blob_idx = data_indices[j];
-                std::string data = read_and_decompress_blob(local_fd, blobs_[blob_idx]);
+                std::string data = decompress_blob_from_mmap(file_data_, blobs_[blob_idx]);
                 protozero::pbf_reader pb(data);
                 auto& bt = types[j];
                 while (pb.next()) {
@@ -712,7 +767,6 @@ void PbfFile::classify_blobs() {
                     }
                 }
             }
-            close(local_fd);
         });
     }
     for (auto& t : threads) t.join();
@@ -764,8 +818,6 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
 
         for (unsigned t = 0; t < num_threads_; t++) {
             decomp_threads.emplace_back([&]() {
-                int local_fd = open(filename_.c_str(), O_RDONLY);
-                if (local_fd < 0) return;
                 while (true) {
                     size_t j = next_decompress.fetch_add(1);
                     if (j >= indices.size()) break;
@@ -774,16 +826,13 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
                     while (ring_ready[slot].load(std::memory_order_acquire)) {
                         std::this_thread::yield();
                     }
-                    // Decompress + decode (heavy work done in parallel)
-                    std::string data = read_and_decompress_blob(local_fd, blobs_[indices[j]]);
+                    std::string data = decompress_blob_from_mmap(file_data_, blobs_[indices[j]]);
                     ring[slot] = decode_pbf_blob(data.data(), data.size());
-                    // Filter entities
-                    if (entity_filter.find('n') == std::string::npos) ring[slot].nodes.clear();
-                    if (entity_filter.find('w') == std::string::npos) ring[slot].ways.clear();
-                    if (entity_filter.find('r') == std::string::npos) ring[slot].relations.clear();
+                    if (!want_nodes) ring[slot].nodes.clear();
+                    if (!want_ways) ring[slot].ways.clear();
+                    if (!want_rels) ring[slot].relations.clear();
                     ring_ready[slot].store(true, std::memory_order_release);
                 }
-                close(local_fd);
             });
         }
 
@@ -828,9 +877,6 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
 
     for (unsigned t = 0; t < num_threads_; t++) {
         threads.emplace_back([&, t]() {
-            int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
-
             PbfBlock block;
             std::string decomp;
             auto& st = stats[t];
@@ -841,7 +887,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
 
                 auto t0 = std::chrono::steady_clock::now();
                 size_t blob_idx = indices[j];
-                decomp = read_and_decompress_blob(local_fd, blobs_[blob_idx]);
+                decomp = decompress_blob_from_mmap(file_data_, blobs_[blob_idx]);
                 auto t1 = std::chrono::steady_clock::now();
 
                 decode_pbf_blob_into(decomp.data(), decomp.size(), block);
@@ -864,8 +910,6 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
                     std::cerr << "  Processed " << done << "/" << indices.size() << " blocks..." << std::endl;
                 }
             }
-
-            close(local_fd);
         });
     }
 

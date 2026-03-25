@@ -121,6 +121,10 @@ public:
     explicit PbfFile(const std::string& filename, unsigned num_threads = 0);
     ~PbfFile();
 
+    // Mmap'd file data (available after construction)
+    const char* file_data() const { return file_data_; }
+    size_t file_size() const { return file_size_; }
+
     // Read all blocks containing the specified entity types in parallel.
     // Callback is called from worker threads with (block, thread_index).
     // The callback must be thread-safe OR use the thread_index for thread-local storage.
@@ -140,6 +144,9 @@ public:
 private:
     std::string filename_;
     unsigned num_threads_;
+    const char* file_data_ = nullptr;
+    size_t file_size_ = 0;
+    int file_fd_ = -1;
     std::vector<BlobInfo> blobs_;
     // Pre-classified blob indices by content type
     std::vector<size_t> node_blobs_;
