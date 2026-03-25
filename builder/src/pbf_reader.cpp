@@ -707,7 +707,7 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
     if (file_fd_ < 0) throw std::runtime_error("cannot open " + filename_);
     file_size_ = lseek(file_fd_, 0, SEEK_END);
     file_data_ = static_cast<const char*>(
-        mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE | MAP_POPULATE, file_fd_, 0));
+        mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, file_fd_, 0));
     if (file_data_ == MAP_FAILED) {
         close(file_fd_);
         throw std::runtime_error("mmap failed for " + filename_);
