@@ -41,7 +41,8 @@ struct PbfNode {
 
 struct PbfWay {
     int64_t id;
-    std::vector<int64_t> node_refs;
+    uint32_t refs_offset; // offset into PbfBlock::way_refs
+    uint32_t refs_count;  // number of node refs
     PbfTags tags;
 
     const char* tag(const char* key) const { return tags.get(key); }
@@ -68,12 +69,16 @@ struct PbfRelation {
 };
 
 // A decoded PBF block containing nodes, ways, and/or relations.
-// Owns the string table — nodes/ways/relations reference it via pointers.
+// Owns the string table and flat ref arrays — structs reference via offsets.
 struct PbfBlock {
     std::vector<std::string> string_table;
     std::vector<PbfNode> nodes;
     std::vector<PbfWay> ways;
+    std::vector<int64_t> way_refs;  // flat array, PbfWay references via offset+count
     std::vector<PbfRelation> relations;
+
+    // Convenience: get node refs for a way
+    const int64_t* refs(const PbfWay& w) const { return way_refs.data() + w.refs_offset; }
 };
 
 // Blob location within the file

@@ -331,11 +331,13 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
                             }
                             case WayTag::REFS: {
                                 auto packed = way_msg.get_packed_sint64();
+                                way.refs_offset = static_cast<uint32_t>(block.way_refs.size());
                                 int64_t ref = 0;
                                 for (auto delta : packed) {
                                     ref += delta;
-                                    way.node_refs.push_back(ref);
+                                    block.way_refs.push_back(ref);
                                 }
+                                way.refs_count = static_cast<uint32_t>(block.way_refs.size()) - way.refs_offset;
                                 break;
                             }
                             default:
@@ -431,6 +433,7 @@ void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
     block.string_table.clear();
     block.nodes.clear();
     block.ways.clear();
+    block.way_refs.clear();
     block.relations.clear();
 
     protozero::pbf_reader pb(data, size);
@@ -515,8 +518,10 @@ void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
                             case WayTag::VALS: for (auto v : way_msg.get_packed_uint32()) vals.push_back(v); break;
                             case WayTag::REFS: {
                                 auto packed = way_msg.get_packed_sint64();
+                                way.refs_offset = static_cast<uint32_t>(block.way_refs.size());
                                 int64_t ref = 0;
-                                for (auto delta : packed) { ref += delta; way.node_refs.push_back(ref); }
+                                for (auto delta : packed) { ref += delta; block.way_refs.push_back(ref); }
+                                way.refs_count = static_cast<uint32_t>(block.way_refs.size()) - way.refs_offset;
                                 break;
                             }
                             default: way_msg.skip();
