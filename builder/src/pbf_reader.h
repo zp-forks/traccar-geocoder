@@ -102,6 +102,15 @@ PbfBlock decode_pbf_blob(const char* blob_data, size_t blob_size);
 // Decode into existing block (reuses vector capacity, avoids reallocation).
 void decode_pbf_blob_into(const char* blob_data, size_t blob_size, PbfBlock& block);
 
+// Streaming node decode — calls callback directly for each node during decode.
+// Avoids creating PbfNode objects entirely. String table is passed for tag lookup.
+// Callback: (id, lat, lng, tag_keys_ptr, tag_vals_ptr, ntags, string_table)
+using NodeCallback = std::function<void(int64_t id, double lat, double lng,
+    const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
+    const std::vector<std::string>& string_table)>;
+
+void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback);
+
 // Read and decompress a single blob from file.
 // Returns the decompressed PrimitiveBlock data.
 std::string read_and_decompress_blob(int fd, const BlobInfo& info);
@@ -144,6 +153,10 @@ public:
 
     // Convenience: read only relations, only nodes, only ways
     unsigned thread_count() const { return num_threads_; }
+
+    // Streaming node reader — processes nodes directly during decode without
+    // creating PbfNode objects. Much faster for node processing.
+    void read_nodes_streaming(const NodeCallback& callback);
 
     const std::vector<BlobInfo>& blobs() const { return blobs_; }
 

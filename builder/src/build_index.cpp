@@ -322,7 +322,7 @@ int main(int argc, char* argv[]) {
             }
             std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
 
-            // --- Pass 2: Node processing (fully parallel via custom PBF reader) ---
+            // --- Pass 2: Node processing (streaming — no PbfNode objects) ---
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             {
                 struct NodeThreadLocal {
@@ -330,26 +330,47 @@ int main(int argc, char* argv[]) {
                     std::vector<std::pair<std::string,std::string>> addr_strings;
                     uint64_t count = 0;
                 };
+                // Use thread_local for streaming callback (no thread index available)
+                static thread_local NodeThreadLocal* tl_node_data = nullptr;
                 std::vector<NodeThreadLocal> ntld(num_threads);
+                std::atomic<unsigned> next_tl{0};
 
-                pbf.read_blocks([&](PbfBlock& block, unsigned t) {
-                    auto& local = ntld[t];
-                    for (auto& node : block.nodes) {
-                        if (node.id > 0) {
-                            index.set(static_cast<uint64_t>(node.id), node.lat, node.lng);
-                        }
+                pbf.read_nodes_streaming([&](int64_t id, double lat, double lng,
+                    const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
+                    const std::vector<std::string>& st) {
 
-                        const char* housenumber = node.tag("addr:housenumber");
-                        if (housenumber) {
-                            const char* street = node.tag("addr:street");
-                            if (street) {
-                                local.addr_coords.push_back({node.lat, node.lng});
-                                local.addr_strings.push_back({housenumber, street});
-                                local.count++;
+                    // Lazy init thread-local pointer
+                    if (!tl_node_data) {
+                        unsigned idx = next_tl.fetch_add(1);
+                        tl_node_data = &ntld[idx % ntld.size()];
+                    }
+
+                    if (id > 0) {
+                        index.set(static_cast<uint64_t>(id), lat, lng);
+                    }
+
+                    // Check for address tags (fast — no string copies for tagless nodes)
+                    if (ntags > 0) {
+                        const char* housenumber = nullptr;
+                        const char* street = nullptr;
+                        for (size_t i = 0; i < ntags; i++) {
+                            if (tag_keys[i] < st.size()) {
+                                if (st[tag_keys[i]] == "addr:housenumber")
+                                    housenumber = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
+                                else if (st[tag_keys[i]] == "addr:street")
+                                    street = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
                             }
                         }
+                        if (housenumber && street) {
+                            tl_node_data->addr_coords.push_back({lat, lng});
+                            tl_node_data->addr_strings.push_back({housenumber, street});
+                            tl_node_data->count++;
+                        }
                     }
-                }, "n");
+                });
+
+                // Reset thread_local for next use
+                tl_node_data = nullptr;
 
                 // Merge address points
                 uint64_t total_addrs = 0;

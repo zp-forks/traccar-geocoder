@@ -478,6 +478,98 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
     return block;
 }
 
+void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback) {
+    // Single-pass decode: string table + dense nodes in one traversal
+    std::vector<std::string> string_table;
+    int32_t granularity = 100;
+    int64_t lat_offset = 0, lon_offset = 0;
+
+    // We need the string table before processing tags, but in PBF the string table
+    // comes before primitive groups, so a single pass works.
+    protozero::pbf_reader pb(data, size);
+    while (pb.next()) {
+        switch (pb.tag()) {
+            case PrimitiveBlockTag::STRINGTABLE: {
+                protozero::pbf_reader st = pb.get_message();
+                while (st.next()) {
+                    if (st.tag() == StringTableTag::S) {
+                        auto view = st.get_view();
+                        string_table.emplace_back(view.data(), view.size());
+                    } else { st.skip(); }
+                }
+                break;
+            }
+            case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
+            case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::PRIMITIVEGROUP: {
+                protozero::pbf_reader group = pb.get_message();
+                while (group.next()) {
+                    if (group.tag() == PrimitiveGroupTag::DENSE) {
+                        protozero::pbf_reader dense = group.get_message();
+                        protozero::data_view ids_data{}, lats_data{}, lons_data{}, kv_data{};
+                        while (dense.next()) {
+                            switch (dense.tag()) {
+                                case DenseNodesTag::ID: ids_data = dense.get_view(); break;
+                                case DenseNodesTag::LAT: lats_data = dense.get_view(); break;
+                                case DenseNodesTag::LON: lons_data = dense.get_view(); break;
+                                case DenseNodesTag::KEYS_VALS: kv_data = dense.get_view(); break;
+                                default: dense.skip();
+                            }
+                        }
+
+                        const char* id_ptr = ids_data.data();
+                        const char* id_end = id_ptr + ids_data.size();
+                        const char* lat_ptr = lats_data.data();
+                        const char* lat_end = lat_ptr + lats_data.size();
+                        const char* lon_ptr = lons_data.data();
+                        const char* lon_end = lon_ptr + lons_data.size();
+                        const char* kv_ptr = kv_data.data();
+                        const char* kv_end = kv_ptr + kv_data.size();
+
+                        // Reusable tag buffers (avoid allocation per node)
+                        thread_local std::vector<uint32_t> tag_keys, tag_vals;
+
+                        int64_t id = 0, lat = 0, lon = 0;
+                        while (id_ptr < id_end) {
+                            id += protozero::decode_zigzag64(protozero::decode_varint(&id_ptr, id_end));
+                            lat += protozero::decode_zigzag64(protozero::decode_varint(&lat_ptr, lat_end));
+                            lon += protozero::decode_zigzag64(protozero::decode_varint(&lon_ptr, lon_end));
+
+                            tag_keys.clear();
+                            tag_vals.clear();
+
+                            if (kv_ptr < kv_end) {
+                                uint32_t key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
+                                if (key_idx != 0) {
+                                    do {
+                                        uint32_t val_idx = (kv_ptr < kv_end)
+                                            ? static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end)) : 0;
+                                        tag_keys.push_back(key_idx);
+                                        tag_vals.push_back(val_idx);
+                                        if (kv_ptr >= kv_end) break;
+                                        key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
+                                    } while (key_idx != 0);
+                                }
+                            }
+
+                            double dlat = 0.000000001 * (lat_offset + (int64_t)granularity * lat);
+                            double dlng = 0.000000001 * (lon_offset + (int64_t)granularity * lon);
+                            callback(id, dlat, dlng,
+                                     tag_keys.data(), tag_vals.data(), tag_keys.size(),
+                                     string_table);
+                        }
+                    } else {
+                        group.skip();
+                    }
+                }
+                break;
+            }
+            default: pb.skip();
+        }
+    }
+}
+
 void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
     // Clear vectors but keep capacity for reuse
     block.string_table.clear();
@@ -723,6 +815,31 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
     std::cerr << "  PBF file mmap'd: " << (file_size_ / (1024*1024)) << " MiB" << std::endl;
 
     blobs_ = scan_pbf_blobs(filename_);
+}
+
+void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
+    classify_blobs();
+    if (node_blobs_.empty()) return;
+
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::vector<std::thread> threads;
+
+    for (unsigned t = 0; t < num_threads_; t++) {
+        threads.emplace_back([&]() {
+            std::string decomp;
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= node_blobs_.size()) break;
+                decompress_blob_from_mmap(file_data_, blobs_[node_blobs_[j]], decomp);
+                decode_nodes_streaming(decomp.data(), decomp.size(), callback);
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 1000 == 0)
+                    std::cerr << "  Processed " << done << "/" << node_blobs_.size() << " node blocks..." << std::endl;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
 }
 
 void PbfFile::release_pages() {
