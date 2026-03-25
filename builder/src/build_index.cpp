@@ -296,9 +296,9 @@ int main(int argc, char* argv[]) {
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
 
-                        for (const auto& member : rel.members) {
-                            if (member.type == 'w') {
-                                cr.members.emplace_back(member.ref, member.role);
+                        for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                            if (rel.members[mi].type == 'w') {
+                                cr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
                             }
                         }
 

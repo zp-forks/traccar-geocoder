@@ -207,7 +207,7 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
     PbfBlock block;
 
     protozero::pbf_reader pb(data, size);
-    std::vector<std::string> string_table;
+    auto& string_table = block.string_table;
     int32_t granularity = 100;
     int64_t lat_offset = 0;
     int64_t lon_offset = 0;
@@ -241,10 +241,7 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
         }
     }
 
-    auto get_string = [&](uint32_t idx) -> const std::string& {
-        static const std::string empty;
-        return idx < string_table.size() ? string_table[idx] : empty;
-    };
+    auto* st_ptr = &block.string_table; // for tag construction
 
     // Second pass: decode primitive groups
     protozero::pbf_reader pb2(data, size);
@@ -294,11 +291,17 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
                         node.lat = 0.000000001 * (lat_offset + (int64_t)granularity * lat);
                         node.lng = 0.000000001 * (lon_offset + (int64_t)granularity * lon);
 
-                        while (kv_pos < kv_vec.size()) {
-                            int32_t key_idx = kv_vec[kv_pos++];
-                            if (key_idx == 0) break;
-                            int32_t val_idx = (kv_pos < kv_vec.size()) ? kv_vec[kv_pos++] : 0;
-                            node.tags.emplace_back(get_string(key_idx), get_string(val_idx));
+                        // Only allocate tags if this node has any
+                        if (kv_pos < kv_vec.size() && kv_vec[kv_pos] != 0) {
+                            node.tags.string_table = st_ptr;
+                            while (kv_pos < kv_vec.size()) {
+                                int32_t key_idx = kv_vec[kv_pos++];
+                                if (key_idx == 0) break;
+                                int32_t val_idx = (kv_pos < kv_vec.size()) ? kv_vec[kv_pos++] : 0;
+                                node.tags.indices.emplace_back(key_idx, val_idx);
+                            }
+                        } else {
+                            if (kv_pos < kv_vec.size()) kv_pos++; // skip the 0 delimiter
                         }
 
                         block.nodes.push_back(std::move(node));
@@ -340,8 +343,9 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
                         }
                     }
 
+                    way.tags.string_table = st_ptr;
                     for (size_t i = 0; i < keys.size() && i < vals.size(); i++) {
-                        way.tags.emplace_back(get_string(keys[i]), get_string(vals[i]));
+                        way.tags.indices.emplace_back(keys[i], vals[i]);
                     }
                     block.ways.push_back(std::move(way));
                     break;
@@ -390,8 +394,9 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
                         }
                     }
 
+                    rel.tags.string_table = st_ptr;
                     for (size_t i = 0; i < keys.size() && i < vals.size(); i++) {
-                        rel.tags.emplace_back(get_string(keys[i]), get_string(vals[i]));
+                        rel.tags.indices.emplace_back(keys[i], vals[i]);
                     }
 
                     int64_t memid = 0;
@@ -405,9 +410,8 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
                                 case 2: type = 'r'; break;
                             }
                         }
-                        std::string role = (i < roles_sid.size())
-                            ? get_string(roles_sid[i]) : "";
-                        rel.members.push_back({type, memid, role});
+                        uint32_t role_sid = (i < roles_sid.size()) ? roles_sid[i] : 0;
+                        rel.members.push_back({type, memid, role_sid});
                     }
                     block.relations.push_back(std::move(rel));
                     break;

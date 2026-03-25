@@ -33,35 +33,18 @@ int main(int argc, char* argv[]) {
 
     read_pbf_parallel(input_file, [&](PbfBlock&& block, size_t) {
         for (auto& n : block.nodes) {
-            // Check for address tags
-            bool has_hn = false, has_st = false;
-            for (auto& [k, v] : n.tags) {
-                if (k == "addr:housenumber") has_hn = true;
-                if (k == "addr:street") has_st = true;
-            }
-            if (has_hn && has_st) addr_nodes++;
-
+            if (n.tag("addr:housenumber") && n.tag("addr:street")) addr_nodes++;
             if (dump_all) all_nodes.push_back(std::move(n));
         }
         for (auto& w : block.ways) {
-            bool has_highway = false, has_interp = false, has_hn = false;
-            for (auto& [k, v] : w.tags) {
-                if (k == "highway") has_highway = true;
-                if (k == "addr:interpolation") has_interp = true;
-                if (k == "addr:housenumber") has_hn = true;
-            }
-            if (has_highway) highway_ways++;
-            if (has_interp) interp_ways++;
-            if (has_hn) building_addr_ways++;
-
+            if (w.tag("highway")) highway_ways++;
+            if (w.tag("addr:interpolation")) interp_ways++;
+            if (w.tag("addr:housenumber")) building_addr_ways++;
             if (dump_all) all_ways.push_back(std::move(w));
         }
         for (auto& r : block.relations) {
-            bool is_admin = false;
-            for (auto& [k, v] : r.tags) {
-                if (k == "boundary" && v == "administrative") is_admin = true;
-            }
-            if (is_admin) admin_relations++;
+            const char* boundary = r.tag("boundary");
+            if (boundary && std::strcmp(boundary, "administrative") == 0) admin_relations++;
 
             if (dump_all) all_relations.push_back(std::move(r));
         }
@@ -92,8 +75,14 @@ int main(int argc, char* argv[]) {
         int32_t lon_fixed = static_cast<int32_t>(n.lng * 10000000.0 + (n.lng >= 0 ? 0.5 : -0.5));
         int32_t lat_fixed = static_cast<int32_t>(n.lat * 10000000.0 + (n.lat >= 0 ? 0.5 : -0.5));
         std::cout << "NODE " << n.id << " " << lon_fixed << " " << lat_fixed;
-        // Sort tags for deterministic output
-        auto tags = n.tags;
+        // Resolve + sort tags for deterministic output
+        std::vector<std::pair<std::string,std::string>> tags;
+        if (n.tags.string_table) {
+            for (auto& [ki, vi] : n.tags.indices) {
+                auto& st = *n.tags.string_table;
+                tags.emplace_back(ki < st.size() ? st[ki] : "", vi < st.size() ? st[vi] : "");
+            }
+        }
         std::sort(tags.begin(), tags.end());
         for (const auto& [k, v] : tags) std::cout << " " << k << "=" << v;
         std::cout << "\n";
@@ -103,19 +92,35 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0; i < w.node_refs.size(); i++) {
             std::cout << (i == 0 ? " " : ",") << w.node_refs[i];
         }
-        auto tags = w.tags;
-        std::sort(tags.begin(), tags.end());
-        for (const auto& [k, v] : tags) std::cout << " " << k << "=" << v;
+        {
+            std::vector<std::pair<std::string,std::string>> tags;
+            if (w.tags.string_table) {
+                for (auto& [ki, vi] : w.tags.indices) {
+                    auto& st = *w.tags.string_table;
+                    tags.emplace_back(ki < st.size() ? st[ki] : "", vi < st.size() ? st[vi] : "");
+                }
+            }
+            std::sort(tags.begin(), tags.end());
+            for (const auto& [k, v] : tags) std::cout << " " << k << "=" << v;
+        }
         std::cout << "\n";
     }
     for (const auto& r : all_relations) {
         std::cout << "REL " << r.id;
         for (size_t i = 0; i < r.members.size(); i++) {
-            std::cout << (i == 0 ? " " : ",") << r.members[i].type << "/" << r.members[i].ref << "/" << r.members[i].role;
+            std::cout << (i == 0 ? " " : ",") << r.members[i].type << "/" << r.members[i].ref << "/" << r.member_role(i);
         }
-        auto tags = r.tags;
-        std::sort(tags.begin(), tags.end());
-        for (const auto& [k, v] : tags) std::cout << " " << k << "=" << v;
+        {
+            std::vector<std::pair<std::string,std::string>> tags;
+            if (r.tags.string_table) {
+                for (auto& [ki, vi] : r.tags.indices) {
+                    auto& st = *r.tags.string_table;
+                    tags.emplace_back(ki < st.size() ? st[ki] : "", vi < st.size() ? st[vi] : "");
+                }
+            }
+            std::sort(tags.begin(), tags.end());
+            for (const auto& [k, v] : tags) std::cout << " " << k << "=" << v;
+        }
         std::cout << "\n";
     }
 

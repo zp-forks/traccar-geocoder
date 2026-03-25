@@ -11,47 +11,66 @@
 
 // --- Raw PBF data structures ---
 
-// Tag lookup helper
-inline const char* find_tag(const std::vector<std::pair<std::string, std::string>>& tags,
-                             const char* key) {
-    for (const auto& [k, v] : tags) {
-        if (k == key) return v.c_str();
+// Tags are stored as index pairs into the block's string table.
+// Avoids all string copying during decode.
+struct PbfTags {
+    const std::vector<std::string>* string_table = nullptr;
+    std::vector<std::pair<uint32_t, uint32_t>> indices; // (key_idx, val_idx)
+
+    const char* get(const char* key) const {
+        if (!string_table) return nullptr;
+        for (const auto& [ki, vi] : indices) {
+            if (ki < string_table->size() && (*string_table)[ki] == key) {
+                return vi < string_table->size() ? (*string_table)[vi].c_str() : nullptr;
+            }
+        }
+        return nullptr;
     }
-    return nullptr;
-}
+
+    bool empty() const { return indices.empty(); }
+};
 
 struct PbfNode {
     int64_t id;
     double lat;
     double lng;
-    std::vector<std::pair<std::string, std::string>> tags;
+    PbfTags tags;
 
-    const char* tag(const char* key) const { return find_tag(tags, key); }
+    const char* tag(const char* key) const { return tags.get(key); }
 };
 
 struct PbfWay {
     int64_t id;
     std::vector<int64_t> node_refs;
-    std::vector<std::pair<std::string, std::string>> tags;
+    PbfTags tags;
 
-    const char* tag(const char* key) const { return find_tag(tags, key); }
+    const char* tag(const char* key) const { return tags.get(key); }
 };
 
 struct PbfRelation {
     struct Member {
         char type; // 'n', 'w', 'r'
         int64_t ref;
-        std::string role;
+        uint32_t role_sid; // index into block string table
     };
     int64_t id;
     std::vector<Member> members;
-    std::vector<std::pair<std::string, std::string>> tags;
+    PbfTags tags;
 
-    const char* tag(const char* key) const { return find_tag(tags, key); }
+    const char* tag(const char* key) const { return tags.get(key); }
+    // Resolve member role from string table
+    const std::string& member_role(size_t i) const {
+        static const std::string empty;
+        if (!tags.string_table || i >= members.size()) return empty;
+        uint32_t sid = members[i].role_sid;
+        return sid < tags.string_table->size() ? (*tags.string_table)[sid] : empty;
+    }
 };
 
-// A decoded PBF block containing nodes, ways, and/or relations
+// A decoded PBF block containing nodes, ways, and/or relations.
+// Owns the string table — nodes/ways/relations reference it via pointers.
 struct PbfBlock {
+    std::vector<std::string> string_table;
     std::vector<PbfNode> nodes;
     std::vector<PbfWay> ways;
     std::vector<PbfRelation> relations;
