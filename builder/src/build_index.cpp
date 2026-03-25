@@ -391,10 +391,12 @@ int main(int argc, char* argv[]) {
             log_phase("Pass 2: node processing", _pt, _cpu);
             pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
 
-            // --- Pass 2b: Way processing (fully parallel) ---
-            std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
+            // --- Pass 2b: Way processing (deferred node resolution) ---
+            // Phase A: Read ways, collect raw node ref IDs (no index access)
+            // Phase B: Sort unique refs, resolve sequentially from dense index  
+            // Phase C: Process ways using compact lookup
+            std::cerr << "  Processing ways (deferred resolution)..." << std::endl;
             {
-                // Thread-local data for parallel way processing
                 struct ThreadLocalData {
                     std::vector<WayHeader> ways;
                     std::vector<NodeCoord> street_nodes;
@@ -403,184 +405,208 @@ int main(int argc, char* argv[]) {
                     std::vector<NodeCoord> interp_nodes;
                     std::vector<DeferredInterp> deferred_interps;
                     std::vector<AddrPoint> building_addrs;
-                    std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
-                    std::vector<std::string> way_strings;      // way name strings
-                    std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
-                    std::vector<std::string> interp_strings;   // interp street name strings
-                    uint64_t way_count = 0;
-                    uint64_t building_addr_count = 0;
-                    uint64_t interp_count = 0;
-                    // Way geometries for parallel admin assembly
-                    struct WayGeomEntry {
-                        int64_t way_id;
-                        std::vector<std::pair<double,double>> coords;
-                        int64_t first_node_id;
-                        int64_t last_node_id;
-                    };
+                    std::vector<std::pair<double, double>> building_addr_coords;
+                    std::vector<std::string> way_strings;
+                    std::vector<std::pair<std::string,std::string>> addr_strings;
+                    std::vector<std::string> interp_strings;
+                    uint64_t way_count = 0, building_addr_count = 0, interp_count = 0;
+                    struct WayGeomEntry { int64_t way_id; std::vector<std::pair<double,double>> coords; int64_t first_node_id, last_node_id; };
                     std::vector<WayGeomEntry> way_geoms;
-                    // Closed-way admin polygons (ways with boundary=administrative)
-                    struct ClosedWayAdmin {
-                        std::vector<std::pair<double,double>> vertices;
-                        std::string name;
-                        uint8_t admin_level;
-                        std::string country_code;
-                    };
+                    struct ClosedWayAdmin { std::vector<std::pair<double,double>> vertices; std::string name; uint8_t admin_level; std::string country_code; };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                 };
 
-                static thread_local ThreadLocalData* tl_way_data = nullptr;
-                std::vector<ThreadLocalData> tld(num_threads);
-                std::atomic<unsigned> next_tl_way{0};
+                enum class WayType : uint8_t { Highway, Interp, BuildingAddr, AdminGeom, ClosedAdmin };
+                struct CollectedWay {
+                    int64_t way_id;
+                    uint32_t refs_offset;
+                    uint16_t refs_count;
+                    WayType type;
+                    std::string str1, str2;
+                    uint8_t admin_level = 0, interp_type = 0;
+                };
+                struct CollectorLocal {
+                    std::vector<CollectedWay> ways;
+                    std::vector<int64_t> refs;
+                };
+
+                // Phase A: collect ways + ref IDs (parallel, no index access)
+                auto _2bt = std::chrono::steady_clock::now();
+                auto _2bc = CpuTicks::now();
+                static thread_local CollectorLocal* tl_collector = nullptr;
+                std::vector<CollectorLocal> collectors(num_threads);
+                std::atomic<unsigned> next_tl_col{0};
 
                 pbf.read_ways_streaming([&](int64_t way_id,
                     const int64_t* refs_data, size_t refs_size,
                     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
                     const std::vector<std::string>& st) {
+                    if (!tl_collector) { unsigned idx = next_tl_col.fetch_add(1); tl_collector = &collectors[idx % collectors.size()]; }
+                    auto& col = *tl_collector;
 
-                    if (!tl_way_data) {
-                        unsigned idx = next_tl_way.fetch_add(1);
-                        tl_way_data = &tld[idx % tld.size()];
-                    }
-                    auto& local = *tl_way_data;
-
-                    // Single-pass tag extraction — avoid repeated linear scans
-                    const char* t_interpolation = nullptr;
-                    const char* t_housenumber = nullptr;
-                    const char* t_street = nullptr;
-                    const char* t_highway = nullptr;
-                    const char* t_name = nullptr;
-                    const char* t_boundary = nullptr;
-                    const char* t_admin_level = nullptr;
-                    const char* t_postal_code = nullptr;
-                    const char* t_iso = nullptr;
+                    const char *t_interp=nullptr, *t_hn=nullptr, *t_street=nullptr, *t_hw=nullptr, *t_name=nullptr;
+                    const char *t_boundary=nullptr, *t_al=nullptr, *t_pc=nullptr, *t_iso=nullptr;
                     for (size_t i = 0; i < ntags; i++) {
                         if (tag_keys[i] >= st.size()) continue;
                         const auto& k = st[tag_keys[i]];
                         const char* v = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
-                        if (k == "addr:interpolation") t_interpolation = v;
-                        else if (k == "addr:housenumber") t_housenumber = v;
+                        if (k == "addr:interpolation") t_interp = v;
+                        else if (k == "addr:housenumber") t_hn = v;
                         else if (k == "addr:street") t_street = v;
-                        else if (k == "highway") t_highway = v;
+                        else if (k == "highway") t_hw = v;
                         else if (k == "name") t_name = v;
                         else if (k == "boundary") t_boundary = v;
-                        else if (k == "admin_level") t_admin_level = v;
-                        else if (k == "postal_code") t_postal_code = v;
+                        else if (k == "admin_level") t_al = v;
+                        else if (k == "postal_code") t_pc = v;
                         else if (k == "ISO3166-1:alpha2") t_iso = v;
                     }
+                    bool is_admin_member = refs_size > 0 && admin_way_ids.count(way_id);
+                    auto store_refs = [&]() -> uint32_t {
+                        uint32_t off = static_cast<uint32_t>(col.refs.size());
+                        for (size_t i = 0; i < refs_size; i++) col.refs.push_back(refs_data[i]);
+                        return off;
+                    };
 
-                    // Early exit: if no relevant tags, skip expensive node resolution
-                    bool need_nodes = t_interpolation || t_housenumber ||
-                        (t_highway && is_included_highway(t_highway) && t_name) ||
-                        (refs_size > 0 && admin_way_ids.count(way_id)) ||
-                        t_boundary;
-                    if (!need_nodes) return;
-
-                    // Pre-resolve all node locations
-                    thread_local std::vector<PackedLocation> resolved_locs;
-                    resolved_locs.clear();
-                    resolved_locs.reserve(refs_size);
-                    bool all_valid = true;
-                    for (size_t ri = 0; ri < refs_size; ri++) {
-                        auto loc = index.get(static_cast<uint64_t>(refs_data[ri]));
-                        resolved_locs.push_back(loc);
-                        if (!loc.valid()) all_valid = false;
+                    if (t_interp && refs_size >= 2 && t_street) {
+                        CollectedWay cw; cw.way_id = way_id; cw.refs_offset = store_refs();
+                        cw.refs_count = static_cast<uint16_t>(std::min(refs_size, size_t(65535)));
+                        cw.type = WayType::Interp; cw.str1 = t_street;
+                        if (std::strcmp(t_interp, "even") == 0) cw.interp_type = 1;
+                        else if (std::strcmp(t_interp, "odd") == 0) cw.interp_type = 2;
+                        col.ways.push_back(std::move(cw)); return;
                     }
-
-                    // Address interpolation
-                    if (t_interpolation) {
-                        if (refs_size >= 2 && all_valid) {
-                            const char* street = t_street;
-                            if (street) {
-                                uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
-                                uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
-                                for (const auto& loc : resolved_locs)
-                                    local.interp_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
-                                uint8_t interp_type = 0;
-                                if (std::strcmp(t_interpolation, "even") == 0) interp_type = 1;
-                                else if (std::strcmp(t_interpolation, "odd") == 0) interp_type = 2;
-                                InterpWay iw{}; iw.node_offset = node_offset;
-                                iw.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
-                                iw.interpolation = interp_type;
-                                local.interp_ways.push_back(iw);
-                                local.interp_strings.push_back(street);
-                                local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
-                                local.interp_count++;
-                            }
-                        }
-                        return;
+                    if (t_hn && t_street && refs_size > 0) {
+                        CollectedWay cw; cw.way_id = way_id; cw.refs_offset = store_refs();
+                        cw.refs_count = static_cast<uint16_t>(std::min(refs_size, size_t(65535)));
+                        cw.type = WayType::BuildingAddr; cw.str1 = t_street; cw.str2 = t_hn;
+                        col.ways.push_back(std::move(cw));
                     }
-
-                    // Building addresses
-                    const char* housenumber = t_housenumber;
-                    if (housenumber) {
-                        const char* street = t_street;
-                        if (street && refs_size > 0) {
-                            double sum_lat = 0, sum_lng = 0; int valid = 0;
-                            for (const auto& loc : resolved_locs) {
-                                if (loc.valid()) { sum_lat += loc.lat(); sum_lng += loc.lon(); valid++; }
-                            }
-                            if (valid > 0) {
-                                local.building_addr_coords.push_back({sum_lat/valid, sum_lng/valid});
-                                local.building_addrs.push_back({static_cast<float>(sum_lat/valid), static_cast<float>(sum_lng/valid), 0, 0});
-                                local.addr_strings.push_back({housenumber, street});
-                                local.building_addr_count++;
-                            }
-                        }
+                    if (t_hw && is_included_highway(t_hw) && t_name && refs_size >= 2) {
+                        CollectedWay cw; cw.way_id = way_id; cw.refs_offset = store_refs();
+                        cw.refs_count = static_cast<uint16_t>(std::min(refs_size, size_t(65535)));
+                        cw.type = WayType::Highway; cw.str1 = t_name;
+                        col.ways.push_back(std::move(cw));
                     }
-
-                    // Highway ways
-                    if (t_highway && is_included_highway(t_highway)) {
-                        if (t_name && refs_size >= 2 && all_valid) {
-                            uint32_t wid = static_cast<uint32_t>(local.ways.size());
-                            uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
-                            for (const auto& loc : resolved_locs)
-                                local.street_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
-                            WayHeader header{}; header.node_offset = noff;
-                            header.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
-                            local.ways.push_back(header);
-                            local.way_strings.push_back(t_name);
-                            local.deferred_ways.push_back({wid, noff, header.node_count});
-                            local.way_count++;
-                        }
+                    if (is_admin_member) {
+                        CollectedWay cw; cw.way_id = way_id; cw.refs_offset = store_refs();
+                        cw.refs_count = static_cast<uint16_t>(std::min(refs_size, size_t(65535)));
+                        cw.type = WayType::AdminGeom; col.ways.push_back(std::move(cw));
                     }
-
-                    // Admin boundary member ways
-                    if (refs_size > 0 && admin_way_ids.count(way_id)) {
-                        std::vector<std::pair<double,double>> geom;
-                        for (const auto& loc : resolved_locs)
-                            if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
-                        if (!geom.empty())
-                            local.way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
-                    }
-
-                    // Closed way admin boundaries
-                    const char* boundary = t_boundary;
-                    if (boundary) {
-                        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
-                        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
-                        if ((is_admin || is_postal) && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                    if (t_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                        bool is_admin = (std::strcmp(t_boundary, "administrative") == 0);
+                        bool is_postal = (std::strcmp(t_boundary, "postal_code") == 0);
+                        if (is_admin || is_postal) {
                             uint8_t al = 0;
-                            if (is_admin) { const char* ls = t_admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
-                            else al = 11;
+                            if (is_admin && t_al) al = static_cast<uint8_t>(std::atoi(t_al)); else if (is_postal) al = 11;
                             int max_al = is_postal ? 11 : 10;
                             if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
-                                const char* aname = t_name;
-                                if (aname || !is_admin) {
-                                    std::string name_str;
-                                    if (is_postal) { const char* pc = t_postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
-                                    else if (aname) name_str = aname;
-                                    if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
-                                        std::vector<std::pair<double,double>> verts;
-                                        for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
-                                        std::string cc; if (al == 2) { const char* iso = t_iso; if (iso) cc = iso; }
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc)});
-                                    }
+                                std::string nm; if (is_postal) { const char* pc = t_pc; if (!pc) pc = t_name; if (pc) nm = pc; } else if (t_name) nm = t_name;
+                                if (!nm.empty()) {
+                                    CollectedWay cw; cw.way_id = way_id; cw.refs_offset = store_refs();
+                                    cw.refs_count = static_cast<uint16_t>(std::min(refs_size, size_t(65535)));
+                                    cw.type = WayType::ClosedAdmin; cw.str1 = std::move(nm); cw.admin_level = al;
+                                    if (al == 2 && t_iso) cw.str2 = t_iso;
+                                    col.ways.push_back(std::move(cw));
                                 }
                             }
                         }
                     }
                 });
+                tl_collector = nullptr;
+                log_phase("    Phase A: collect ways", _2bt, _2bc);
+
+                // Phase B: sort unique ref IDs, resolve sequentially
+                size_t total_refs = 0, collected_ways = 0;
+                for (auto& col : collectors) { total_refs += col.refs.size(); collected_ways += col.ways.size(); }
+                std::vector<int64_t> all_refs;
+                all_refs.reserve(total_refs);
+                for (auto& col : collectors) all_refs.insert(all_refs.end(), col.refs.begin(), col.refs.end());
+                std::sort(all_refs.begin(), all_refs.end());
+                all_refs.erase(std::unique(all_refs.begin(), all_refs.end()), all_refs.end());
+                std::cerr << "    " << collected_ways << " relevant ways, " << total_refs << " refs, " << all_refs.size() << " unique nodes" << std::endl;
+
+                // Sequential scan — cache-friendly!
+                std::vector<PackedLocation> resolved(all_refs.size());
+                for (size_t i = 0; i < all_refs.size(); i++)
+                    resolved[i] = index.get(static_cast<uint64_t>(all_refs[i]));
+                log_phase("    Phase B: resolve nodes", _2bt, _2bc);
+
+                // Lookup via binary search on sorted array
+                auto lookup = [&](int64_t ref_id) -> PackedLocation {
+                    auto it = std::lower_bound(all_refs.begin(), all_refs.end(), ref_id);
+                    if (it != all_refs.end() && *it == ref_id) return resolved[it - all_refs.begin()];
+                    return {0, 0};
+                };
+
+                // Phase C: process collected ways in parallel
+                static thread_local ThreadLocalData* tl_way_data = nullptr;
+                std::vector<ThreadLocalData> tld(num_threads);
+                std::atomic<unsigned> next_tl_way{0};
+                std::atomic<size_t> next_col{0};
+                std::vector<std::thread> way_workers;
+                for (unsigned wt = 0; wt < num_threads; wt++) {
+                    way_workers.emplace_back([&]() {
+                        if (!tl_way_data) { unsigned idx = next_tl_way.fetch_add(1); tl_way_data = &tld[idx % tld.size()]; }
+                        auto& local = *tl_way_data;
+                        while (true) {
+                            size_t ci = next_col.fetch_add(1);
+                            if (ci >= collectors.size()) break;
+                            auto& col = collectors[ci];
+                            for (auto& cw : col.ways) {
+                                const int64_t* refs = col.refs.data() + cw.refs_offset;
+                                size_t nrefs = cw.refs_count;
+                                thread_local std::vector<PackedLocation> locs;
+                                locs.clear(); locs.reserve(nrefs);
+                                bool all_valid = true;
+                                for (size_t i = 0; i < nrefs; i++) { auto loc = lookup(refs[i]); locs.push_back(loc); if (!loc.valid()) all_valid = false; }
+
+                                switch (cw.type) {
+                                case WayType::Interp: {
+                                    if (!all_valid) break;
+                                    uint32_t iid = static_cast<uint32_t>(local.interp_ways.size());
+                                    uint32_t noff = static_cast<uint32_t>(local.interp_nodes.size());
+                                    for (auto& l : locs) local.interp_nodes.push_back({static_cast<float>(l.lat()), static_cast<float>(l.lon())});
+                                    InterpWay iw{}; iw.node_offset = noff; iw.node_count = static_cast<uint8_t>(std::min(nrefs, size_t(255))); iw.interpolation = cw.interp_type;
+                                    local.interp_ways.push_back(iw); local.interp_strings.push_back(cw.str1);
+                                    local.deferred_interps.push_back({iid, noff, iw.node_count}); local.interp_count++; break;
+                                }
+                                case WayType::BuildingAddr: {
+                                    double slat=0, slng=0; int valid=0;
+                                    for (auto& l : locs) { if (l.valid()) { slat+=l.lat(); slng+=l.lon(); valid++; } }
+                                    if (valid > 0) {
+                                        local.building_addr_coords.push_back({slat/valid, slng/valid});
+                                        local.building_addrs.push_back({static_cast<float>(slat/valid), static_cast<float>(slng/valid), 0, 0});
+                                        local.addr_strings.push_back({cw.str2, cw.str1}); local.building_addr_count++;
+                                    } break;
+                                }
+                                case WayType::Highway: {
+                                    if (!all_valid || nrefs < 2) break;
+                                    uint32_t wid = static_cast<uint32_t>(local.ways.size());
+                                    uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
+                                    for (auto& l : locs) local.street_nodes.push_back({static_cast<float>(l.lat()), static_cast<float>(l.lon())});
+                                    WayHeader h{}; h.node_offset = noff; h.node_count = static_cast<uint8_t>(std::min(nrefs, size_t(255)));
+                                    local.ways.push_back(h); local.way_strings.push_back(cw.str1);
+                                    local.deferred_ways.push_back({wid, noff, h.node_count}); local.way_count++; break;
+                                }
+                                case WayType::AdminGeom: {
+                                    std::vector<std::pair<double,double>> geom;
+                                    for (auto& l : locs) if (l.valid()) geom.push_back({l.lat(), l.lon()});
+                                    if (!geom.empty()) local.way_geoms.push_back({cw.way_id, std::move(geom), refs[0], refs[nrefs-1]}); break;
+                                }
+                                case WayType::ClosedAdmin: {
+                                    if (!all_valid || locs.size() < 3) break;
+                                    std::vector<std::pair<double,double>> verts;
+                                    for (auto& l : locs) verts.push_back({l.lat(), l.lon()});
+                                    local.closed_way_admins.push_back({std::move(verts), std::move(cw.str1), cw.admin_level, std::move(cw.str2)}); break;
+                                }
+                                }
+                            }
+                        }
+                    });
+                }
+                for (auto& w : way_workers) w.join();
                 tl_way_data = nullptr;
+                log_phase("    Phase C: process ways", _2bt, _2bc);
                 std::cerr << "  Parallel way processing complete." << std::endl;
 
                 // Process areas/multipolygons — sequential fallback path
