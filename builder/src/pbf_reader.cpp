@@ -203,13 +203,14 @@ std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
     throw std::runtime_error("blob has neither raw nor zlib data");
 }
 
-// Decompress from mmap'd file (no syscalls)
-static std::string decompress_blob_from_mmap(const char* file_data, const BlobInfo& info) {
+// Decompress from mmap'd file into reusable buffer (no allocation after warmup)
+static void decompress_blob_from_mmap(const char* file_data, const BlobInfo& info,
+                                       std::string& out) {
     const char* blob_ptr = file_data + info.offset + 4 + info.header_size;
     size_t blob_size = info.data_size;
 
     protozero::pbf_reader blob_pbf(blob_ptr, blob_size);
-    protozero::data_view raw_view, zlib_view;
+    protozero::data_view raw_view{}, zlib_view{};
     int32_t raw_size = 0;
 
     while (blob_pbf.next()) {
@@ -222,22 +223,29 @@ static std::string decompress_blob_from_mmap(const char* file_data, const BlobIn
     }
 
     if (raw_view.size() > 0) {
-        return std::string(raw_view.data(), raw_view.size());
+        out.assign(raw_view.data(), raw_view.size());
+        return;
     }
 
     if (zlib_view.size() > 0) {
-        std::string decompressed(raw_size, '\0');
-        z_stream strm{};
+        out.resize(raw_size);
+        // Reuse thread-local z_stream to avoid inflateInit/End overhead per block
+        thread_local z_stream strm{};
+        thread_local bool strm_init = false;
+        if (!strm_init) {
+            if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
+            strm_init = true;
+        } else {
+            inflateReset(&strm);
+        }
         strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(zlib_view.data()));
         strm.avail_in = zlib_view.size();
-        strm.next_out = reinterpret_cast<Bytef*>(decompressed.data());
-        strm.avail_out = decompressed.size();
-        if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
+        strm.next_out = reinterpret_cast<Bytef*>(out.data());
+        strm.avail_out = out.size();
         int ret = inflate(&strm, Z_FINISH);
-        inflateEnd(&strm);
         if (ret != Z_STREAM_END) throw std::runtime_error("zlib inflate failed");
-        decompressed.resize(strm.total_out);
-        return decompressed;
+        out.resize(strm.total_out);
+        return;
     }
 
     throw std::runtime_error("blob has no data");
@@ -740,11 +748,12 @@ void PbfFile::classify_blobs() {
 
     for (unsigned t = 0; t < num_threads_; t++) {
         threads.emplace_back([&]() {
+            std::string data;
             while (true) {
                 size_t j = next_idx.fetch_add(1);
                 if (j >= data_indices.size()) break;
                 size_t blob_idx = data_indices[j];
-                std::string data = decompress_blob_from_mmap(file_data_, blobs_[blob_idx]);
+                decompress_blob_from_mmap(file_data_, blobs_[blob_idx], data);
                 protozero::pbf_reader pb(data);
                 auto& bt = types[j];
                 while (pb.next()) {
@@ -826,7 +835,8 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
                     while (ring_ready[slot].load(std::memory_order_acquire)) {
                         std::this_thread::yield();
                     }
-                    std::string data = decompress_blob_from_mmap(file_data_, blobs_[indices[j]]);
+                    thread_local std::string data;
+                    decompress_blob_from_mmap(file_data_, blobs_[indices[j]], data);
                     ring[slot] = decode_pbf_blob(data.data(), data.size());
                     if (!want_nodes) ring[slot].nodes.clear();
                     if (!want_ways) ring[slot].ways.clear();
@@ -887,7 +897,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
 
                 auto t0 = std::chrono::steady_clock::now();
                 size_t blob_idx = indices[j];
-                decomp = decompress_blob_from_mmap(file_data_, blobs_[blob_idx]);
+                decompress_blob_from_mmap(file_data_, blobs_[blob_idx], decomp);
                 auto t1 = std::chrono::steady_clock::now();
 
                 decode_pbf_blob_into(decomp.data(), decomp.size(), block);
