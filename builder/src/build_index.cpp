@@ -678,6 +678,7 @@ int main(int argc, char* argv[]) {
                 // --- Parallel admin boundary assembly ---
                 {
                     log_phase("Pass 2b: way processing", _pt, _cpu);
+                    pbf.unmap(); // release 86 GiB PBF mmap before admin/S2 phases
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
                               << data.way_geometries.size() << " way geometries)..." << std::endl;

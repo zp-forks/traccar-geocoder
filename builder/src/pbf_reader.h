@@ -128,6 +128,9 @@ public:
     // Release mmap pages back to OS (keeps mapping, frees physical memory)
     void release_pages();
 
+    // Fully unmap the PBF file (call after all PBF reading is complete)
+    void unmap();
+
     // Read all blocks containing the specified entity types in parallel.
     // Callback is called from worker threads with (block, thread_index).
     // The callback must be thread-safe OR use the thread_index for thread-local storage.

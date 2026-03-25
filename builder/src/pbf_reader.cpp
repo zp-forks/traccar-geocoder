@@ -731,6 +731,17 @@ void PbfFile::release_pages() {
     }
 }
 
+void PbfFile::unmap() {
+    if (file_data_ && file_data_ != MAP_FAILED) {
+        munmap(const_cast<char*>(file_data_), file_size_);
+        file_data_ = nullptr;
+    }
+    if (file_fd_ >= 0) {
+        close(file_fd_);
+        file_fd_ = -1;
+    }
+}
+
 PbfFile::~PbfFile() {
     if (file_data_ && file_data_ != MAP_FAILED) munmap(const_cast<char*>(file_data_), file_size_);
     if (file_fd_ >= 0) close(file_fd_);
