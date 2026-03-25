@@ -487,3 +487,115 @@ void read_pbf_parallel(const std::string& filename,
     for (auto& t : threads) t.join();
     close(fd);
 }
+
+// --- PbfFile implementation ---
+
+PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
+    : filename_(filename), num_threads_(num_threads) {
+    if (num_threads_ == 0) num_threads_ = std::thread::hardware_concurrency();
+    if (num_threads_ == 0) num_threads_ = 4;
+    blobs_ = scan_pbf_blobs(filename_);
+}
+
+PbfFile::~PbfFile() = default;
+
+void PbfFile::classify_blobs() {
+    if (classified_) return;
+
+    // PBF files are ordered: node blocks, then way blocks, then relation blocks.
+    // Peek at each data blob to classify by content type.
+    int fd = open(filename_.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("cannot open " + filename_);
+
+    for (size_t i = 0; i < blobs_.size(); i++) {
+        if (blobs_[i].type != "OSMData") continue;
+
+        std::string data = read_and_decompress_blob(fd, blobs_[i]);
+        protozero::pbf_reader pb(data);
+
+        bool has_nodes = false, has_ways = false, has_relations = false;
+        while (pb.next()) {
+            if (pb.tag() == PrimitiveBlockTag::PRIMITIVEGROUP) {
+                protozero::pbf_reader group = pb.get_message();
+                while (group.next()) {
+                    switch (group.tag()) {
+                        case PrimitiveGroupTag::NODES:
+                        case PrimitiveGroupTag::DENSE:
+                            has_nodes = true; group.skip(); break;
+                        case PrimitiveGroupTag::WAYS:
+                            has_ways = true; group.skip(); break;
+                        case PrimitiveGroupTag::RELATIONS:
+                            has_relations = true; group.skip(); break;
+                        default: group.skip();
+                    }
+                }
+            } else {
+                pb.skip();
+            }
+        }
+
+        if (has_nodes) node_blobs_.push_back(i);
+        if (has_ways) way_blobs_.push_back(i);
+        if (has_relations) relation_blobs_.push_back(i);
+    }
+
+    close(fd);
+    classified_ = true;
+
+    std::cerr << "  PBF classified: " << node_blobs_.size() << " node blocks, "
+              << way_blobs_.size() << " way blocks, "
+              << relation_blobs_.size() << " relation blocks" << std::endl;
+}
+
+void PbfFile::read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> callback,
+                           const std::string& entity_filter) {
+    classify_blobs();
+
+    // Collect which blob indices to process
+    std::vector<size_t> indices;
+    if (entity_filter.find('n') != std::string::npos)
+        indices.insert(indices.end(), node_blobs_.begin(), node_blobs_.end());
+    if (entity_filter.find('w') != std::string::npos)
+        indices.insert(indices.end(), way_blobs_.begin(), way_blobs_.end());
+    if (entity_filter.find('r') != std::string::npos)
+        indices.insert(indices.end(), relation_blobs_.begin(), relation_blobs_.end());
+
+    if (indices.empty()) return;
+
+    // Parallel decode — no callback mutex, caller uses thread_idx for thread-local data
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::vector<std::thread> threads;
+
+    for (unsigned t = 0; t < num_threads_; t++) {
+        threads.emplace_back([&, t]() {
+            int local_fd = open(filename_.c_str(), O_RDONLY);
+            if (local_fd < 0) return;
+
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= indices.size()) break;
+
+                size_t blob_idx = indices[j];
+                std::string decompressed = read_and_decompress_blob(local_fd, blobs_[blob_idx]);
+                PbfBlock block = decode_pbf_blob(decompressed.data(), decompressed.size());
+
+                // Filter entities
+                if (entity_filter.find('n') == std::string::npos) block.nodes.clear();
+                if (entity_filter.find('w') == std::string::npos) block.ways.clear();
+                if (entity_filter.find('r') == std::string::npos) block.relations.clear();
+
+                callback(std::move(block), t);
+
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 1000 == 0) {
+                    std::cerr << "  Processed " << done << "/" << indices.size() << " blocks..." << std::endl;
+                }
+            }
+
+            close(local_fd);
+        });
+    }
+
+    for (auto& t : threads) t.join();
+}
