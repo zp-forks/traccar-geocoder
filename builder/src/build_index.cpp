@@ -14,9 +14,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include <osmium/io/pbf_input.hpp>
-#include <osmium/visitor.hpp>
 #include <sys/mman.h>
+
+#include "pbf_reader.h"
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -27,7 +27,6 @@
 #include "parsed_data.h"
 #include "s2_helpers.h"
 #include "ring_assembly.h"
-#include "relation_collector.h"
 #include "interpolation.h"
 #include "cache.h"
 #include "continent_filter.h"
@@ -197,53 +196,48 @@ int main(int argc, char* argv[]) {
         // BuildHandler no longer used — parallel processing handles everything
 
         // Dense array node location index — lockless parallel writes
-        // Planet OSM node IDs max ~12.5 billion. 8 bytes per Location = 100GB virtual.
+        // Planet OSM node IDs max ~12.5 billion. 8 bytes per entry = 100GB virtual.
         // MAP_NORESERVE means OS only allocates pages on write (~80GB for 10B nodes).
         static const size_t MAX_NODE_ID = MAX_NODE_ID_DEFAULT;
+        struct PackedLocation {
+            int32_t lat_e7;  // latitude * 10^7
+            int32_t lon_e7;  // longitude * 10^7
+            bool valid() const { return lat_e7 != 0 || lon_e7 != 0; }
+            double lat() const { return lat_e7 / 10000000.0; }
+            double lon() const { return lon_e7 / 10000000.0; }
+        };
         struct DenseIndex {
-            osmium::Location* data;
+            PackedLocation* data;
             size_t capacity;
 
             DenseIndex() : capacity(MAX_NODE_ID) {
-                void* ptr = mmap(nullptr, capacity * sizeof(osmium::Location),
+                void* ptr = mmap(nullptr, capacity * sizeof(PackedLocation),
                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                     -1, 0);
                 if (ptr == MAP_FAILED) {
                     std::cerr << "Error: failed to mmap dense node index ("
-                              << (capacity * sizeof(osmium::Location) / (1024*1024*1024)) << "GB virtual)" << std::endl;
+                              << (capacity * sizeof(PackedLocation) / (1024*1024*1024)) << "GB virtual)" << std::endl;
                     std::exit(1);
                 }
-                data = static_cast<osmium::Location*>(ptr);
-                std::cerr << "Allocated dense node index: " << (capacity * sizeof(osmium::Location) / (1024*1024*1024))
+                data = static_cast<PackedLocation*>(ptr);
+                std::cerr << "Allocated dense node index: " << (capacity * sizeof(PackedLocation) / (1024*1024*1024))
                           << "GB virtual address space" << std::endl;
             }
 
             ~DenseIndex() {
-                munmap(data, capacity * sizeof(osmium::Location));
+                munmap(data, capacity * sizeof(PackedLocation));
             }
 
             // Lockless — each node ID maps to a unique array slot
-            void set(osmium::unsigned_object_id_type id, osmium::Location loc) {
-                if (id >= capacity) {
-                    std::cerr << "FATAL: node ID " << id << " exceeds dense index capacity " << capacity << std::endl;
-                    std::exit(1);
-                }
-                data[id] = loc;
+            void set(uint64_t id, double lat, double lng) {
+                if (id >= capacity) return;
+                data[id] = {static_cast<int32_t>(lat * 10000000.0 + (lat >= 0 ? 0.5 : -0.5)),
+                            static_cast<int32_t>(lng * 10000000.0 + (lng >= 0 ? 0.5 : -0.5))};
             }
 
-            osmium::Location get(osmium::unsigned_object_id_type id) const {
-                if (id >= capacity) return osmium::Location{};
+            PackedLocation get(uint64_t id) const {
+                if (id >= capacity) return {0, 0};
                 return data[id];
-            }
-
-            void set_batch(const std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>>& batch) {
-                for (const auto& [id, loc] : batch) {
-                    if (id >= capacity) {
-                        std::cerr << "FATAL: node ID " << id << " exceeds dense index capacity " << capacity << std::endl;
-                        std::exit(1);
-                    }
-                    data[id] = loc;
-                }
             }
         } index;
 
@@ -252,23 +246,74 @@ int main(int argc, char* argv[]) {
 
             // --- Pass 1: collect relation members for parallel admin assembly ---
             std::cerr << "  Pass 1: scanning relations..." << std::endl;
-            RelationCollector rel_collector(data.collected_relations);
+            PbfFile pbf(input_file, num_threads);
 
             {
-                osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
-                osmium::apply(reader1, rel_collector);
-                reader1.close();
+                std::mutex rel_mutex;
+                pbf.read_blocks([&](PbfBlock&& block, unsigned) {
+                    for (auto& rel : block.relations) {
+                        const char* boundary = rel.tag("boundary");
+                        if (!boundary) continue;
+
+                        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
+                        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
+                        if (!is_admin && !is_postal) continue;
+
+                        uint8_t admin_level = 0;
+                        if (is_admin) {
+                            const char* level_str = rel.tag("admin_level");
+                            if (!level_str) continue;
+                            admin_level = static_cast<uint8_t>(std::atoi(level_str));
+                            if (admin_level < 2 || admin_level > 10) continue;
+                        } else {
+                            admin_level = 11;
+                        }
+                        if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) continue;
+
+                        const char* name = rel.tag("name");
+                        if (!name && is_admin) continue;
+
+                        std::string name_str;
+                        if (is_postal) {
+                            const char* postal_code = rel.tag("postal_code");
+                            if (!postal_code) postal_code = name;
+                            if (!postal_code) continue;
+                            name_str = postal_code;
+                        } else {
+                            name_str = name;
+                        }
+
+                        std::string country_code;
+                        if (admin_level == 2) {
+                            const char* cc = rel.tag("ISO3166-1:alpha2");
+                            if (cc) country_code = cc;
+                        }
+
+                        CollectedRelation cr;
+                        cr.id = rel.id;
+                        cr.admin_level = admin_level;
+                        cr.name = std::move(name_str);
+                        cr.country_code = std::move(country_code);
+                        cr.is_postal = is_postal;
+
+                        for (const auto& member : rel.members) {
+                            if (member.type == 'w') {
+                                cr.members.emplace_back(member.ref, member.role);
+                            }
+                        }
+
+                        if (!cr.members.empty()) {
+                            std::lock_guard<std::mutex> lock(rel_mutex);
+                            data.collected_relations.push_back(std::move(cr));
+                        }
+                    }
+                }, "r");
             }
             std::cerr << "  Collected " << data.collected_relations.size()
                       << " admin/postal relations for parallel assembly." << std::endl;
-
-            // --- Combined Pass 2+3: nodes then ways in a single PBF read ---
-            // PBF guarantees ordering: nodes → ways → relations.
-            // We read everything in one pass, processing nodes first, then
-            // transitioning to way processing when the first way block arrives.
             log_phase("Pass 1: relation scanning", _pt, _cpu);
 
-            // Build admin_way_ids BEFORE the combined pass (needed during way processing)
+            // Build admin_way_ids BEFORE way processing
             std::unordered_set<int64_t> admin_way_ids;
             for (const auto& rel : data.collected_relations) {
                 for (const auto& [way_id, role] : rel.members) {
@@ -277,114 +322,35 @@ int main(int argc, char* argv[]) {
             }
             std::cerr << "  Admin assembly needs " << admin_way_ids.size() << " way geometries." << std::endl;
 
-            std::cerr << "  Pass 2+3: processing nodes and ways in single read..." << std::endl;
-
+            // --- Pass 2: Node processing (fully parallel via custom PBF reader) ---
+            std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             {
-                // Shared queue infrastructure for both phases
-                std::mutex queue_mutex;
-                std::condition_variable queue_cv;
-                std::deque<osmium::memory::Buffer> block_queue;
-                bool reader_done = false;
-                const size_t MAX_QUEUE = MAX_BLOCK_QUEUE;
-
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
                     std::vector<std::pair<std::string,std::string>> addr_strings;
                     uint64_t count = 0;
                 };
                 std::vector<NodeThreadLocal> ntld(num_threads);
-                std::atomic<uint64_t> blocks_done{0};
 
-                // Worker threads
-                std::vector<std::thread> node_workers;
-                for (unsigned int t = 0; t < num_threads; t++) {
-                    node_workers.emplace_back([&, t]() {
-                        auto& local = ntld[t];
-                        std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>> loc_batch;
-                        loc_batch.reserve(8192);
-
-                        while (true) {
-                            osmium::memory::Buffer block;
-                            {
-                                std::unique_lock<std::mutex> lock(queue_mutex);
-                                queue_cv.wait(lock, [&]{ return !block_queue.empty() || reader_done; });
-                                if (block_queue.empty() && reader_done) break;
-                                block = std::move(block_queue.front());
-                                block_queue.pop_front();
-                            }
-                            queue_cv.notify_one(); // wake reader if it was waiting
-
-                            for (const auto& item : block) {
-                                if (item.type() == osmium::item_type::node) {
-                                    const auto& node = static_cast<const osmium::Node&>(item);
-                                    if (!node.location().valid()) continue;
-                                    loc_batch.push_back({node.positive_id(), node.location()});
-
-                                    const char* housenumber = node.tags()["addr:housenumber"];
-                                    if (housenumber) {
-                                        const char* street = node.tags()["addr:street"];
-                                        if (street) {
-                                            local.addr_coords.push_back({node.location().lat(), node.location().lon()});
-                                            local.addr_strings.push_back({housenumber, street});
-                                            local.count++;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Flush location batch (sharded index handles its own locking)
-                            if (!loc_batch.empty()) {
-                                index.set_batch(loc_batch);
-                                loc_batch.clear();
-                            }
-
-                            uint64_t n = blocks_done.fetch_add(1) + 1;
-                            if (n % 1000 == 0) {
-                                std::cerr << "  Processed " << n << " node blocks..." << std::endl;
-                            }
+                pbf.read_blocks([&](PbfBlock&& block, unsigned t) {
+                    auto& local = ntld[t];
+                    for (auto& node : block.nodes) {
+                        // Store location in dense index (lockless — unique ID per slot)
+                        if (node.id > 0) {
+                            index.set(static_cast<uint64_t>(node.id), node.lat, node.lng);
                         }
 
-                        // Flush remaining
-                        if (!loc_batch.empty()) {
-                            index.set_batch(loc_batch);
+                        const char* housenumber = node.tag("addr:housenumber");
+                        if (housenumber) {
+                            const char* street = node.tag("addr:street");
+                            if (street) {
+                                local.addr_coords.push_back({node.lat, node.lng});
+                                local.addr_strings.push_back({housenumber, street});
+                                local.count++;
+                            }
                         }
-                    });
-                }
-
-                // Single reader for all entity types — processes nodes first,
-                // then transitions to way processing when first way block arrives.
-                osmium::io::Reader combined_reader{input_file};
-                bool nodes_done = false;
-                osmium::memory::Buffer first_way_buf; // stash the first way block
-
-                // Phase 1: Feed node blocks to node workers
-                while (auto buf = combined_reader.read()) {
-                    // Check if this buffer contains nodes or ways/relations
-                    bool has_node = false;
-                    for (const auto& item : buf) {
-                        if (item.type() == osmium::item_type::node) { has_node = true; break; }
                     }
-
-                    if (has_node) {
-                        std::unique_lock<std::mutex> lock(queue_mutex);
-                        queue_cv.wait(lock, [&]{ return block_queue.size() < MAX_QUEUE; });
-                        block_queue.push_back(std::move(buf));
-                        queue_cv.notify_one();
-                    } else {
-                        // First non-node block — stash it and transition
-                        first_way_buf = std::move(buf);
-                        nodes_done = true;
-                        break;
-                    }
-                }
-
-                // Signal node workers done
-                {
-                    std::lock_guard<std::mutex> lock(queue_mutex);
-                    reader_done = true;
-                }
-                queue_cv.notify_all();
-                for (auto& w : node_workers) w.join();
+                }, "n");
 
                 // Merge address points
                 uint64_t total_addrs = 0;
@@ -399,11 +365,12 @@ int main(int argc, char* argv[]) {
                 }
                 std::cerr << "  Node processing complete: " << total_addrs
                           << " address points collected." << std::endl;
-                log_phase("Pass 2: node processing", _pt, _cpu);
-                std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
+            }
+            log_phase("Pass 2: node processing", _pt, _cpu);
 
-                // --- Phase 2: Way processing using same reader ---
-
+            // --- Pass 2b: Way processing (fully parallel) ---
+            std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
+            {
                 // Thread-local data for parallel way processing
                 struct ThreadLocalData {
                     std::vector<WayHeader> ways;
@@ -438,194 +405,163 @@ int main(int argc, char* argv[]) {
                     std::vector<ClosedWayAdmin> closed_way_admins;
                 };
 
-                // Read buffers and dispatch to thread pool
-                // Streaming producer-consumer for way blocks
-                std::mutex way_queue_mutex;
-                std::condition_variable way_queue_cv;
-                std::deque<osmium::memory::Buffer> way_block_queue;
-                bool way_reader_done = false;
-                const size_t WAY_MAX_QUEUE = MAX_BLOCK_QUEUE;
-
                 std::vector<ThreadLocalData> tld(num_threads);
-                std::atomic<uint64_t> way_blocks_done{0};
 
-                std::vector<std::thread> workers;
-                for (unsigned int t = 0; t < num_threads; t++) {
-                    workers.emplace_back([&, t]() {
-                        auto& local = tld[t];
-                        while (true) {
-                            osmium::memory::Buffer block;
-                            {
-                                std::unique_lock<std::mutex> lock(way_queue_mutex);
-                                way_queue_cv.wait(lock, [&]{ return !way_block_queue.empty() || way_reader_done; });
-                                if (way_block_queue.empty() && way_reader_done) break;
-                                block = std::move(way_block_queue.front());
-                                way_block_queue.pop_front();
+                pbf.read_blocks([&](PbfBlock&& block, unsigned t) {
+                    auto& local = tld[t];
+                    for (auto& way : block.ways) {
+                        const auto& refs = way.node_refs;
+
+                        // Pre-resolve all node locations in one pass
+                        thread_local std::vector<PackedLocation> resolved_locs;
+                        resolved_locs.clear();
+                        resolved_locs.reserve(refs.size());
+                        bool all_valid = true;
+                        for (int64_t ref : refs) {
+                            auto loc = index.get(static_cast<uint64_t>(ref));
+                            resolved_locs.push_back(loc);
+                            if (!loc.valid()) all_valid = false;
+                        }
+
+                        // Address interpolation
+                        const char* interpolation = way.tag("addr:interpolation");
+                        if (interpolation) {
+                            if (refs.size() >= 2 && all_valid) {
+                                const char* street = way.tag("addr:street");
+                                if (street) {
+                                    uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
+                                    uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
+
+                                    for (const auto& loc : resolved_locs) {
+                                        local.interp_nodes.push_back({
+                                            static_cast<float>(loc.lat()),
+                                            static_cast<float>(loc.lon())
+                                        });
+                                    }
+
+                                    uint8_t interp_type = 0;
+                                    if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
+                                    else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
+
+                                    InterpWay iw{};
+                                    iw.node_offset = node_offset;
+                                    iw.node_count = static_cast<uint8_t>(std::min(refs.size(), size_t(255)));
+                                    iw.street_id = 0;
+                                    iw.start_number = 0;
+                                    iw.end_number = 0;
+                                    iw.interpolation = interp_type;
+                                    local.interp_ways.push_back(iw);
+                                    local.interp_strings.push_back(street);
+                                    local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
+                                    local.interp_count++;
+                                }
                             }
-                            way_queue_cv.notify_one();
+                            return; // continue to next way
+                        }
 
-                            for (const auto& item : block) {
-                                if (item.type() == osmium::item_type::way) {
-                                    const auto& way = static_cast<const osmium::Way&>(item);
-                                    const auto& wnodes = way.nodes();
-
-                                    // Pre-resolve all node locations in one pass
-                                    thread_local std::vector<osmium::Location> resolved_locs;
-                                    resolved_locs.clear();
-                                    resolved_locs.reserve(wnodes.size());
-                                    bool all_valid = true;
-                                    for (const auto& nr : wnodes) {
-                                        auto loc = index.get(nr.positive_ref());
-                                        resolved_locs.push_back(loc);
-                                        if (!loc.valid()) all_valid = false;
+                        // Building addresses
+                        const char* housenumber = way.tag("addr:housenumber");
+                        if (housenumber) {
+                            const char* street = way.tag("addr:street");
+                            if (street && !refs.empty()) {
+                                double sum_lat = 0, sum_lng = 0;
+                                int valid = 0;
+                                for (const auto& loc : resolved_locs) {
+                                    if (loc.valid()) {
+                                        sum_lat += loc.lat();
+                                        sum_lng += loc.lon();
+                                        valid++;
                                     }
+                                }
+                                if (valid > 0) {
+                                    local.building_addr_coords.push_back({sum_lat / valid, sum_lng / valid});
+                                    local.building_addrs.push_back({
+                                        static_cast<float>(sum_lat / valid),
+                                        static_cast<float>(sum_lng / valid),
+                                        0, 0
+                                    });
+                                    local.addr_strings.push_back({housenumber, street});
+                                    local.building_addr_count++;
+                                }
+                            }
+                        }
 
-                                    // Address interpolation
-                                    const char* interpolation = way.tags()["addr:interpolation"];
-                                    if (interpolation) {
-                                        if (wnodes.size() >= 2 && all_valid) {
-                                            const char* street = way.tags()["addr:street"];
-                                            if (street) {
-                                                uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
-                                                uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
+                        // Highway ways
+                        const char* highway = way.tag("highway");
+                        if (highway && is_included_highway(highway)) {
+                            const char* name = way.tag("name");
+                            if (name && refs.size() >= 2 && all_valid) {
+                                uint32_t way_id = static_cast<uint32_t>(local.ways.size());
+                                uint32_t node_offset = static_cast<uint32_t>(local.street_nodes.size());
 
-                                                for (const auto& loc : resolved_locs) {
-                                                    local.interp_nodes.push_back({
-                                                        static_cast<float>(loc.lat()),
-                                                        static_cast<float>(loc.lon())
-                                                    });
-                                                }
+                                for (const auto& loc : resolved_locs) {
+                                    local.street_nodes.push_back({
+                                        static_cast<float>(loc.lat()),
+                                        static_cast<float>(loc.lon())
+                                    });
+                                }
 
-                                                uint8_t interp_type = 0;
-                                                if (std::strcmp(interpolation, "even") == 0) interp_type = 1;
-                                                else if (std::strcmp(interpolation, "odd") == 0) interp_type = 2;
+                                WayHeader header{};
+                                header.node_offset = node_offset;
+                                header.node_count = static_cast<uint8_t>(std::min(refs.size(), size_t(255)));
+                                header.name_id = 0;
+                                local.ways.push_back(header);
+                                local.way_strings.push_back(name);
+                                local.deferred_ways.push_back({way_id, node_offset, header.node_count});
+                                local.way_count++;
+                            }
+                        }
 
-                                                InterpWay iw{};
-                                                iw.node_offset = node_offset;
-                                                iw.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-                                                iw.street_id = 0;
-                                                iw.start_number = 0;
-                                                iw.end_number = 0;
-                                                iw.interpolation = interp_type;
-                                                local.interp_ways.push_back(iw);
-                                                local.interp_strings.push_back(street);
-                                                local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
-                                                local.interp_count++;
-                                            }
-                                        }
-                                        continue;
-                                    }
-
-                                    // Building addresses
-                                    const char* housenumber = way.tags()["addr:housenumber"];
-                                    if (housenumber) {
-                                        const char* street = way.tags()["addr:street"];
-                                        if (street && !wnodes.empty()) {
-                                            double sum_lat = 0, sum_lng = 0;
-                                            int valid = 0;
-                                            for (const auto& loc : resolved_locs) {
-                                                if (loc.valid()) {
-                                                    sum_lat += loc.lat();
-                                                    sum_lng += loc.lon();
-                                                    valid++;
-                                                }
-                                            }
-                                            if (valid > 0) {
-                                                local.building_addr_coords.push_back({sum_lat / valid, sum_lng / valid});
-                                                local.building_addrs.push_back({
-                                                    static_cast<float>(sum_lat / valid),
-                                                    static_cast<float>(sum_lng / valid),
-                                                    0, 0
-                                                });
-                                                local.addr_strings.push_back({housenumber, street});
-                                                local.building_addr_count++;
-                                            }
-                                        }
-                                    }
-
-                                    // Highway ways (single pass using pre-resolved locations)
-                                    const char* highway = way.tags()["highway"];
-                                    if (highway && is_included_highway(highway)) {
-                                        const char* name = way.tags()["name"];
-                                        if (name && wnodes.size() >= 2 && all_valid) {
-                                            uint32_t way_id = static_cast<uint32_t>(local.ways.size());
-                                            uint32_t node_offset = static_cast<uint32_t>(local.street_nodes.size());
-
-                                            for (const auto& loc : resolved_locs) {
-                                                local.street_nodes.push_back({
-                                                    static_cast<float>(loc.lat()),
-                                                    static_cast<float>(loc.lon())
-                                                });
-                                            }
-
-                                            WayHeader header{};
-                                            header.node_offset = node_offset;
-                                            header.node_count = static_cast<uint8_t>(std::min(wnodes.size(), size_t(255)));
-                                            header.name_id = 0;
-                                            local.ways.push_back(header);
-                                            local.way_strings.push_back(name);
-                                            local.deferred_ways.push_back({way_id, node_offset, header.node_count});
-                                            local.way_count++;
-                                        }
-                                    }
-
-                                    // Store way geometry only for admin boundary member ways
-                                    if (!wnodes.empty() && admin_way_ids.count(way.id())) {
-                                        std::vector<std::pair<double,double>> geom;
-                                        for (const auto& loc : resolved_locs) {
-                                            if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
-                                        }
-                                        if (!geom.empty()) {
-                                            int64_t first_nid = wnodes.front().positive_ref();
-                                            int64_t last_nid = wnodes.back().positive_ref();
-                                            local.way_geoms.push_back({way.id(), std::move(geom), first_nid, last_nid});
-                                        }
+                        // Store way geometry only for admin boundary member ways
+                        if (!refs.empty() && admin_way_ids.count(way.id)) {
+                            std::vector<std::pair<double,double>> geom;
+                            for (const auto& loc : resolved_locs) {
+                                if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
+                            }
+                            if (!geom.empty()) {
+                                int64_t first_nid = refs.front();
+                                int64_t last_nid = refs.back();
+                                local.way_geoms.push_back({way.id, std::move(geom), first_nid, last_nid});
+                            }
                                     }
 
                                     // Handle closed ways that are admin boundaries themselves
-                                    // Osmium creates areas from closed ways independently of
-                                    // multipolygon relations, even if the way is a relation member.
                                     {
-                                        const char* boundary = way.tags()["boundary"];
+                                        const char* boundary = way.tag("boundary");
                                         if (boundary) {
                                             bool is_admin = (std::strcmp(boundary, "administrative") == 0);
                                             bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
-                                            if ((is_admin || is_postal) && wnodes.size() >= 4 &&
-                                                wnodes.front().ref() == wnodes.back().ref()) {
-                                                // Closed way forming an admin polygon
+                                            if ((is_admin || is_postal) && refs.size() >= 4 &&
+                                                refs.front() == refs.back()) {
                                                 uint8_t al = 0;
                                                 if (is_admin) {
-                                                    const char* level_str = way.tags()["admin_level"];
+                                                    const char* level_str = way.tag("admin_level");
                                                     if (level_str) al = static_cast<uint8_t>(std::atoi(level_str));
                                                 } else {
                                                     al = 11;
                                                 }
                                                 int max_al = is_postal ? 11 : 10;
                                                 if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
-                                                    const char* aname = way.tags()["name"];
-                                                    if (!aname && is_admin) continue; // admin needs name
-                                                    std::string name_str;
-                                                    if (is_postal) {
-                                                        const char* pc = way.tags()["postal_code"];
-                                                        if (!pc) pc = aname;
-                                                        if (!pc) continue; // postal needs postal_code or name
-                                                        name_str = pc;
-                                                    } else {
-                                                        name_str = aname;
-                                                    }
-                                                    {
-                                                        std::vector<std::pair<double,double>> verts;
-                                                        bool all_valid = true;
-                                                        for (const auto& nr : wnodes) {
-                                                            auto loc = index.get(nr.positive_ref());
-                                                            if (loc.valid()) {
-                                                                verts.push_back({loc.lat(), loc.lon()});
-                                                            } else { all_valid = false; break; }
+                                                    const char* aname = way.tag("name");
+                                                    if (!aname && is_admin) {} // admin needs name — skip
+                                                    else {
+                                                        std::string name_str;
+                                                        if (is_postal) {
+                                                            const char* pc = way.tag("postal_code");
+                                                            if (!pc) pc = aname;
+                                                            if (!pc) {} // postal needs code or name
+                                                            else name_str = pc;
+                                                        } else {
+                                                            name_str = aname;
                                                         }
-                                                        if (all_valid && verts.size() >= 3) {
+                                                        if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
+                                                            std::vector<std::pair<double,double>> verts;
+                                                            for (const auto& loc : resolved_locs) {
+                                                                verts.push_back({loc.lat(), loc.lon()});
+                                                            }
                                                             std::string cc;
                                                             if (al == 2) {
-                                                                const char* iso = way.tags()["ISO3166-1:alpha2"];
+                                                                const char* iso = way.tag("ISO3166-1:alpha2");
                                                                 if (iso) cc = iso;
                                                             }
                                                             local.closed_way_admins.push_back({
@@ -639,44 +575,8 @@ int main(int argc, char* argv[]) {
                                             }
                                         }
                                     }
-                                }
-                            }
-
-                            uint64_t done = way_blocks_done.fetch_add(1) + 1;
-                            if (done % 1000 == 0) {
-                                std::cerr << "  Processed " << done << " way blocks..." << std::endl;
-                            }
-                        }
-                    });
-                }
-
-                // Way reader: use the combined_reader (continuing from where nodes left off)
-                {
-                    // First, push the stashed way buffer
-                    if (first_way_buf) {
-                        std::unique_lock<std::mutex> lock(way_queue_mutex);
-                        way_queue_cv.wait(lock, [&]{ return way_block_queue.size() < WAY_MAX_QUEUE; });
-                        way_block_queue.push_back(std::move(first_way_buf));
-                        way_queue_cv.notify_one();
-                    }
-                    // Continue reading remaining blocks from the same reader
-                    while (auto buf = combined_reader.read()) {
-                        {
-                            std::unique_lock<std::mutex> lock(way_queue_mutex);
-                            way_queue_cv.wait(lock, [&]{ return way_block_queue.size() < WAY_MAX_QUEUE; });
-                            way_block_queue.push_back(std::move(buf));
-                        }
-                        way_queue_cv.notify_one();
-                    }
-                    combined_reader.close();
-                    {
-                        std::lock_guard<std::mutex> lock(way_queue_mutex);
-                        way_reader_done = true;
-                    }
-                    way_queue_cv.notify_all();
-                }
-
-                for (auto& w : workers) w.join();
+                    }  // end for (auto& way : block.ways)
+                }, "w");
                 std::cerr << "  Parallel way processing complete." << std::endl;
 
                 // Process areas/multipolygons — sequential fallback path

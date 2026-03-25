@@ -13,6 +13,7 @@ find_package(s2 QUIET)
 
 add_executable(build-index
     src/build_index.cpp
+    src/pbf_reader.cpp
     src/s2_helpers.cpp
     src/ring_assembly.cpp
     src/cache.cpp
