@@ -11,3 +11,10 @@ extern const ContinentBBox kContinents[];
 extern const size_t kContinentCount;
 
 ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox);
+
+// Fast version using precomputed continent bitmasks (avoids cell_in_bbox per cell)
+ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bbox,
+    uint8_t continent_bit,
+    const std::vector<uint8_t>& way_masks,
+    const std::vector<uint8_t>& addr_masks,
+    const std::vector<uint8_t>& interp_masks);

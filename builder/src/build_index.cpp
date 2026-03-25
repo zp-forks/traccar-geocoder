@@ -1350,6 +1350,67 @@ int main(int argc, char* argv[]) {
 
     // Process continents with bounded concurrency, largest first.
     if (generate_continents) {
+        // Pre-compute continent membership for each unique cell in sorted pairs.
+        // One parallel scan replaces 8 × cell_in_bbox per cell during filtering.
+        auto _pct = std::chrono::steady_clock::now();
+        auto _pcc = CpuTicks::now();
+
+        // For each sorted pair array, build a parallel array of continent bitmasks.
+        // Since pairs are sorted by cell_id, consecutive entries share the same mask.
+        auto precompute_masks = [](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
+            if (sorted.empty()) return {};
+            std::vector<uint8_t> masks(sorted.size(), 0);
+
+            unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
+            size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
+            std::vector<size_t> bounds = {0};
+            for (unsigned t = 1; t < nthreads; t++) {
+                size_t target = t * chunk;
+                if (target >= sorted.size()) break;
+                while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id)
+                    target++;
+                if (target < sorted.size()) bounds.push_back(target);
+            }
+            bounds.push_back(sorted.size());
+
+            std::vector<std::thread> threads;
+            for (size_t th = 0; th + 1 < bounds.size(); th++) {
+                threads.emplace_back([&, th]() {
+                    for (size_t i = bounds[th]; i < bounds[th+1]; ) {
+                        uint64_t cell_id = sorted[i].cell_id;
+                        // Test against all 8 continents
+                        S2CellId cell(cell_id);
+                        S2LatLng center = cell.ToLatLng();
+                        double lat = center.lat().degrees();
+                        double lng = center.lng().degrees();
+                        uint8_t mask = 0;
+                        for (size_t ci = 0; ci < kContinentCount; ci++) {
+                            if (lat >= kContinents[ci].min_lat && lat <= kContinents[ci].max_lat &&
+                                lng >= kContinents[ci].min_lng && lng <= kContinents[ci].max_lng)
+                                mask |= (1u << ci);
+                        }
+                        // Fill mask for all entries with this cell_id
+                        while (i < bounds[th+1] && sorted[i].cell_id == cell_id) {
+                            masks[i] = mask;
+                            i++;
+                        }
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+            return masks;
+        };
+
+        // Precompute for all three sorted pair arrays
+        auto way_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_way_cells); });
+        auto addr_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_addr_cells); });
+        auto interp_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_interp_cells); });
+        auto way_continent_masks = way_masks.get();
+        auto addr_continent_masks = addr_masks.get();
+        auto interp_continent_masks = interp_masks.get();
+
+        log_phase("Pre-compute continent masks", _pct, _pcc);
+
         // Sort by bbox area descending — largest continents first
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
@@ -1382,7 +1443,9 @@ int main(int argc, char* argv[]) {
                 auto _ct = std::chrono::steady_clock::now();
                 auto _cc = CpuTicks::now();
                 std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
-                auto subset = filter_by_bbox(data, continent);
+                uint8_t cbit = 1u << continent_order[i];
+                auto subset = filter_by_bbox_masked(data, continent, cbit,
+                    way_continent_masks, addr_continent_masks, interp_continent_masks);
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
                 write_region(subset, output_dir + "/" + continent.name);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
