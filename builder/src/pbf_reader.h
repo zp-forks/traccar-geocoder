@@ -5,8 +5,10 @@
 // to a thread pool with zero sequential bottleneck.
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // --- Raw PBF data structures ---

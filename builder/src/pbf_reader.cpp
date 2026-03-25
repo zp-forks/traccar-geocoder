@@ -13,6 +13,7 @@
 #include <zlib.h>
 
 #include <protozero/pbf_reader.hpp>
+#include <protozero/varint.hpp>
 
 // --- PBF file format constants ---
 // BlobHeader max size: 32 MiB (per spec), but typically <100 bytes
@@ -471,38 +472,55 @@ void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
             switch (group.tag()) {
                 case PrimitiveGroupTag::DENSE: {
                     protozero::pbf_reader dense = group.get_message();
-                    std::vector<int64_t> ids_vec, lats_vec, lons_vec;
-                    std::vector<int32_t> kv_vec;
+                    // Save raw data views — iterate in lockstep without intermediate vectors
+                    protozero::data_view ids_data, lats_data, lons_data, kv_data;
                     while (dense.next()) {
                         switch (dense.tag()) {
-                            case DenseNodesTag::ID: for (auto v : dense.get_packed_sint64()) ids_vec.push_back(v); break;
-                            case DenseNodesTag::LAT: for (auto v : dense.get_packed_sint64()) lats_vec.push_back(v); break;
-                            case DenseNodesTag::LON: for (auto v : dense.get_packed_sint64()) lons_vec.push_back(v); break;
-                            case DenseNodesTag::KEYS_VALS: for (auto v : dense.get_packed_int32()) kv_vec.push_back(v); break;
+                            case DenseNodesTag::ID: ids_data = dense.get_view(); break;
+                            case DenseNodesTag::LAT: lats_data = dense.get_view(); break;
+                            case DenseNodesTag::LON: lons_data = dense.get_view(); break;
+                            case DenseNodesTag::KEYS_VALS: kv_data = dense.get_view(); break;
                             default: dense.skip();
                         }
                     }
+
+                    // Raw varint pointers for zero-copy iteration
+                    const char* id_ptr = ids_data.data();
+                    const char* id_end = id_ptr + ids_data.size();
+                    const char* lat_ptr = lats_data.data();
+                    const char* lat_end = lat_ptr + lats_data.size();
+                    const char* lon_ptr = lons_data.data();
+                    const char* lon_end = lon_ptr + lons_data.size();
+                    const char* kv_ptr = kv_data.data();
+                    const char* kv_end = kv_ptr + kv_data.size();
+
                     int64_t id = 0, lat = 0, lon = 0;
-                    size_t kv_pos = 0;
-                    for (size_t i = 0; i < ids_vec.size(); i++) {
-                        id += ids_vec[i];
-                        lat += (i < lats_vec.size()) ? lats_vec[i] : 0;
-                        lon += (i < lons_vec.size()) ? lons_vec[i] : 0;
+
+                    while (id_ptr < id_end) {
+                        id += protozero::decode_zigzag64(protozero::decode_varint(&id_ptr, id_end));
+                        lat += protozero::decode_zigzag64(protozero::decode_varint(&lat_ptr, lat_end));
+                        lon += protozero::decode_zigzag64(protozero::decode_varint(&lon_ptr, lon_end));
+
                         PbfNode node;
                         node.id = id;
                         node.lat = 0.000000001 * (lat_offset + (int64_t)granularity * lat);
                         node.lng = 0.000000001 * (lon_offset + (int64_t)granularity * lon);
-                        if (kv_pos < kv_vec.size() && kv_vec[kv_pos] != 0) {
-                            node.tags.string_table = st_ptr;
-                            while (kv_pos < kv_vec.size()) {
-                                int32_t key_idx = kv_vec[kv_pos++];
-                                if (key_idx == 0) break;
-                                int32_t val_idx = (kv_pos < kv_vec.size()) ? kv_vec[kv_pos++] : 0;
-                                node.tags.indices.emplace_back(key_idx, val_idx);
+
+                        // Parse tags (kv pairs terminated by 0)
+                        if (kv_ptr < kv_end) {
+                            uint32_t key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
+                            if (key_idx != 0) {
+                                node.tags.string_table = st_ptr;
+                                do {
+                                    uint32_t val_idx = (kv_ptr < kv_end)
+                                        ? static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end)) : 0;
+                                    node.tags.indices.emplace_back(key_idx, val_idx);
+                                    if (kv_ptr >= kv_end) break;
+                                    key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
+                                } while (key_idx != 0);
                             }
-                        } else {
-                            if (kv_pos < kv_vec.size()) kv_pos++;
                         }
+
                         block.nodes.push_back(std::move(node));
                     }
                     break;
@@ -801,27 +819,45 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
     std::atomic<size_t> blocks_done{0};
     std::vector<std::thread> threads;
 
+    // Per-thread timing accumulators
+    struct ThreadStats {
+        double read_us = 0, decode_us = 0, callback_us = 0;
+        size_t count = 0;
+    };
+    std::vector<ThreadStats> stats(num_threads_);
+
     for (unsigned t = 0; t < num_threads_; t++) {
         threads.emplace_back([&, t]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
             if (local_fd < 0) return;
 
-            PbfBlock block;       // reused across iterations
-            std::string decomp;   // reused decompression buffer
+            PbfBlock block;
+            std::string decomp;
+            auto& st = stats[t];
 
             while (true) {
                 size_t j = next_idx.fetch_add(1);
                 if (j >= indices.size()) break;
 
+                auto t0 = std::chrono::steady_clock::now();
                 size_t blob_idx = indices[j];
                 decomp = read_and_decompress_blob(local_fd, blobs_[blob_idx]);
+                auto t1 = std::chrono::steady_clock::now();
+
                 decode_pbf_blob_into(decomp.data(), decomp.size(), block);
+                auto t2 = std::chrono::steady_clock::now();
 
                 if (!want_nodes) block.nodes.clear();
                 if (!want_ways) block.ways.clear();
                 if (!want_rels) block.relations.clear();
 
                 callback(block, t);
+                auto t3 = std::chrono::steady_clock::now();
+
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.callback_us += std::chrono::duration<double, std::micro>(t3 - t2).count();
+                st.count++;
 
                 size_t done = blocks_done.fetch_add(1) + 1;
                 if (done % 1000 == 0) {
@@ -832,6 +868,29 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
             close(local_fd);
         });
     }
+
+    for (auto& t : threads) t.join();
+
+    // Report timing breakdown
+    double total_read = 0, total_decode = 0, total_callback = 0;
+    size_t total_blocks = 0;
+    for (auto& s : stats) {
+        total_read += s.read_us;
+        total_decode += s.decode_us;
+        total_callback += s.callback_us;
+        total_blocks += s.count;
+    }
+    std::cerr << "  Block timing (" << total_blocks << " blocks, " << num_threads_ << " threads): "
+              << "read=" << (total_read/1e6) << "s decode=" << (total_decode/1e6)
+              << "s callback=" << (total_callback/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
+              << "s decode=" << (total_decode/1e6/num_threads_)
+              << "s callback=" << (total_callback/1e6/num_threads_) << "s)"
+              << std::endl;
+
+    // Skip the duplicate join below
+    threads.clear();
+    return;
 
     for (auto& t : threads) t.join();
 }
