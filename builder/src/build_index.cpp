@@ -236,12 +236,6 @@ int main(int argc, char* argv[]) {
                 return data[id];
             }
 
-            void prefetch(osmium::unsigned_object_id_type id) const {
-                if (id < capacity) {
-                    __builtin_prefetch(&data[id], 0, 0); // read, no temporal locality
-                }
-            }
-
             void set_batch(const std::vector<std::pair<osmium::unsigned_object_id_type, osmium::Location>>& batch) {
                 for (const auto& [id, loc] : batch) {
                     if (id >= capacity) {
@@ -475,13 +469,7 @@ int main(int argc, char* argv[]) {
                                     const auto& way = static_cast<const osmium::Way&>(item);
                                     const auto& wnodes = way.nodes();
 
-                                    // Prefetch all node locations from dense index.
-                                    // Hides ~100ns memory latency per TLB miss across 111 GiB mmap.
-                                    for (const auto& nr : wnodes) {
-                                        index.prefetch(nr.positive_ref());
-                                    }
-
-                                    // Pre-resolve all node locations in one pass (from prefetched cache)
+                                    // Pre-resolve all node locations in one pass
                                     thread_local std::vector<osmium::Location> resolved_locs;
                                     resolved_locs.clear();
                                     resolved_locs.reserve(wnodes.size());
