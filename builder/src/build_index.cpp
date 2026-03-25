@@ -250,7 +250,7 @@ int main(int argc, char* argv[]) {
 
             {
                 std::mutex rel_mutex;
-                pbf.read_blocks([&](PbfBlock&& block, unsigned) {
+                pbf.read_blocks([&](PbfBlock& block, unsigned) {
                     for (auto& rel : block.relations) {
                         const char* boundary = rel.tag("boundary");
                         if (!boundary) continue;
@@ -332,7 +332,7 @@ int main(int argc, char* argv[]) {
                 };
                 std::vector<NodeThreadLocal> ntld(num_threads);
 
-                pbf.read_blocks([&](PbfBlock&& block, unsigned t) {
+                pbf.read_blocks([&](PbfBlock& block, unsigned t) {
                     auto& local = ntld[t];
                     for (auto& node : block.nodes) {
                         if (node.id > 0) {
@@ -406,7 +406,7 @@ int main(int argc, char* argv[]) {
 
                 std::vector<ThreadLocalData> tld(num_threads);
 
-                pbf.read_blocks([&](PbfBlock&& block, unsigned t) {
+                pbf.read_blocks([&](PbfBlock& block, unsigned t) {
                     auto& local = tld[t];
                     for (auto& way : block.ways) {
                         const auto& refs = way.node_refs;

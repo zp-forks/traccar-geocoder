@@ -90,8 +90,10 @@ struct BlobInfo {
 std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename);
 
 // Decode a single blob from raw file data into a PbfBlock.
-// `blob_data` is the raw bytes of the Blob message (after the BlobHeader).
 PbfBlock decode_pbf_blob(const char* blob_data, size_t blob_size);
+
+// Decode into existing block (reuses vector capacity, avoids reallocation).
+void decode_pbf_blob_into(const char* blob_data, size_t blob_size, PbfBlock& block);
 
 // Read and decompress a single blob from file.
 // Returns the decompressed PrimitiveBlock data.
@@ -102,7 +104,7 @@ std::string read_and_decompress_blob(int fd, const BlobInfo& info);
 // `num_threads` controls parallelism (0 = hardware_concurrency).
 // `entity_filter` controls which entity types to parse: 'n' = nodes, 'w' = ways, 'r' = relations
 void read_pbf_parallel(const std::string& filename,
-                       std::function<void(PbfBlock&&, size_t block_index)> callback,
+                       std::function<void(PbfBlock&, size_t block_index)> callback,
                        unsigned num_threads = 0,
                        const std::string& entity_filter = "nwr");
 
@@ -117,7 +119,9 @@ public:
     // The callback must be thread-safe OR use the thread_index for thread-local storage.
     // If ordered=true: decompresses in parallel but calls callback in file order
     // (useful for nodes where sequential ID locality matters for mmap performance).
-    void read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> callback,
+    // Callback receives a reference — block is reused across iterations.
+    // Do NOT move from the block; it will be overwritten on next decode.
+    void read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback,
                      const std::string& entity_filter = "nwr",
                      bool ordered = false);
 
