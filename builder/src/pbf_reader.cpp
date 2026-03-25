@@ -570,6 +570,76 @@ void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& c
     }
 }
 
+void decode_ways_streaming(const char* data, size_t size, const WayCallback& callback) {
+    std::vector<std::string> string_table;
+    int32_t granularity = 100;
+    int64_t lat_offset = 0, lon_offset = 0;
+
+    // Reusable per-way buffers
+    thread_local std::vector<int64_t> refs;
+    thread_local std::vector<uint32_t> keys, vals;
+
+    protozero::pbf_reader pb(data, size);
+    while (pb.next()) {
+        switch (pb.tag()) {
+            case PrimitiveBlockTag::STRINGTABLE: {
+                protozero::pbf_reader st = pb.get_message();
+                while (st.next()) {
+                    if (st.tag() == StringTableTag::S) {
+                        auto view = st.get_view();
+                        string_table.emplace_back(view.data(), view.size());
+                    } else { st.skip(); }
+                }
+                break;
+            }
+            case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
+            case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::PRIMITIVEGROUP: {
+                protozero::pbf_reader group = pb.get_message();
+                while (group.next()) {
+                    if (group.tag() == PrimitiveGroupTag::WAYS) {
+                        protozero::pbf_reader way_msg = group.get_message();
+                        int64_t way_id = 0;
+                        refs.clear();
+                        keys.clear();
+                        vals.clear();
+
+                        while (way_msg.next()) {
+                            switch (way_msg.tag()) {
+                                case WayTag::ID: way_id = way_msg.get_int64(); break;
+                                case WayTag::KEYS:
+                                    for (auto v : way_msg.get_packed_uint32()) keys.push_back(v);
+                                    break;
+                                case WayTag::VALS:
+                                    for (auto v : way_msg.get_packed_uint32()) vals.push_back(v);
+                                    break;
+                                case WayTag::REFS: {
+                                    int64_t ref = 0;
+                                    for (auto delta : way_msg.get_packed_sint64()) {
+                                        ref += delta;
+                                        refs.push_back(ref);
+                                    }
+                                    break;
+                                }
+                                default: way_msg.skip();
+                            }
+                        }
+
+                        size_t ntags = std::min(keys.size(), vals.size());
+                        callback(way_id, refs.data(), refs.size(),
+                                 keys.data(), vals.data(), ntags, string_table);
+                    } else {
+                        group.skip();
+                    }
+                }
+                break;
+            }
+            default: pb.skip();
+        }
+    }
+}
+
 void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
     // Clear vectors but keep capacity for reuse
     block.string_table.clear();
@@ -836,6 +906,31 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
                 size_t done = blocks_done.fetch_add(1) + 1;
                 if (done % 1000 == 0)
                     std::cerr << "  Processed " << done << "/" << node_blobs_.size() << " node blocks..." << std::endl;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+}
+
+void PbfFile::read_ways_streaming(const WayCallback& callback) {
+    classify_blobs();
+    if (way_blobs_.empty()) return;
+
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::vector<std::thread> threads;
+
+    for (unsigned t = 0; t < num_threads_; t++) {
+        threads.emplace_back([&]() {
+            std::string decomp;
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= way_blobs_.size()) break;
+                decompress_blob_from_mmap(file_data_, blobs_[way_blobs_[j]], decomp);
+                decode_ways_streaming(decomp.data(), decomp.size(), callback);
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 1000 == 0)
+                    std::cerr << "  Processed " << done << "/" << way_blobs_.size() << " way blocks..." << std::endl;
             }
         });
     }
