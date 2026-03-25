@@ -173,11 +173,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Increase osmium queue sizes for better PBF pipeline throughput.
-    // Default output queue is 20 slots — too small for 30 pool threads.
-    setenv("OSMIUM_MAX_OSMDATA_QUEUE_SIZE", "200", 0);  // decoded buffer queue
-    setenv("OSMIUM_MAX_WORK_QUEUE_SIZE", "200", 0);     // pool work queue
-
     ParsedData data;
     auto _pt = std::chrono::steady_clock::now();
     auto _cpu = CpuTicks::now();
