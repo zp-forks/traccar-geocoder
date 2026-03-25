@@ -456,7 +456,7 @@ int main(int argc, char* argv[]) {
                                     local.interp_count++;
                                 }
                             }
-                            return; // continue to next way
+                            continue; // next way in block
                         }
 
                         // Building addresses
