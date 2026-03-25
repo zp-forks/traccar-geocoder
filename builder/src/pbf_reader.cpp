@@ -582,14 +582,14 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> c
 
     if (ordered) {
         // Ordered mode: decompress in parallel, process in file order.
-        // Pipeline: N decompressor threads fill a ring buffer, main thread
-        // consumes in order.
-        const size_t WINDOW = num_threads_ * 2; // look-ahead window
-        std::vector<std::string> decompressed(indices.size());
-        std::vector<std::atomic<bool>> ready(indices.size());
-        for (auto& r : ready) r.store(false);
+        // Ring buffer of WINDOW slots — decompressors block when too far ahead.
+        const size_t WINDOW = num_threads_ * 4;
+        std::vector<std::string> ring(WINDOW);
+        std::vector<std::atomic<bool>> ring_ready(WINDOW);
+        for (auto& r : ring_ready) r.store(false);
 
         std::atomic<size_t> next_decompress{0};
+        std::atomic<size_t> consumed{0};
         std::vector<std::thread> decomp_threads;
 
         for (unsigned t = 0; t < num_threads_; t++) {
@@ -599,8 +599,13 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> c
                 while (true) {
                     size_t j = next_decompress.fetch_add(1);
                     if (j >= indices.size()) break;
-                    decompressed[j] = read_and_decompress_blob(local_fd, blobs_[indices[j]]);
-                    ready[j].store(true, std::memory_order_release);
+                    size_t slot = j % WINDOW;
+                    // Wait until this slot has been consumed
+                    while (ring_ready[slot].load(std::memory_order_acquire)) {
+                        std::this_thread::yield();
+                    }
+                    ring[slot] = read_and_decompress_blob(local_fd, blobs_[indices[j]]);
+                    ring_ready[slot].store(true, std::memory_order_release);
                 }
                 close(local_fd);
             });
@@ -608,14 +613,16 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&&, unsigned thread_idx)> c
 
         // Consume in order on main thread
         for (size_t j = 0; j < indices.size(); j++) {
-            // Spin-wait for this block to be ready
-            while (!ready[j].load(std::memory_order_acquire)) {
+            size_t slot = j % WINDOW;
+            while (!ring_ready[slot].load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
 
-            PbfBlock block = decode_pbf_blob(decompressed[j].data(), decompressed[j].size());
-            decompressed[j].clear(); // free memory
-            decompressed[j].shrink_to_fit();
+            PbfBlock block = decode_pbf_blob(ring[slot].data(), ring[slot].size());
+            ring[slot].clear();
+            ring[slot].shrink_to_fit();
+            ring_ready[slot].store(false, std::memory_order_release);
+            consumed.store(j + 1, std::memory_order_release);
 
             if (entity_filter.find('n') == std::string::npos) block.nodes.clear();
             if (entity_filter.find('w') == std::string::npos) block.ways.clear();
