@@ -930,121 +930,99 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
     }
 }
 
-// Producer-consumer streaming: N readers feed a queue, M workers process.
-// Adapts to I/O speed — readers saturate disk, workers stay CPU-busy.
-template<typename DecodeFn>
-static void stream_producer_consumer(
-    const std::string& filename,
-    const std::vector<BlobInfo>& blobs,
-    const std::vector<size_t>& data_indices,
-    unsigned num_threads,
-    DecodeFn decode_fn,
-    const char* label) {
-
-    if (data_indices.empty()) return;
-
-    // Split threads: readers handle I/O, workers handle CPU
-    unsigned num_readers = std::max(1u, std::min(num_threads / 4, 16u));
-    unsigned num_workers = std::max(1u, num_threads - num_readers);
-    size_t QUEUE_SIZE = num_workers * 2;  // bounded queue
-
-    std::cerr << "  " << label << ": " << num_readers << " readers, "
-              << num_workers << " workers, queue=" << QUEUE_SIZE << std::endl;
-
-    // Bounded queue of decompressed blobs
-    struct QueueItem {
-        std::string data;
-        bool valid = false;
-    };
-    std::vector<QueueItem> queue(QUEUE_SIZE);
-    std::vector<std::atomic<bool>> queue_ready(QUEUE_SIZE);
-    std::vector<std::atomic<bool>> queue_free(QUEUE_SIZE);
-    for (auto& r : queue_ready) r.store(false);
-    for (auto& f : queue_free) f.store(true);
-
-    std::atomic<size_t> next_read{0};
-    std::atomic<size_t> next_process{0};
-    std::atomic<bool> readers_done{false};
-    std::atomic<size_t> blocks_done{0};
-
-    // Reader threads: pread + inflate → queue
-    std::vector<std::thread> readers;
-    for (unsigned r = 0; r < num_readers; r++) {
-        readers.emplace_back([&]() {
-            int local_fd = open(filename.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
-            std::string blob_buf;
-            while (true) {
-                size_t j = next_read.fetch_add(1);
-                if (j >= data_indices.size()) break;
-                size_t slot = j % QUEUE_SIZE;
-                // Wait for slot to be free
-                while (!queue_free[slot].load(std::memory_order_acquire))
-                    std::this_thread::yield();
-                // Read + decompress into slot
-                queue[slot].data = read_and_decompress_blob(local_fd, blobs[data_indices[j]]);
-                queue[slot].valid = true;
-                queue_free[slot].store(false, std::memory_order_release);
-                queue_ready[slot].store(true, std::memory_order_release);
-            }
-            close(local_fd);
-        });
-    }
-
-    // Worker threads: dequeue → decode → callback
-    std::vector<std::thread> workers;
-    for (unsigned w = 0; w < num_workers; w++) {
-        workers.emplace_back([&]() {
-            while (true) {
-                size_t j = next_process.fetch_add(1);
-                if (j >= data_indices.size()) break;
-                size_t slot = j % QUEUE_SIZE;
-                // Wait for data
-                while (!queue_ready[slot].load(std::memory_order_acquire)) {
-                    if (readers_done.load() && !queue_ready[slot].load()) break;
-                    std::this_thread::yield();
-                }
-                if (!queue_ready[slot].load()) break;
-                // Process
-                decode_fn(queue[slot].data.data(), queue[slot].data.size());
-                // Release slot
-                queue[slot].data.clear();
-                queue[slot].data.shrink_to_fit();
-                queue_ready[slot].store(false, std::memory_order_release);
-                queue_free[slot].store(true, std::memory_order_release);
-
-                size_t done = blocks_done.fetch_add(1) + 1;
-                if (done % 5000 == 0)
-                    std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
-            }
-        });
-    }
-
-    for (auto& r : readers) r.join();
-    readers_done.store(true);
-    for (auto& w : workers) w.join();
-}
-
 void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     std::vector<size_t> data_indices;
     for (size_t i = 0; i < blobs_.size(); i++)
         if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+    if (data_indices.empty()) return;
 
-    stream_producer_consumer(filename_, blobs_, data_indices, num_threads_,
-        [&](const char* data, size_t size) {
-            decode_nodes_streaming(data, size, callback);
-        }, "Node streaming");
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::vector<std::thread> threads;
+
+    struct ThreadStats { double read_us = 0, decode_us = 0, callback_us = 0; size_t count = 0; };
+    std::vector<ThreadStats> stats(num_threads_);
+
+    for (unsigned t = 0; t < num_threads_; t++) {
+        threads.emplace_back([&, t]() {
+            int local_fd = open(filename_.c_str(), O_RDONLY);
+            if (local_fd < 0) return;
+            std::string decomp, blob_buf;
+            auto& st = stats[t];
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= data_indices.size()) break;
+                auto t0 = std::chrono::steady_clock::now();
+                read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
+                auto t1 = std::chrono::steady_clock::now();
+                decode_nodes_streaming(decomp.data(), decomp.size(), callback);
+                auto t2 = std::chrono::steady_clock::now();
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.count++;
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 5000 == 0)
+                    std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
+            }
+            close(local_fd);
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
+    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
+    std::cerr << "  Node streaming (" << total_blocks << " blocks, " << num_threads_ << " threads): "
+              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
+              << "s decode+cb=" << (total_decode/1e6/num_threads_) << "s)" << std::endl;
 }
 
 void PbfFile::read_ways_streaming(const WayCallback& callback) {
+    // Process ALL data blobs — way blobs produce ways, node/relation blobs produce nothing.
     std::vector<size_t> data_indices;
     for (size_t i = 0; i < blobs_.size(); i++)
         if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+    if (data_indices.empty()) return;
 
-    stream_producer_consumer(filename_, blobs_, data_indices, num_threads_,
-        [&](const char* data, size_t size) {
-            decode_ways_streaming(data, size, callback);
-        }, "Way streaming");
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::vector<std::thread> threads;
+
+    struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
+    std::vector<ThreadStats> stats(num_threads_);
+
+    for (unsigned t = 0; t < num_threads_; t++) {
+        threads.emplace_back([&, t]() {
+            int local_fd = open(filename_.c_str(), O_RDONLY);
+            if (local_fd < 0) return;
+            std::string decomp, blob_buf;
+            auto& st = stats[t];
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= data_indices.size()) break;
+                auto t0 = std::chrono::steady_clock::now();
+                read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
+                auto t1 = std::chrono::steady_clock::now();
+                decode_ways_streaming(decomp.data(), decomp.size(), callback);
+                auto t2 = std::chrono::steady_clock::now();
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.count++;
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 5000 == 0)
+                    std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
+            }
+            close(local_fd);
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
+    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
+    std::cerr << "  Way streaming (" << total_blocks << " blocks, " << num_threads_ << " threads): "
+              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
+              << "s decode+cb=" << (total_decode/1e6/num_threads_) << "s)" << std::endl;
 }
 
 PbfFile::~PbfFile() = default;
