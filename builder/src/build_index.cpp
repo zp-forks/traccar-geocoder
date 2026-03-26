@@ -27,6 +27,7 @@
 #include "parsed_data.h"
 #include "s2_helpers.h"
 #include "ring_assembly.h"
+#include "continent_boundaries.h"
 #include "interpolation.h"
 #include "cache.h"
 #include "continent_filter.h"
@@ -1355,9 +1356,13 @@ int main(int argc, char* argv[]) {
         auto _pct = std::chrono::steady_clock::now();
         auto _pcc = CpuTicks::now();
 
+        // Load continent polygons for boundary-based filtering
+        auto continent_polys = get_continent_polygons();
+        std::cerr << "  Loaded " << continent_polys.size() << " continent boundary polygons" << std::endl;
+
         // For each sorted pair array, build a parallel array of continent bitmasks.
         // Since pairs are sorted by cell_id, consecutive entries share the same mask.
-        auto precompute_masks = [](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
+        auto precompute_masks = [&continent_polys](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
             if (sorted.empty()) return {};
             std::vector<uint8_t> masks(sorted.size(), 0);
 
@@ -1378,18 +1383,16 @@ int main(int argc, char* argv[]) {
                 threads.emplace_back([&, th]() {
                     for (size_t i = bounds[th]; i < bounds[th+1]; ) {
                         uint64_t cell_id = sorted[i].cell_id;
-                        // Test against all 8 continents
                         S2CellId cell(cell_id);
                         S2LatLng center = cell.ToLatLng();
                         double lat = center.lat().degrees();
                         double lng = center.lng().degrees();
                         uint8_t mask = 0;
-                        for (size_t ci = 0; ci < kContinentCount; ci++) {
-                            if (lat >= kContinents[ci].min_lat && lat <= kContinents[ci].max_lat &&
-                                lng >= kContinents[ci].min_lng && lng <= kContinents[ci].max_lng)
+                        // Test against continent polygons (not bboxes)
+                        for (size_t ci = 0; ci < continent_polys.size() && ci < 8; ci++) {
+                            if (point_in_polygon(lat, lng, continent_polys[ci].vertices))
                                 mask |= (1u << ci);
                         }
-                        // Fill mask for all entries with this cell_id
                         while (i < bounds[th+1] && sorted[i].cell_id == cell_id) {
                             masks[i] = mask;
                             i++;

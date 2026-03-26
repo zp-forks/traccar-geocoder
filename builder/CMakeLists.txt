@@ -18,6 +18,7 @@ add_executable(build-index
     src/ring_assembly.cpp
     src/cache.cpp
     src/continent_filter.cpp
+    src/continent_boundaries.cpp
     src/cell_index.cpp
     src/interpolation.cpp
 )
