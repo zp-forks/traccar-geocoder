@@ -915,7 +915,19 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
     if (num_threads_ == 0) num_threads_ = 4;
 
     blobs_ = scan_pbf_blobs(filename_);
-    std::cerr << "  PBF: " << blobs_.size() << " blobs" << std::endl;
+
+    // Advise kernel to preload PBF into page cache (no virtual address space reservation).
+    // This ensures pread hits RAM instead of disk for subsequent parallel reads.
+    int fd = open(filename_.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        off_t file_size = lseek(fd, 0, SEEK_END);
+        posix_fadvise(fd, 0, file_size, POSIX_FADV_WILLNEED);
+        close(fd);
+        std::cerr << "  PBF: " << blobs_.size() << " blobs, "
+                  << (file_size / (1024*1024)) << " MiB (preloading to page cache)" << std::endl;
+    } else {
+        std::cerr << "  PBF: " << blobs_.size() << " blobs" << std::endl;
+    }
 }
 
 void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
