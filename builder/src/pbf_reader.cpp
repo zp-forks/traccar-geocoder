@@ -983,66 +983,77 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
 
 PbfFile::~PbfFile() = default;
 
+// Peek at a single blob to determine its content type
+static int peek_blob_type(int fd, const BlobInfo& info) {
+    std::string data = read_and_decompress_blob(fd, info);
+    protozero::pbf_reader pb(data);
+    while (pb.next()) {
+        if (pb.tag() == PrimitiveBlockTag::PRIMITIVEGROUP) {
+            protozero::pbf_reader group = pb.get_message();
+            while (group.next()) {
+                switch (group.tag()) {
+                    case PrimitiveGroupTag::NODES:
+                    case PrimitiveGroupTag::DENSE: return 0; // nodes
+                    case PrimitiveGroupTag::WAYS: return 1;  // ways
+                    case PrimitiveGroupTag::RELATIONS: return 2; // relations
+                    default: group.skip();
+                }
+            }
+        } else { pb.skip(); }
+    }
+    return -1;
+}
+
 void PbfFile::classify_blobs() {
     if (classified_) return;
 
     // PBF files are ordered: node blocks → way blocks → relation blocks.
-    // Use parallel classification: each thread peeks at assigned blobs.
+    // Binary search for the boundaries instead of decompressing all 50K blobs.
     std::vector<size_t> data_indices;
-    for (size_t i = 0; i < blobs_.size(); i++) {
+    for (size_t i = 0; i < blobs_.size(); i++)
         if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+
+    if (data_indices.empty()) { classified_ = true; return; }
+
+    int fd = open(filename_.c_str(), O_RDONLY);
+    if (fd < 0) { classified_ = true; return; }
+
+    // Binary search for node→way boundary
+    size_t node_way_boundary = data_indices.size(); // default: all nodes
+    {
+        size_t lo = 0, hi = data_indices.size();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int type = peek_blob_type(fd, blobs_[data_indices[mid]]);
+            if (type == 0) lo = mid + 1; // nodes — boundary is after this
+            else hi = mid;               // ways or relations — boundary is at or before this
+        }
+        node_way_boundary = lo;
     }
 
-    // Classify in parallel
-    struct BlobType { bool nodes = false, ways = false, relations = false; };
-    std::vector<BlobType> types(data_indices.size());
-    std::atomic<size_t> next_idx{0};
-    std::vector<std::thread> threads;
-
-    for (unsigned t = 0; t < num_threads_; t++) {
-        threads.emplace_back([&]() {
-            int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
-            while (true) {
-                size_t j = next_idx.fetch_add(1);
-                if (j >= data_indices.size()) break;
-                size_t blob_idx = data_indices[j];
-                std::string data = read_and_decompress_blob(local_fd, blobs_[blob_idx]);
-                protozero::pbf_reader pb(data);
-                auto& bt = types[j];
-                while (pb.next()) {
-                    if (pb.tag() == PrimitiveBlockTag::PRIMITIVEGROUP) {
-                        protozero::pbf_reader group = pb.get_message();
-                        while (group.next()) {
-                            switch (group.tag()) {
-                                case PrimitiveGroupTag::NODES:
-                                case PrimitiveGroupTag::DENSE:
-                                    bt.nodes = true; group.skip(); break;
-                                case PrimitiveGroupTag::WAYS:
-                                    bt.ways = true; group.skip(); break;
-                                case PrimitiveGroupTag::RELATIONS:
-                                    bt.relations = true; group.skip(); break;
-                                default: group.skip();
-                            }
-                        }
-                    } else {
-                        pb.skip();
-                    }
-                }
-            }
-            close(local_fd);
-        });
+    // Binary search for way→relation boundary
+    size_t way_rel_boundary = data_indices.size(); // default: no relations
+    {
+        size_t lo = node_way_boundary, hi = data_indices.size();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int type = peek_blob_type(fd, blobs_[data_indices[mid]]);
+            if (type <= 1) lo = mid + 1; // nodes or ways
+            else hi = mid;               // relations
+        }
+        way_rel_boundary = lo;
     }
-    for (auto& t : threads) t.join();
 
-    for (size_t j = 0; j < data_indices.size(); j++) {
-        if (types[j].nodes) node_blobs_.push_back(data_indices[j]);
-        if (types[j].ways) way_blobs_.push_back(data_indices[j]);
-        if (types[j].relations) relation_blobs_.push_back(data_indices[j]);
-    }
+    close(fd);
+
+    for (size_t j = 0; j < node_way_boundary; j++)
+        node_blobs_.push_back(data_indices[j]);
+    for (size_t j = node_way_boundary; j < way_rel_boundary; j++)
+        way_blobs_.push_back(data_indices[j]);
+    for (size_t j = way_rel_boundary; j < data_indices.size(); j++)
+        relation_blobs_.push_back(data_indices[j]);
 
     classified_ = true;
-
     std::cerr << "  PBF classified: " << node_blobs_.size() << " node blocks, "
               << way_blobs_.size() << " way blocks, "
               << relation_blobs_.size() << " relation blocks" << std::endl;
@@ -1051,11 +1062,17 @@ void PbfFile::classify_blobs() {
 void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback,
                            const std::string& entity_filter,
                            bool ordered) {
-    // Process ALL data blobs — entity_filter controls which types are kept in each block.
-    // Avoids expensive classification pass.
+    // For read_blocks (used for relations), classify to avoid wasting work
+    // on 50K blobs when only 454 contain relations.
+    classify_blobs();
+
     std::vector<size_t> indices;
-    for (size_t i = 0; i < blobs_.size(); i++)
-        if (blobs_[i].type == "OSMData") indices.push_back(i);
+    if (entity_filter.find('n') != std::string::npos)
+        indices.insert(indices.end(), node_blobs_.begin(), node_blobs_.end());
+    if (entity_filter.find('w') != std::string::npos)
+        indices.insert(indices.end(), way_blobs_.begin(), way_blobs_.end());
+    if (entity_filter.find('r') != std::string::npos)
+        indices.insert(indices.end(), relation_blobs_.begin(), relation_blobs_.end());
 
     if (indices.empty()) return;
 
