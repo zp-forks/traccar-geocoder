@@ -1,4 +1,5 @@
 #include "continent_filter.h"
+#include "continent_boundaries.h"
 #include "parsed_data.h"
 
 #include <algorithm>
@@ -427,7 +428,8 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     uint8_t continent_bit,
     const std::vector<uint8_t>& way_masks,
     const std::vector<uint8_t>& addr_masks,
-    const std::vector<uint8_t>& interp_masks) {
+    const std::vector<uint8_t>& interp_masks,
+    const std::vector<std::pair<double,double>>* polygon) {
 
     ParsedData out;
     auto _ft = std::chrono::steady_clock::now();
@@ -518,13 +520,19 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     std::unordered_map<uint32_t, uint32_t> way_remap, addr_remap, interp_remap, admin_remap;
 
     auto f_remap_ways = std::async(std::launch::async, [&]() {
-        auto& sorted_ids = used_way_ids; // already sorted from bitset scan
+        auto& sorted_ids = used_way_ids;
         std::vector<WayHeader> ways; std::vector<NodeCoord> nodes;
         ways.reserve(sorted_ids.size()); nodes.reserve(sorted_ids.size() * 5);
         std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
+            const auto& w = full.ways[old_id];
+            // Coordinate-level polygon test on first node
+            if (polygon && w.node_count > 0) {
+                const auto& n = full.street_nodes[w.node_offset];
+                if (!point_in_polygon(n.lat, n.lng, *polygon)) continue;
+            }
             remap[old_id] = static_cast<uint32_t>(ways.size());
-            const auto& w = full.ways[old_id]; WayHeader nw = w;
+            WayHeader nw = w;
             nw.node_offset = static_cast<uint32_t>(nodes.size()); ways.push_back(nw);
             for (uint8_t n = 0; n < w.node_count; n++) nodes.push_back(full.street_nodes[w.node_offset + n]);
         }
@@ -534,7 +542,12 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         auto& sorted_ids = used_addr_ids;
         std::vector<AddrPoint> addrs; addrs.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(sorted_ids.size());
-        for (uint32_t old_id : sorted_ids) { remap[old_id] = static_cast<uint32_t>(addrs.size()); addrs.push_back(full.addr_points[old_id]); }
+        for (uint32_t old_id : sorted_ids) {
+            const auto& a = full.addr_points[old_id];
+            // Coordinate-level polygon test on address point
+            if (polygon && !point_in_polygon(a.lat, a.lng, *polygon)) continue;
+            remap[old_id] = static_cast<uint32_t>(addrs.size()); addrs.push_back(a);
+        }
         return std::make_tuple(std::move(remap), std::move(addrs));
     });
     auto f_remap_interps = std::async(std::launch::async, [&]() {

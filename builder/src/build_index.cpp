@@ -1447,8 +1447,10 @@ int main(int argc, char* argv[]) {
                 auto _cc = CpuTicks::now();
                 std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
                 uint8_t cbit = 1u << continent_order[i];
+                const auto* poly = (continent_order[i] < continent_polys.size() && !continent_polys[continent_order[i]].vertices.empty())
+                    ? &continent_polys[continent_order[i]].vertices : nullptr;
                 auto subset = filter_by_bbox_masked(data, continent, cbit,
-                    way_continent_masks, addr_continent_masks, interp_continent_masks);
+                    way_continent_masks, addr_continent_masks, interp_continent_masks, poly);
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
                 write_region(subset, output_dir + "/" + continent.name);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
