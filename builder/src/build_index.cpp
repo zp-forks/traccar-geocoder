@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/mman.h>
 
 #include "pbf_reader.h"
@@ -210,25 +211,55 @@ int main(int argc, char* argv[]) {
         struct DenseIndex {
             PackedLocation* data;
             size_t capacity;
+            size_t byte_size;
+            int tmp_fd = -1;
+            std::string tmp_path;
 
-            DenseIndex() : capacity(MAX_NODE_ID) {
-                void* ptr = mmap(nullptr, capacity * sizeof(PackedLocation),
-                    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                    -1, 0);
+            DenseIndex() : capacity(MAX_NODE_ID), byte_size(MAX_NODE_ID * sizeof(PackedLocation)) {
+                // Use file-backed mmap instead of anonymous mmap.
+                // Under memory pressure, evicted pages are re-read from the temp file
+                // (fast SSD I/O) instead of going to swap (slow).
+                // This lets the kernel efficiently balance PBF page cache + index pages.
+                tmp_path = "/tmp/dense_index_" + std::to_string(getpid()) + ".tmp";
+                tmp_fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+                void* ptr = MAP_FAILED;
+                if (tmp_fd >= 0) {
+                    if (ftruncate(tmp_fd, byte_size) == 0) {
+                        ptr = mmap(nullptr, byte_size,
+                            PROT_READ | PROT_WRITE, MAP_SHARED, tmp_fd, 0);
+                    }
+                    if (ptr == MAP_FAILED) {
+                        close(tmp_fd);
+                        tmp_fd = -1;
+                        // Fall back to anonymous mmap
+                        std::cerr << "Warning: file-backed mmap failed, falling back to anonymous" << std::endl;
+                        ptr = mmap(nullptr, byte_size,
+                            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                            -1, 0);
+                    }
+                } else {
+                    // No temp file — fall back to anonymous
+                    ptr = mmap(nullptr, byte_size,
+                        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                        -1, 0);
+                }
                 if (ptr == MAP_FAILED) {
                     std::cerr << "Error: failed to mmap dense node index ("
-                              << (capacity * sizeof(PackedLocation) / (1024*1024*1024)) << "GB virtual)" << std::endl;
+                              << (byte_size / (1024*1024*1024)) << "GB)" << std::endl;
                     std::exit(1);
                 }
-                // Enable transparent huge pages to reduce TLB misses
-                madvise(ptr, capacity * sizeof(PackedLocation), MADV_HUGEPAGE);
+                madvise(ptr, byte_size, MADV_HUGEPAGE);
                 data = static_cast<PackedLocation*>(ptr);
-                std::cerr << "Allocated dense node index: " << (capacity * sizeof(PackedLocation) / (1024*1024*1024))
-                          << "GB virtual address space" << std::endl;
+                std::cerr << "Allocated dense node index: " << (byte_size / (1024*1024*1024))
+                          << "GB " << (tmp_fd >= 0 ? "(file-backed)" : "(anonymous)") << std::endl;
             }
 
             ~DenseIndex() {
-                munmap(data, capacity * sizeof(PackedLocation));
+                munmap(data, byte_size);
+                if (tmp_fd >= 0) {
+                    close(tmp_fd);
+                    unlink(tmp_path.c_str());
+                }
             }
 
             // Lockless — each node ID maps to a unique array slot
