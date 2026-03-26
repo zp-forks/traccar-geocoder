@@ -453,20 +453,29 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         }
         bounds.push_back(sorted.size());
 
-        std::vector<uint8_t> bitset(bitset_bytes, 0);
+        // Per-thread bitsets to avoid race conditions on concurrent byte writes
+        std::vector<std::vector<uint8_t>> thread_bitsets(bounds.size() - 1);
         std::vector<std::thread> threads;
         for (size_t t = 0; t + 1 < bounds.size(); t++) {
             threads.emplace_back([&, t]() {
+                auto& bs = thread_bitsets[t];
+                bs.resize(bitset_bytes, 0);
                 for (size_t i = bounds[t]; i < bounds[t+1]; i++) {
                     if (masks[i] & continent_bit) {
                         uint32_t id = sorted[i].item_id;
                         if (id < max_id)
-                            bitset[id / 8] |= (1 << (id % 8));
+                            bs[id / 8] |= (1 << (id % 8));
                     }
                 }
             });
         }
         for (auto& t : threads) t.join();
+
+        // Merge with OR
+        std::vector<uint8_t> bitset(bitset_bytes, 0);
+        for (auto& bs : thread_bitsets) {
+            for (size_t i = 0; i < bitset_bytes; i++) bitset[i] |= bs[i];
+        }
 
         // Extract sorted IDs from bitset (already in ascending order)
         for (uint32_t id = 0; id < max_id; id++) {
