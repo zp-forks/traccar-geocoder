@@ -197,126 +197,60 @@ int main(int argc, char* argv[]) {
         AdminCoverPool admin_pool(num_threads);
         // BuildHandler no longer used — parallel processing handles everything
 
+        // Dense array node location index — lockless parallel writes
+        // Planet OSM node IDs max ~12.5 billion. 8 bytes per entry = 100GB virtual.
+        // MAP_NORESERVE means OS only allocates pages on write (~80GB for 10B nodes).
         static const size_t MAX_NODE_ID = MAX_NODE_ID_DEFAULT;
         struct PackedLocation {
-            int32_t lat_e7;
-            int32_t lon_e7;
+            int32_t lat_e7;  // latitude * 10^7
+            int32_t lon_e7;  // longitude * 10^7
             bool valid() const { return lat_e7 != 0 || lon_e7 != 0; }
             double lat() const { return lat_e7 / 10000000.0; }
             double lon() const { return lon_e7 / 10000000.0; }
         };
+        struct DenseIndex {
+            PackedLocation* data;
+            size_t capacity;
 
-        // Compact node index: only stores nodes referenced by ways.
-        // ~300M entries × 8 bytes = ~2.4 GiB (vs 111 GiB dense array).
-        // Backed by a sorted ref set for O(log n) ID → index mapping.
-        struct CompactIndex {
-            std::vector<int64_t> ref_ids;     // sorted unique node IDs referenced by ways
-            std::vector<PackedLocation> locs; // locations indexed by position in ref_ids
-            bool has_dense = false;           // true if using dense fallback
-            PackedLocation* dense_data = nullptr;
-
-            // Initialize from sorted ref set
-            void init_from_refs(std::vector<int64_t>&& refs) {
-                ref_ids = std::move(refs);
-                locs.resize(ref_ids.size(), {0, 0});
-                std::cerr << "Compact node index: " << ref_ids.size() << " entries ("
-                          << (ref_ids.size() * (sizeof(int64_t) + sizeof(PackedLocation)) / (1024*1024))
-                          << " MiB)" << std::endl;
-            }
-
-            // Fall back to dense index if ref scanning is skipped
-            void init_dense() {
-                size_t byte_size = MAX_NODE_ID * sizeof(PackedLocation);
+            DenseIndex() : capacity(MAX_NODE_ID) {
+                size_t byte_size = capacity * sizeof(PackedLocation);
                 void* ptr = mmap(nullptr, byte_size,
                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                     -1, 0);
-                if (ptr == MAP_FAILED) { std::cerr << "Dense index alloc failed" << std::endl; std::exit(1); }
+                if (ptr == MAP_FAILED) {
+                    std::cerr << "Error: failed to mmap dense node index ("
+                              << (byte_size / (1024*1024*1024)) << "GB)" << std::endl;
+                    std::exit(1);
+                }
                 madvise(ptr, byte_size, MADV_HUGEPAGE);
-                dense_data = static_cast<PackedLocation*>(ptr);
-                has_dense = true;
+                data = static_cast<PackedLocation*>(ptr);
                 std::cerr << "Allocated dense node index: " << (byte_size / (1024*1024*1024))
                           << "GB virtual address space" << std::endl;
             }
 
-            ~CompactIndex() {
-                if (dense_data) munmap(dense_data, MAX_NODE_ID * sizeof(PackedLocation));
+            ~DenseIndex() {
+                munmap(data, capacity * sizeof(PackedLocation));
             }
 
-            // Find index of node ID in sorted ref_ids (binary search)
-            int64_t find_idx(int64_t id) const {
-                auto it = std::lower_bound(ref_ids.begin(), ref_ids.end(), id);
-                if (it != ref_ids.end() && *it == id) return it - ref_ids.begin();
-                return -1;
-            }
-
+            // Lockless — each node ID maps to a unique array slot
             void set(uint64_t id, double lat, double lng) {
-                PackedLocation loc = {static_cast<int32_t>(lat * 10000000.0 + (lat >= 0 ? 0.5 : -0.5)),
-                                      static_cast<int32_t>(lng * 10000000.0 + (lng >= 0 ? 0.5 : -0.5))};
-                if (has_dense) {
-                    if (id < MAX_NODE_ID) dense_data[id] = loc;
-                } else {
-                    int64_t idx = find_idx(static_cast<int64_t>(id));
-                    if (idx >= 0) locs[idx] = loc;
-                }
+                if (id >= capacity) return;
+                data[id] = {static_cast<int32_t>(lat * 10000000.0 + (lat >= 0 ? 0.5 : -0.5)),
+                            static_cast<int32_t>(lng * 10000000.0 + (lng >= 0 ? 0.5 : -0.5))};
             }
 
             PackedLocation get(uint64_t id) const {
-                if (has_dense) {
-                    if (id >= MAX_NODE_ID) return {0, 0};
-                    return dense_data[id];
-                }
-                int64_t idx = find_idx(static_cast<int64_t>(id));
-                if (idx < 0) return {0, 0};
-                return locs[idx];
+                if (id >= capacity) return {0, 0};
+                return data[id];
             }
         } index;
 
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
-            PbfFile pbf(input_file, num_threads);
-
-            // --- Pass 0: scan way refs to build compact node index ---
-            // Collects all node IDs referenced by ways (~300M unique).
-            // This allows a ~5 GiB compact index instead of 111 GiB dense array.
-            std::cerr << "  Pass 0: scanning way node refs..." << std::endl;
-            {
-                std::vector<std::vector<int64_t>> thread_refs(num_threads);
-                std::atomic<unsigned> next_tl{0};
-                static thread_local std::vector<int64_t>* tl_refs = nullptr;
-
-                pbf.read_ways_streaming([&](int64_t way_id,
-                    const int64_t* refs, size_t nrefs,
-                    const uint32_t*, const uint32_t*, size_t,
-                    const std::vector<std::string>&) {
-                    if (!tl_refs) {
-                        unsigned idx = next_tl.fetch_add(1);
-                        tl_refs = &thread_refs[idx % thread_refs.size()];
-                    }
-                    for (size_t i = 0; i < nrefs; i++)
-                        tl_refs->push_back(refs[i]);
-                });
-                tl_refs = nullptr;
-
-                // Merge, sort, unique
-                size_t total = 0;
-                for (auto& v : thread_refs) total += v.size();
-                std::vector<int64_t> all_refs;
-                all_refs.reserve(total);
-                for (auto& v : thread_refs) {
-                    all_refs.insert(all_refs.end(), v.begin(), v.end());
-                    v.clear(); v.shrink_to_fit();
-                }
-                std::sort(all_refs.begin(), all_refs.end());
-                all_refs.erase(std::unique(all_refs.begin(), all_refs.end()), all_refs.end());
-                std::cerr << "  Way refs: " << total << " total, " << all_refs.size() << " unique node IDs" << std::endl;
-
-                index.init_from_refs(std::move(all_refs));
-            }
-            log_phase("Pass 0: way ref scan", _pt, _cpu);
-
             // --- Pass 1: collect relation members for parallel admin assembly ---
             std::cerr << "  Pass 1: scanning relations..." << std::endl;
+            PbfFile pbf(input_file, num_threads);
 
             {
                 std::mutex rel_mutex;
