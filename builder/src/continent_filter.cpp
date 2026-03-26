@@ -526,10 +526,14 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
             const auto& w = full.ways[old_id];
-            // Coordinate-level polygon test on first node
+            // Coordinate-level polygon test — include way if ANY node is inside
             if (polygon && w.node_count > 0) {
-                const auto& n = full.street_nodes[w.node_offset];
-                if (!point_in_polygon(n.lat, n.lng, *polygon)) continue;
+                bool any_inside = false;
+                for (uint8_t n = 0; n < w.node_count; n++) {
+                    const auto& nd = full.street_nodes[w.node_offset + n];
+                    if (point_in_polygon(nd.lat, nd.lng, *polygon)) { any_inside = true; break; }
+                }
+                if (!any_inside) continue;
             }
             remap[old_id] = static_cast<uint32_t>(ways.size());
             WayHeader nw = w;
