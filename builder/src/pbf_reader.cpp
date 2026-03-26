@@ -146,6 +146,48 @@ std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename) {
 
 // --- Blob decompression ---
 
+// Reusable-buffer version: avoids allocation after warmup
+static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
+                                            std::string& blob_buf, std::string& out) {
+    size_t blob_offset = info.offset + 4 + info.header_size;
+    blob_buf.resize(info.data_size);
+    ssize_t n = pread(fd, blob_buf.data(), info.data_size, blob_offset);
+    if (n != (ssize_t)info.data_size) {
+        throw std::runtime_error("pread failed");
+    }
+
+    protozero::pbf_reader blob_pbf(blob_buf);
+    protozero::data_view raw_view{}, zlib_view{};
+    int32_t raw_size = 0;
+    while (blob_pbf.next()) {
+        switch (blob_pbf.tag()) {
+            case BlobTag::RAW: raw_view = blob_pbf.get_view(); break;
+            case BlobTag::RAW_SIZE: raw_size = blob_pbf.get_int32(); break;
+            case BlobTag::ZLIB: zlib_view = blob_pbf.get_view(); break;
+            default: blob_pbf.skip();
+        }
+    }
+    if (raw_view.size() > 0) {
+        out.assign(raw_view.data(), raw_view.size());
+        return;
+    }
+    if (zlib_view.size() > 0) {
+        out.resize(raw_size);
+        thread_local z_stream strm{};
+        thread_local bool strm_init = false;
+        if (!strm_init) { inflateInit(&strm); strm_init = true; }
+        else inflateReset(&strm);
+        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(zlib_view.data()));
+        strm.avail_in = zlib_view.size();
+        strm.next_out = reinterpret_cast<Bytef*>(out.data());
+        strm.avail_out = out.size();
+        inflate(&strm, Z_FINISH);
+        out.resize(strm.total_out);
+        return;
+    }
+    throw std::runtime_error("blob has no data");
+}
+
 std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
     // Read the blob data (after 4-byte header length + header)
     size_t blob_offset = info.offset + 4 + info.header_size;
@@ -877,8 +919,12 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
 }
 
 void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
-    classify_blobs();
-    if (node_blobs_.empty()) return;
+    // Process ALL data blobs — node blobs produce nodes, way/relation blobs produce nothing.
+    // Avoids the expensive classification pass (50K blob decompressions).
+    std::vector<size_t> data_indices;
+    for (size_t i = 0; i < blobs_.size(); i++)
+        if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+    if (data_indices.empty()) return;
 
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
@@ -888,15 +934,15 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
         threads.emplace_back([&]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
             if (local_fd < 0) return;
-            std::string decomp;
+            std::string decomp, blob_buf;
             while (true) {
                 size_t j = next_idx.fetch_add(1);
-                if (j >= node_blobs_.size()) break;
-                decomp = read_and_decompress_blob(local_fd, blobs_[node_blobs_[j]]);
+                if (j >= data_indices.size()) break;
+                read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
                 decode_nodes_streaming(decomp.data(), decomp.size(), callback);
                 size_t done = blocks_done.fetch_add(1) + 1;
-                if (done % 1000 == 0)
-                    std::cerr << "  Processed " << done << "/" << node_blobs_.size() << " node blocks..." << std::endl;
+                if (done % 5000 == 0)
+                    std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
             }
             close(local_fd);
         });
@@ -905,8 +951,11 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
 }
 
 void PbfFile::read_ways_streaming(const WayCallback& callback) {
-    classify_blobs();
-    if (way_blobs_.empty()) return;
+    // Process ALL data blobs — way blobs produce ways, node/relation blobs produce nothing.
+    std::vector<size_t> data_indices;
+    for (size_t i = 0; i < blobs_.size(); i++)
+        if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+    if (data_indices.empty()) return;
 
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
@@ -916,15 +965,15 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
         threads.emplace_back([&]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
             if (local_fd < 0) return;
-            std::string decomp;
+            std::string decomp, blob_buf;
             while (true) {
                 size_t j = next_idx.fetch_add(1);
-                if (j >= way_blobs_.size()) break;
-                decomp = read_and_decompress_blob(local_fd, blobs_[way_blobs_[j]]);
+                if (j >= data_indices.size()) break;
+                read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
                 decode_ways_streaming(decomp.data(), decomp.size(), callback);
                 size_t done = blocks_done.fetch_add(1) + 1;
-                if (done % 1000 == 0)
-                    std::cerr << "  Processed " << done << "/" << way_blobs_.size() << " way blocks..." << std::endl;
+                if (done % 5000 == 0)
+                    std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
             }
             close(local_fd);
         });
@@ -1002,16 +1051,11 @@ void PbfFile::classify_blobs() {
 void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback,
                            const std::string& entity_filter,
                            bool ordered) {
-    classify_blobs();
-
-    // Collect which blob indices to process
+    // Process ALL data blobs — entity_filter controls which types are kept in each block.
+    // Avoids expensive classification pass.
     std::vector<size_t> indices;
-    if (entity_filter.find('n') != std::string::npos)
-        indices.insert(indices.end(), node_blobs_.begin(), node_blobs_.end());
-    if (entity_filter.find('w') != std::string::npos)
-        indices.insert(indices.end(), way_blobs_.begin(), way_blobs_.end());
-    if (entity_filter.find('r') != std::string::npos)
-        indices.insert(indices.end(), relation_blobs_.begin(), relation_blobs_.end());
+    for (size_t i = 0; i < blobs_.size(); i++)
+        if (blobs_[i].type == "OSMData") indices.push_back(i);
 
     if (indices.empty()) return;
 
@@ -1097,7 +1141,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
             int local_fd = open(filename_.c_str(), O_RDONLY);
             if (local_fd < 0) return;
             PbfBlock block;
-            std::string decomp;
+            std::string decomp, blob_buf;
             auto& st = stats[t];
 
             while (true) {
@@ -1106,7 +1150,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
 
                 auto t0 = std::chrono::steady_clock::now();
                 size_t blob_idx = indices[j];
-                decomp = read_and_decompress_blob(local_fd, blobs_[blob_idx]);
+                read_and_decompress_blob_into(local_fd, blobs_[blob_idx], blob_buf, decomp);
                 auto t1 = std::chrono::steady_clock::now();
 
                 decode_pbf_blob_into(decomp.data(), decomp.size(), block);
