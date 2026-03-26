@@ -919,8 +919,6 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
 }
 
 void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
-    // Process ALL data blobs — node blobs produce nodes, way/relation blobs produce nothing.
-    // Avoids the expensive classification pass (50K blob decompressions).
     std::vector<size_t> data_indices;
     for (size_t i = 0; i < blobs_.size(); i++)
         if (blobs_[i].type == "OSMData") data_indices.push_back(i);
@@ -930,16 +928,26 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     std::atomic<size_t> blocks_done{0};
     std::vector<std::thread> threads;
 
+    struct ThreadStats { double read_us = 0, decode_us = 0, callback_us = 0; size_t count = 0; };
+    std::vector<ThreadStats> stats(num_threads_);
+
     for (unsigned t = 0; t < num_threads_; t++) {
-        threads.emplace_back([&]() {
+        threads.emplace_back([&, t]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
             if (local_fd < 0) return;
             std::string decomp, blob_buf;
+            auto& st = stats[t];
             while (true) {
                 size_t j = next_idx.fetch_add(1);
                 if (j >= data_indices.size()) break;
+                auto t0 = std::chrono::steady_clock::now();
                 read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
+                auto t1 = std::chrono::steady_clock::now();
                 decode_nodes_streaming(decomp.data(), decomp.size(), callback);
+                auto t2 = std::chrono::steady_clock::now();
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.count++;
                 size_t done = blocks_done.fetch_add(1) + 1;
                 if (done % 5000 == 0)
                     std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
@@ -948,6 +956,13 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
         });
     }
     for (auto& t : threads) t.join();
+
+    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
+    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
+    std::cerr << "  Node streaming (" << total_blocks << " blocks, " << num_threads_ << " threads): "
+              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
+              << "s decode+cb=" << (total_decode/1e6/num_threads_) << "s)" << std::endl;
 }
 
 void PbfFile::read_ways_streaming(const WayCallback& callback) {
@@ -961,16 +976,26 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
     std::atomic<size_t> blocks_done{0};
     std::vector<std::thread> threads;
 
+    struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
+    std::vector<ThreadStats> stats(num_threads_);
+
     for (unsigned t = 0; t < num_threads_; t++) {
-        threads.emplace_back([&]() {
+        threads.emplace_back([&, t]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
             if (local_fd < 0) return;
             std::string decomp, blob_buf;
+            auto& st = stats[t];
             while (true) {
                 size_t j = next_idx.fetch_add(1);
                 if (j >= data_indices.size()) break;
+                auto t0 = std::chrono::steady_clock::now();
                 read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
+                auto t1 = std::chrono::steady_clock::now();
                 decode_ways_streaming(decomp.data(), decomp.size(), callback);
+                auto t2 = std::chrono::steady_clock::now();
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.count++;
                 size_t done = blocks_done.fetch_add(1) + 1;
                 if (done % 5000 == 0)
                     std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
@@ -979,6 +1004,13 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
         });
     }
     for (auto& t : threads) t.join();
+
+    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
+    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
+    std::cerr << "  Way streaming (" << total_blocks << " blocks, " << num_threads_ << " threads): "
+              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
+              << "s decode+cb=" << (total_decode/1e6/num_threads_) << "s)" << std::endl;
 }
 
 PbfFile::~PbfFile() = default;
