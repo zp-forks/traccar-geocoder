@@ -208,79 +208,40 @@ int main(int argc, char* argv[]) {
             double lat() const { return lat_e7 / 10000000.0; }
             double lon() const { return lon_e7 / 10000000.0; }
         };
-        constexpr size_t INDEX_PAGE_SIZE = 1 << 20; // 1M entries per page = 8 MiB
-        const size_t INDEX_NUM_PAGES = (MAX_NODE_ID + INDEX_PAGE_SIZE - 1) / INDEX_PAGE_SIZE;
-
         struct DenseIndex {
-            // Two-level paged index: only allocates memory for populated regions.
-            // Reduces physical memory from ~80 GiB to ~50 GiB, freeing RAM for PBF cache.
-
-            PackedLocation** pages;
+            PackedLocation* data;
             size_t capacity;
-            std::atomic<size_t> pages_allocated{0};
 
             DenseIndex() : capacity(MAX_NODE_ID) {
-                pages = new PackedLocation*[INDEX_NUM_PAGES]();  // zero-initialized (all nullptr)
-                std::cerr << "Allocated paged dense node index: "
-                          << INDEX_NUM_PAGES << " pages × " << (INDEX_PAGE_SIZE * sizeof(PackedLocation) / (1024*1024))
-                          << "MiB = " << (INDEX_NUM_PAGES * INDEX_PAGE_SIZE * sizeof(PackedLocation) / (1024*1024*1024))
-                          << "GB max, on-demand allocation" << std::endl;
+                size_t byte_size = capacity * sizeof(PackedLocation);
+                void* ptr = mmap(nullptr, byte_size,
+                    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                    -1, 0);
+                if (ptr == MAP_FAILED) {
+                    std::cerr << "Error: failed to mmap dense node index ("
+                              << (byte_size / (1024*1024*1024)) << "GB)" << std::endl;
+                    std::exit(1);
+                }
+                madvise(ptr, byte_size, MADV_HUGEPAGE);
+                data = static_cast<PackedLocation*>(ptr);
+                std::cerr << "Allocated dense node index: " << (byte_size / (1024*1024*1024))
+                          << "GB virtual address space" << std::endl;
             }
 
             ~DenseIndex() {
-                for (size_t i = 0; i < INDEX_NUM_PAGES; i++) {
-                    if (pages[i]) {
-                        munmap(pages[i], INDEX_PAGE_SIZE * sizeof(PackedLocation));
-                    }
-                }
-                delete[] pages;
+                munmap(data, capacity * sizeof(PackedLocation));
             }
 
-            // Allocate a page on first write (thread-safe via CAS)
-            PackedLocation* ensure_page(size_t page_idx) {
-                PackedLocation* p = pages[page_idx];
-                if (p) return p;
-                // Allocate new page
-                void* ptr = mmap(nullptr, INDEX_PAGE_SIZE * sizeof(PackedLocation),
-                    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                    -1, 0);
-                if (ptr == MAP_FAILED) return nullptr;
-                // CAS to install — if another thread beat us, unmap ours
-                PackedLocation* expected = nullptr;
-                if (__atomic_compare_exchange_n(&pages[page_idx], &expected,
-                        static_cast<PackedLocation*>(ptr), false,
-                        __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
-                    pages_allocated.fetch_add(1);
-                    return static_cast<PackedLocation*>(ptr);
-                } else {
-                    munmap(ptr, INDEX_PAGE_SIZE * sizeof(PackedLocation));
-                    return expected;  // another thread's page
-                }
-            }
-
+            // Lockless — each node ID maps to a unique array slot
             void set(uint64_t id, double lat, double lng) {
                 if (id >= capacity) return;
-                size_t page_idx = id / INDEX_PAGE_SIZE;
-                size_t offset = id % INDEX_PAGE_SIZE;
-                PackedLocation* page = ensure_page(page_idx);
-                if (page) {
-                    page[offset] = {static_cast<int32_t>(lat * 10000000.0 + (lat >= 0 ? 0.5 : -0.5)),
-                                    static_cast<int32_t>(lng * 10000000.0 + (lng >= 0 ? 0.5 : -0.5))};
-                }
+                data[id] = {static_cast<int32_t>(lat * 10000000.0 + (lat >= 0 ? 0.5 : -0.5)),
+                            static_cast<int32_t>(lng * 10000000.0 + (lng >= 0 ? 0.5 : -0.5))};
             }
 
             PackedLocation get(uint64_t id) const {
                 if (id >= capacity) return {0, 0};
-                size_t page_idx = id / INDEX_PAGE_SIZE;
-                PackedLocation* page = pages[page_idx];
-                if (!page) return {0, 0};
-                return page[id % INDEX_PAGE_SIZE];
-            }
-
-            void report() const {
-                size_t n = pages_allocated.load();
-                std::cerr << "Dense index: " << n << "/" << INDEX_NUM_PAGES << " pages allocated ("
-                          << (n * INDEX_PAGE_SIZE * sizeof(PackedLocation) / (1024*1024*1024)) << " GiB physical)" << std::endl;
+                return data[id];
             }
         } index;
 
@@ -440,7 +401,6 @@ int main(int argc, char* argv[]) {
                           << " address points collected." << std::endl;
             }
             log_phase("Pass 2: node processing", _pt, _cpu);
-            index.report();
             pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
 
             // --- Pass 2b: Way processing (fully parallel) ---
