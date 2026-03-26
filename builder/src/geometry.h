@@ -195,6 +195,30 @@ inline std::vector<std::pair<double,double>> simplify_polygon_epsilon(
     keep[pts.size() - 1] = true;
     dp_simplify(pts, 0, pts.size() - 1, epsilon_deg, keep);
 
+    size_t count = 0;
+    for (bool k : keep) if (k) count++;
+
+    // If simplification went below min_vertices, reduce epsilon until we have enough
+    if (count < min_vertices) {
+        double lo = 0, hi = epsilon_deg;
+        for (int iter = 0; iter < 20; iter++) {
+            double mid = (lo + hi) / 2;
+            std::vector<bool> try_keep(pts.size(), false);
+            try_keep[0] = true;
+            try_keep[pts.size() - 1] = true;
+            dp_simplify(pts, 0, pts.size() - 1, mid, try_keep);
+            size_t c = 0;
+            for (bool k : try_keep) if (k) c++;
+            if (c >= min_vertices) {
+                lo = mid;
+                keep = try_keep;
+                count = c;
+            } else {
+                hi = mid;
+            }
+        }
+    }
+
     std::vector<std::pair<double,double>> result;
     for (size_t i = 0; i < pts.size(); i++) {
         if (keep[i]) result.push_back(pts[i]);
