@@ -6,11 +6,12 @@
 // These are rough boundaries — accurate enough for geocoding data
 // separation but not for cartographic purposes.
 
+#include <string>
 #include <vector>
 #include <utility>
 
 struct ContinentPolygon {
-    const char* name;
+    std::string name;
     std::vector<std::pair<double,double>> vertices; // (lat, lng) pairs
 };
 
