@@ -3,9 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <fcntl.h>
 #include <iostream>
 #include <sys/mman.h>
@@ -953,14 +951,21 @@ static void stream_producer_consumer(
     std::cerr << "  " << label << ": " << num_readers << " readers, "
               << num_workers << " workers, queue=" << QUEUE_SIZE << std::endl;
 
-    // Simple bounded queue with mutex + condition variables
-    std::deque<std::string> queue;
-    std::mutex queue_mutex;
-    std::condition_variable queue_not_full;
-    std::condition_variable queue_not_empty;
+    // Bounded queue of decompressed blobs
+    struct QueueItem {
+        std::string data;
+        bool valid = false;
+    };
+    std::vector<QueueItem> queue(QUEUE_SIZE);
+    std::vector<std::atomic<bool>> queue_ready(QUEUE_SIZE);
+    std::vector<std::atomic<bool>> queue_free(QUEUE_SIZE);
+    for (auto& r : queue_ready) r.store(false);
+    for (auto& f : queue_free) f.store(true);
+
     std::atomic<size_t> next_read{0};
+    std::atomic<size_t> next_process{0};
+    std::atomic<bool> readers_done{false};
     std::atomic<size_t> blocks_done{0};
-    bool readers_finished = false;
 
     // Reader threads: pread + inflate → queue
     std::vector<std::thread> readers;
@@ -968,16 +973,19 @@ static void stream_producer_consumer(
         readers.emplace_back([&]() {
             int local_fd = open(filename.c_str(), O_RDONLY);
             if (local_fd < 0) return;
+            std::string blob_buf;
             while (true) {
                 size_t j = next_read.fetch_add(1);
                 if (j >= data_indices.size()) break;
-                std::string data = read_and_decompress_blob(local_fd, blobs[data_indices[j]]);
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex);
-                    queue_not_full.wait(lock, [&]{ return queue.size() < QUEUE_SIZE; });
-                    queue.push_back(std::move(data));
-                }
-                queue_not_empty.notify_one();
+                size_t slot = j % QUEUE_SIZE;
+                // Wait for slot to be free
+                while (!queue_free[slot].load(std::memory_order_acquire))
+                    std::this_thread::yield();
+                // Read + decompress into slot
+                queue[slot].data = read_and_decompress_blob(local_fd, blobs[data_indices[j]]);
+                queue[slot].valid = true;
+                queue_free[slot].store(false, std::memory_order_release);
+                queue_ready[slot].store(true, std::memory_order_release);
             }
             close(local_fd);
         });
@@ -988,19 +996,22 @@ static void stream_producer_consumer(
     for (unsigned w = 0; w < num_workers; w++) {
         workers.emplace_back([&]() {
             while (true) {
-                std::string data;
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex);
-                    queue_not_empty.wait(lock, [&]{
-                        return !queue.empty() || readers_finished;
-                    });
-                    if (queue.empty() && readers_finished) return;
-                    data = std::move(queue.front());
-                    queue.pop_front();
+                size_t j = next_process.fetch_add(1);
+                if (j >= data_indices.size()) break;
+                size_t slot = j % QUEUE_SIZE;
+                // Wait for data
+                while (!queue_ready[slot].load(std::memory_order_acquire)) {
+                    if (readers_done.load() && !queue_ready[slot].load()) break;
+                    std::this_thread::yield();
                 }
-                queue_not_full.notify_one();
-
-                decode_fn(data.data(), data.size());
+                if (!queue_ready[slot].load()) break;
+                // Process
+                decode_fn(queue[slot].data.data(), queue[slot].data.size());
+                // Release slot
+                queue[slot].data.clear();
+                queue[slot].data.shrink_to_fit();
+                queue_ready[slot].store(false, std::memory_order_release);
+                queue_free[slot].store(true, std::memory_order_release);
 
                 size_t done = blocks_done.fetch_add(1) + 1;
                 if (done % 5000 == 0)
@@ -1010,11 +1021,7 @@ static void stream_producer_consumer(
     }
 
     for (auto& r : readers) r.join();
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        readers_finished = true;
-    }
-    queue_not_empty.notify_all();
+    readers_done.store(true);
     for (auto& w : workers) w.join();
 }
 
