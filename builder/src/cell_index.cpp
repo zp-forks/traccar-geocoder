@@ -64,7 +64,7 @@ std::vector<uint32_t> write_entries_from_sorted(
         return offsets;
     }
 
-    unsigned int nthreads = std::min(std::thread::hardware_concurrency(), 32u);
+    unsigned int nthreads = std::thread::hardware_concurrency();
     if (nthreads == 0) nthreads = 4;
     size_t cells_per_chunk = (sorted_cells.size() + nthreads - 1) / nthreads;
 
