@@ -220,7 +220,13 @@ int main(int argc, char* argv[]) {
                 // Under memory pressure, evicted pages are re-read from the temp file
                 // (fast SSD I/O) instead of going to swap (slow).
                 // This lets the kernel efficiently balance PBF page cache + index pages.
-                tmp_path = "/tmp/dense_index_" + std::to_string(getpid()) + ".tmp";
+                // Use current directory (should be on real disk, not tmpfs)
+                // Avoid /tmp which is often tmpfs (RAM-backed, too small)
+                {
+                    const char* dir = getenv("TMPDIR");
+                    if (!dir) dir = ".";
+                    tmp_path = std::string(dir) + "/dense_index_" + std::to_string(getpid()) + ".tmp";
+                }
                 tmp_fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
                 void* ptr = MAP_FAILED;
                 if (tmp_fd >= 0) {
