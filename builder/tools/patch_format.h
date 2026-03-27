@@ -212,7 +212,8 @@ static const char* patch_file_names[] = {
 // Encoding types for each section
 enum class PatchEncoding : uint32_t {
     RAW_REPLACE = 0,  // Full replacement (zlib compressed)
-    COPY_INSERT = 1,  // COPY/INSERT byte stream (zlib compressed)
+    COPY_INSERT = 1,  // Single zstd delta frame (zstd --patch-from)
+    TWO_STAGE = 2,    // Two zstd delta frames: old→remapped, remapped→new
 };
 
 // Patch file header
@@ -237,6 +238,13 @@ enum : uint8_t {
     OP_COPY = 0,    // Copy from old file: [u8 tag][u64 offset][u32 length]
     OP_INSERT = 1,  // Insert new data:    [u8 tag][u32 length][data...]
 };
+
+// Offset fixup section marker: 0xFFFFFFFD
+// Format: uint32_t marker, uint32_t file_id, uint32_t stride,
+//         uint32_t count, [(uint32_t record_index, uint32_t new_offset_value)] * count
+// Applied to byte offset 0 of each record (node_offset/vertex_offset field).
+
+static constexpr uint32_t FIXUP_MARKER = 0xFFFFFFFD;
 
 // --- Grid coordinate for fingerprinting ---
 

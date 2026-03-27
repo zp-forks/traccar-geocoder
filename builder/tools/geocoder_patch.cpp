@@ -64,107 +64,100 @@ int main(int argc, char* argv[]) {
         std::cerr << "Unsupported version " << version << std::endl; return 1;
     }
 
-    // Read string remap
-    std::unordered_map<uint32_t, uint32_t> str_remap;
+    // Skip string remap section (two-stage encoding handles remapping internally)
     {
         uint32_t section_id; pf.read(reinterpret_cast<char*>(&section_id), 4);
-        if (section_id != 0xFFFFFFFE) {
-            std::cerr << "Expected remap section" << std::endl; return 1;
+        if (section_id == 0xFFFFFFFE) {
+            uint32_t count; pf.read(reinterpret_cast<char*>(&count), 4);
+            pf.seekg(count * 8, std::ios::cur);
+            std::cerr << "Skipped string remap (" << count << " entries, handled by two-stage)" << std::endl;
+        } else {
+            std::cerr << "Warning: expected remap section, got " << section_id << std::endl;
+            // Seek back so section processing can handle it
+            pf.seekg(-4, std::ios::cur);
         }
-        uint32_t count; pf.read(reinterpret_cast<char*>(&count), 4);
-        for (uint32_t i = 0; i < count; i++) {
-            uint32_t old_off, new_off;
-            pf.read(reinterpret_cast<char*>(&old_off), 4);
-            pf.read(reinterpret_cast<char*>(&new_off), 4);
-            str_remap[old_off] = new_off;
-        }
-        std::cerr << "Loaded " << count << " string remap entries" << std::endl;
     }
-
-    // Detect struct strides
-    auto detect_stride = [&](const std::string& name, std::vector<size_t> candidates) -> size_t {
-        auto data = read_file(cur_dir + "/" + name);
-        for (size_t s : candidates)
-            if (data.size() % s == 0 && data.size() > 0) return s;
-        return candidates[0];
-    };
-    size_t way_stride = detect_stride("street_ways.bin", {12, 9});
-    size_t interp_stride = detect_stride("interp_ways.bin", {20, 18});
-    size_t admin_stride = detect_stride("admin_polygons.bin", {24, 20, 19});
-
-    // Which files need string remap?
-    auto needs_remap = [](uint32_t fid) -> bool {
-        return fid == (uint32_t)PatchFileId::ADDR_POINTS ||
-               fid == (uint32_t)PatchFileId::STREET_WAYS ||
-               fid == (uint32_t)PatchFileId::INTERP_WAYS ||
-               fid == (uint32_t)PatchFileId::ADMIN_POLYGONS;
-    };
 
     // Process file sections
     while (pf) {
         uint32_t file_id; pf.read(reinterpret_cast<char*>(&file_id), 4);
         if (!pf || file_id == 0xFFFFFFFF) break;
-
         uint32_t encoding; pf.read(reinterpret_cast<char*>(&encoding), 4);
-        uint64_t old_size, new_size, delta_size;
-        pf.read(reinterpret_cast<char*>(&old_size), 8);
-        pf.read(reinterpret_cast<char*>(&new_size), 8);
-        pf.read(reinterpret_cast<char*>(&delta_size), 8);
 
         if (file_id >= (uint32_t)PatchFileId::COUNT) {
-            pf.seekg(delta_size, std::ios::cur);
-            continue;
+            std::cerr << "  Unknown section " << file_id << std::endl;
+            break;
         }
         const char* filename = patch_file_names[file_id];
 
-        // Write delta data to temp file
-        std::string zst_path = tmpdir + "/" + std::string(filename) + ".zst";
-        {
-            std::ofstream zf(zst_path, std::ios::binary);
-            std::vector<char> buf(std::min(delta_size, (uint64_t)1024*1024));
-            uint64_t remaining = delta_size;
+        auto write_temp = [&](const std::string& path, uint64_t size) {
+            std::ofstream zf(path, std::ios::binary);
+            std::vector<char> buf(std::min(size, (uint64_t)1024*1024));
+            uint64_t remaining = size;
             while (remaining > 0) {
                 size_t chunk = std::min(remaining, (uint64_t)buf.size());
                 pf.read(buf.data(), chunk);
                 zf.write(buf.data(), chunk);
                 remaining -= chunk;
             }
-        }
+        };
 
-        // Prepare reference file (old file, with remap if needed)
-        std::string ref_path;
-        if (needs_remap(file_id)) {
-            auto old_data = read_file(cur_dir + "/" + std::string(filename));
-            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS)
-                remap_addr_points(old_data, str_remap);
-            else if (file_id == (uint32_t)PatchFileId::STREET_WAYS)
-                remap_field(old_data, way_stride, way_stride == 12 ? 8 : 5, str_remap);
-            else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS)
-                remap_field(old_data, interp_stride, interp_stride >= 20 ? 8 : 5, str_remap);
-            else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS)
-                remap_field(old_data, admin_stride, 8, str_remap);
-            ref_path = tmpdir + "/" + std::string(filename) + ".ref";
-            write_file(ref_path, old_data);
+        auto zstd_apply = [&](const std::string& ref, const std::string& zst, const std::string& out) -> bool {
+            std::string cmd = "zstd --patch-from='" + ref + "' -d '" + zst + "' -o '" + out + "' -f --long=31 --quiet 2>/dev/null";
+            return system(cmd.c_str()) == 0;
+        };
+
+        if (encoding == (uint32_t)PatchEncoding::COPY_INSERT) {
+            // Single-stage: old → new
+            uint64_t old_size, new_size, delta_size;
+            pf.read(reinterpret_cast<char*>(&old_size), 8);
+            pf.read(reinterpret_cast<char*>(&new_size), 8);
+            pf.read(reinterpret_cast<char*>(&delta_size), 8);
+
+            std::string zst = tmpdir + "/" + std::string(filename) + ".zst";
+            write_temp(zst, delta_size);
+
+            std::string ref = cur_dir + "/" + std::string(filename);
+            std::string out = out_dir + "/" + std::string(filename);
+            if (!zstd_apply(ref, zst, out)) {
+                std::cerr << "FAILED: " << filename << std::endl; return 1;
+            }
+            std::cerr << "  " << filename << ": " << read_file(out).size() << " bytes" << std::endl;
+            remove(zst.c_str());
+
+        } else if (encoding == (uint32_t)PatchEncoding::TWO_STAGE) {
+            // Two-stage: old → remapped → new
+            uint64_t old_size, remap_size, new_size, s1_size, s2_size;
+            pf.read(reinterpret_cast<char*>(&old_size), 8);
+            pf.read(reinterpret_cast<char*>(&remap_size), 8);
+            pf.read(reinterpret_cast<char*>(&new_size), 8);
+            pf.read(reinterpret_cast<char*>(&s1_size), 8);
+            pf.read(reinterpret_cast<char*>(&s2_size), 8);
+
+            std::string zst1 = tmpdir + "/" + std::string(filename) + ".s1.zst";
+            std::string zst2 = tmpdir + "/" + std::string(filename) + ".s2.zst";
+            std::string mid = tmpdir + "/" + std::string(filename) + ".mid";
+            std::string out = out_dir + "/" + std::string(filename);
+
+            write_temp(zst1, s1_size);
+            write_temp(zst2, s2_size);
+
+            // Stage 1: old → remapped
+            std::string ref = cur_dir + "/" + std::string(filename);
+            if (!zstd_apply(ref, zst1, mid)) {
+                std::cerr << "FAILED stage1: " << filename << std::endl; return 1;
+            }
+            // Stage 2: remapped → new
+            if (!zstd_apply(mid, zst2, out)) {
+                std::cerr << "FAILED stage2: " << filename << std::endl; return 1;
+            }
+            std::cerr << "  " << filename << ": " << read_file(out).size() << " bytes" << std::endl;
+            remove(zst1.c_str()); remove(zst2.c_str()); remove(mid.c_str());
+
         } else {
-            ref_path = cur_dir + "/" + std::string(filename);
+            std::cerr << "  Unknown encoding " << encoding << " for " << filename << std::endl;
+            break;
         }
-
-        // Apply delta: zstd -d --patch-from=ref delta -o output
-        std::string out_path = out_dir + "/" + std::string(filename);
-        std::string cmd = "zstd --patch-from='" + ref_path + "' -d '" + zst_path +
-                          "' -o '" + out_path + "' -f --long=31";
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            std::cerr << "FAILED: " << filename << " (zstd exit " << ret << ")" << std::endl;
-            return 1;
-        }
-
-        auto out_data = read_file(out_path);
-        std::cerr << "  " << filename << ": " << out_data.size() << " bytes" << std::endl;
-
-        // Cleanup temp files
-        remove(zst_path.c_str());
-        if (needs_remap(file_id)) remove(ref_path.c_str());
     }
 
     // Cleanup

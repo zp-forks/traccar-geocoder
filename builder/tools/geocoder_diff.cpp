@@ -572,19 +572,44 @@ int main(int argc, char* argv[]) {
         std::cerr << "  Remap: " << count << " entries" << std::endl;
     }
 
-    // Diff each file: use remapped temp files as reference
-    auto diff_file = [&](PatchFileId id, const std::string& name, bool use_temp) {
+    // Two-stage diff: old→remapped (stage1), remapped→new (stage2)
+    auto diff_two_stage = [&](PatchFileId id, const std::string& name) {
         std::cerr << "  " << name << ": ";
-        std::string ref = use_temp ? tmpdir + "/" + name : old_dir + "/" + name;
-        std::string tgt = new_dir + "/" + name;
+        std::string old_path = old_dir + "/" + name;
+        std::string temp_path = tmpdir + "/" + name;
+        std::string new_path = new_dir + "/" + name;
+        std::string zst1 = tmpdir + "/" + name + ".s1.zst";
+        std::string zst2 = tmpdir + "/" + name + ".s2.zst";
+
+        system(("zstd --patch-from='" + old_path + "' '" + temp_path + "' -o '" + zst1 + "' -f --quiet 2>/dev/null").c_str());
+        system(("zstd --patch-from='" + temp_path + "' '" + new_path + "' -o '" + zst2 + "' -f --quiet 2>/dev/null").c_str());
+
+        auto s1 = read_file(zst1), s2 = read_file(zst2);
+        auto old_data = read_file(old_path), remapped = read_file(temp_path), new_data = read_file(new_path);
+
+        uint32_t fid = static_cast<uint32_t>(id), enc = static_cast<uint32_t>(PatchEncoding::TWO_STAGE);
+        uint64_t os = old_data.size(), rs = remapped.size(), ns = new_data.size();
+        uint64_t s1s = s1.size(), s2s = s2.size();
+        write_val(pf, &fid, 4); write_val(pf, &enc, 4);
+        write_val(pf, &os, 8); write_val(pf, &rs, 8); write_val(pf, &ns, 8);
+        write_val(pf, &s1s, 8); write_val(pf, &s2s, 8);
+        pf.write(s1.data(), s1.size());
+        pf.write(s2.data(), s2.size());
+
+        double pct = ns > 0 ? (s1s + s2s) * 100.0 / ns : 0;
+        std::cerr << "s1=" << s1s << " s2=" << s2s << " (" << std::fixed << std::setprecision(2) << pct << "%)" << std::endl;
+        remove(zst1.c_str()); remove(zst2.c_str());
+    };
+
+    // Single-stage diff for files without remapping
+    auto diff_single = [&](PatchFileId id, const std::string& name) {
+        std::cerr << "  " << name << ": ";
+        std::string old_path = old_dir + "/" + name;
+        std::string new_path = new_dir + "/" + name;
         std::string zst = tmpdir + "/" + name + ".zst";
-
-        std::string cmd = "zstd --patch-from='" + ref + "' '" + tgt + "' -o '" + zst + "' -f --quiet 2>/dev/null";
-        system(cmd.c_str());
-
+        system(("zstd --patch-from='" + old_path + "' '" + new_path + "' -o '" + zst + "' -f --quiet 2>/dev/null").c_str());
         auto zst_data = read_file(zst);
-        auto old_data = read_file(old_dir + "/" + name);
-        auto new_data = read_file(tgt);
+        auto old_data = read_file(old_path), new_data = read_file(new_path);
 
         uint32_t fid = static_cast<uint32_t>(id), enc = static_cast<uint32_t>(PatchEncoding::COPY_INSERT);
         uint64_t os = old_data.size(), ns = new_data.size(), ds = zst_data.size();
@@ -597,20 +622,22 @@ int main(int argc, char* argv[]) {
         remove(zst.c_str());
     };
 
-    diff_file(PatchFileId::STRINGS, "strings.bin", false);
-    diff_file(PatchFileId::ADDR_POINTS, "addr_points.bin", true);
-    diff_file(PatchFileId::STREET_WAYS, "street_ways.bin", true);
-    diff_file(PatchFileId::INTERP_WAYS, "interp_ways.bin", true);
-    diff_file(PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", true);
-    diff_file(PatchFileId::STREET_NODES, "street_nodes.bin", true);
-    diff_file(PatchFileId::INTERP_NODES, "interp_nodes.bin", true);
-    diff_file(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", true);
-    diff_file(PatchFileId::GEO_CELLS, "geo_cells.bin", true);
-    diff_file(PatchFileId::STREET_ENTRIES, "street_entries.bin", true);
-    diff_file(PatchFileId::ADDR_ENTRIES, "addr_entries.bin", true);
-    diff_file(PatchFileId::INTERP_ENTRIES, "interp_entries.bin", true);
-    diff_file(PatchFileId::ADMIN_CELLS, "admin_cells.bin", true);
-    diff_file(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin", true);
+    // All remapped files use two-stage
+    diff_two_stage(PatchFileId::ADDR_POINTS, "addr_points.bin");
+    diff_two_stage(PatchFileId::STREET_WAYS, "street_ways.bin");
+    diff_two_stage(PatchFileId::INTERP_WAYS, "interp_ways.bin");
+    diff_two_stage(PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin");
+    diff_two_stage(PatchFileId::STREET_NODES, "street_nodes.bin");
+    diff_two_stage(PatchFileId::INTERP_NODES, "interp_nodes.bin");
+    diff_two_stage(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin");
+    diff_two_stage(PatchFileId::GEO_CELLS, "geo_cells.bin");
+    diff_two_stage(PatchFileId::STREET_ENTRIES, "street_entries.bin");
+    diff_two_stage(PatchFileId::ADDR_ENTRIES, "addr_entries.bin");
+    diff_two_stage(PatchFileId::INTERP_ENTRIES, "interp_entries.bin");
+    diff_two_stage(PatchFileId::ADMIN_CELLS, "admin_cells.bin");
+    diff_two_stage(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin");
+    // strings.bin: single stage (no remap)
+    diff_single(PatchFileId::STRINGS, "strings.bin");
 
     uint32_t end = 0xFFFFFFFF;
     write_val(pf, &end, 4);
