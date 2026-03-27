@@ -203,8 +203,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Loaded " << count << " ID remaps for file " << fid << std::endl;
     }
 
-    // Helper: rebuild entry + cell files using ID remap
-    auto rebuild_entries = [&](const std::string& cells_file, const std::string& entries_file,
+    // Helper: rebuild entry + cell files using ID remap (LEGACY, unused)
+    auto rebuild_entries_legacy = [&](const std::string& cells_file, const std::string& entries_file,
                                 size_t cell_stride, size_t offset_pos,
                                 const std::unordered_map<uint32_t,uint32_t>& id_rm, bool has_flags)
         -> std::pair<std::vector<char>, std::vector<char>> // (entries_data, cells_data)
@@ -259,9 +259,40 @@ int main(int argc, char* argv[]) {
         return {new_entries_buf, new_cells_buf};
     };
 
-    // Pre-rebuild entry/cell files using ID remaps (for use as zstd reference)
-    std::unordered_map<std::string, std::string> rebuilt_refs; // filename → temp path
+    // Pre-rebuild entry/cell files using SHARED rebuild function (identical to diff tool)
+    std::unordered_map<std::string, std::string> rebuilt_refs;
     if (!id_remaps.empty()) {
+        auto w_rm = id_remaps.count((uint32_t)PatchFileId::STREET_WAYS) ? id_remaps[(uint32_t)PatchFileId::STREET_WAYS] : std::unordered_map<uint32_t,uint32_t>{};
+        auto a_rm = id_remaps.count((uint32_t)PatchFileId::ADDR_POINTS) ? id_remaps[(uint32_t)PatchFileId::ADDR_POINTS] : std::unordered_map<uint32_t,uint32_t>{};
+        auto i_rm = id_remaps.count((uint32_t)PatchFileId::INTERP_WAYS) ? id_remaps[(uint32_t)PatchFileId::INTERP_WAYS] : std::unordered_map<uint32_t,uint32_t>{};
+        auto ad_rm = id_remaps.count((uint32_t)PatchFileId::ADMIN_POLYGONS) ? id_remaps[(uint32_t)PatchFileId::ADMIN_POLYGONS] : std::unordered_map<uint32_t,uint32_t>{};
+
+        auto old_geo = read_file(cur_dir + "/geo_cells.bin");
+        auto old_se = read_file(cur_dir + "/street_entries.bin");
+        auto old_ae = read_file(cur_dir + "/addr_entries.bin");
+        auto old_ie = read_file(cur_dir + "/interp_entries.bin");
+
+        auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm);
+        write_file(tmpdir + "/geo_cells.bin", geo.geo_cells_data);
+        write_file(tmpdir + "/street_entries.bin", geo.street_entries_data);
+        write_file(tmpdir + "/addr_entries.bin", geo.addr_entries_data);
+        write_file(tmpdir + "/interp_entries.bin", geo.interp_entries_data);
+        rebuilt_refs["geo_cells.bin"] = tmpdir + "/geo_cells.bin";
+        rebuilt_refs["street_entries.bin"] = tmpdir + "/street_entries.bin";
+        rebuilt_refs["addr_entries.bin"] = tmpdir + "/addr_entries.bin";
+        rebuilt_refs["interp_entries.bin"] = tmpdir + "/interp_entries.bin";
+
+        auto old_ac = read_file(cur_dir + "/admin_cells.bin");
+        auto old_admin_e = read_file(cur_dir + "/admin_entries.bin");
+        auto admin = rebuild_admin_from_remap(old_ac, old_admin_e, ad_rm);
+        write_file(tmpdir + "/admin_cells.bin", admin.admin_cells_data);
+        write_file(tmpdir + "/admin_entries.bin", admin.admin_entries_data);
+        rebuilt_refs["admin_cells.bin"] = tmpdir + "/admin_cells.bin";
+        rebuilt_refs["admin_entries.bin"] = tmpdir + "/admin_entries.bin";
+
+        std::cerr << "Rebuilt " << rebuilt_refs.size() << " entry/cell files (shared function)" << std::endl;
+    }
+    #if 0 // Legacy rebuild code — replaced by shared rebuild_geo_from_remap
         // Rebuild geo entries (street, addr, interp)
         auto way_rm = id_remaps.count((uint32_t)PatchFileId::STREET_WAYS) ?
                        id_remaps[(uint32_t)PatchFileId::STREET_WAYS] : std::unordered_map<uint32_t,uint32_t>{};
@@ -384,8 +415,7 @@ int main(int argc, char* argv[]) {
             // Don't add admin entries/cells to rebuilt_refs (diff uses old→new directly)
         }
 
-        std::cerr << "Rebuilt " << rebuilt_refs.size() << " entry/cell files from ID remaps" << std::endl;
-    }
+    #endif // Legacy rebuild code
 
     // Process file sections
     while (pf) {

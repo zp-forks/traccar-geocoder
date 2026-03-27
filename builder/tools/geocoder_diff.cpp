@@ -520,9 +520,36 @@ int main(int argc, char* argv[]) {
         write_file(tmpdir + "/admin_vertices.bin", new_v);
     }
 
-    // Rebuild entry/cell files with remapped IDs
-    remap_and_rebuild_entries(old_dir, new_dir, tmpdir,
-                              way_id_remap, addr_id_remap, interp_id_remap, admin_id_remap);
+    // Rebuild entry/cell files using shared function (identical to patch tool)
+    {
+        auto old_geo = read_file(old_dir + "/geo_cells.bin");
+        auto old_se = read_file(old_dir + "/street_entries.bin");
+        auto old_ae = read_file(old_dir + "/addr_entries.bin");
+        auto old_ie = read_file(old_dir + "/interp_entries.bin");
+        // Convert vector remaps to unordered_maps
+        std::unordered_map<uint32_t,uint32_t> w_rm, a_rm, i_rm, ad_rm;
+        for (uint32_t j = 0; j < way_id_remap.size(); j++)
+            if (way_id_remap[j] != 0xFFFFFFFF) w_rm[j] = way_id_remap[j];
+        for (uint32_t j = 0; j < addr_id_remap.size(); j++)
+            if (addr_id_remap[j] != 0xFFFFFFFF) a_rm[j] = addr_id_remap[j];
+        for (uint32_t j = 0; j < interp_id_remap.size(); j++)
+            if (interp_id_remap[j] != 0xFFFFFFFF) i_rm[j] = interp_id_remap[j];
+        for (uint32_t j = 0; j < admin_id_remap.size(); j++)
+            if (admin_id_remap[j] != 0xFFFFFFFF) ad_rm[j] = admin_id_remap[j];
+
+        auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm);
+        write_file(tmpdir + "/geo_cells.bin", geo.geo_cells_data);
+        write_file(tmpdir + "/street_entries.bin", geo.street_entries_data);
+        write_file(tmpdir + "/addr_entries.bin", geo.addr_entries_data);
+        write_file(tmpdir + "/interp_entries.bin", geo.interp_entries_data);
+
+        auto old_ac = read_file(old_dir + "/admin_cells.bin");
+        auto old_admin_e = read_file(old_dir + "/admin_entries.bin");
+        auto admin = rebuild_admin_from_remap(old_ac, old_admin_e, ad_rm);
+        write_file(tmpdir + "/admin_cells.bin", admin.admin_cells_data);
+        write_file(tmpdir + "/admin_entries.bin", admin.admin_entries_data);
+        std::cerr << "  Rebuilt entry/cell files" << std::endl;
+    }
 
     // Open patch file
     std::ofstream pf(patch_path, std::ios::binary);
