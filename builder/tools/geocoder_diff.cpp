@@ -546,6 +546,26 @@ int main(int argc, char* argv[]) {
         for (auto c : a_added) wval(patch, &c, 8);
         for (auto c : a_removed) wval(patch, &c, 8);
         std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl;
+
+        // Include entry/cell files as full replacement for byte-identical output.
+        for (const auto& fname : std::vector<std::pair<PatchFileId, std::string>>{
+            {PatchFileId::GEO_CELLS, "geo_cells.bin"},
+            {PatchFileId::STREET_ENTRIES, "street_entries.bin"},
+            {PatchFileId::ADDR_ENTRIES, "addr_entries.bin"},
+            {PatchFileId::INTERP_ENTRIES, "interp_entries.bin"},
+            {PatchFileId::ADMIN_CELLS, "admin_cells.bin"},
+            {PatchFileId::ADMIN_ENTRIES, "admin_entries.bin"}})
+        {
+            auto data = read_file(new_dir + "/" + fname.second);
+            uint32_t f = static_cast<uint32_t>(fname.first), stride_val = 0;
+            uint64_t os = 0, ns = data.size();
+            uint32_t nfix = 0; uint64_t ss = data.size();
+            wval(patch, &f, 4); wval(patch, &stride_val, 4);
+            wval(patch, &os, 8); wval(patch, &ns, 8);
+            wval(patch, &nfix, 4); wval(patch, &ss, 8);
+            patch.insert(patch.end(), data.begin(), data.end());
+            std::cerr << "  " << fname.second << ": full " << data.size() << " bytes" << std::endl;
+        }
     }
 
     if (false) // disabled — entry files not included
