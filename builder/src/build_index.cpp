@@ -1285,8 +1285,253 @@ int main(int argc, char* argv[]) {
         log_phase("Rebuild cell maps", _pt, _cpu);
     }
 
+    // --- Deterministic ordering ---
+    // Sort all data by canonical keys so that the same PBF input always produces
+    // the same binary output, regardless of thread scheduling. This is required
+    // for incremental patching — patches between deterministic builds are small
+    // because matching records land at the same file offsets.
+    {
+        std::cerr << "Deterministic ordering..." << std::endl;
+        auto _st = std::chrono::steady_clock::now();
+        auto _sc = CpuTicks::now();
+
+        // 1. Sort string pool alphabetically, remap all string offsets
+        {
+            auto& pool_data = data.string_pool.mutable_data();
+            if (!pool_data.empty()) {
+                // Extract strings
+                std::vector<std::pair<uint32_t, const char*>> strings;
+                size_t pos = 0;
+                while (pos < pool_data.size()) {
+                    strings.emplace_back(static_cast<uint32_t>(pos), pool_data.data() + pos);
+                    pos += strlen(pool_data.data() + pos) + 1;
+                }
+                std::sort(strings.begin(), strings.end(), [](const auto& a, const auto& b) {
+                    return strcmp(a.second, b.second) < 0;
+                });
+
+                // Build remap + new pool
+                std::unordered_map<uint32_t, uint32_t> remap;
+                remap.reserve(strings.size());
+                std::vector<char> new_data;
+                new_data.reserve(pool_data.size());
+                for (auto& [old_off, str] : strings) {
+                    remap[old_off] = static_cast<uint32_t>(new_data.size());
+                    size_t len = strlen(str);
+                    new_data.insert(new_data.end(), str, str + len + 1);
+                }
+                pool_data = std::move(new_data);
+
+                // Apply remap to all data records
+                const auto& rm = remap;
+                for (auto& w : data.ways) w.name_id = rm.at(w.name_id);
+                for (auto& a : data.addr_points) {
+                    a.housenumber_id = rm.at(a.housenumber_id);
+                    a.street_id = rm.at(a.street_id);
+                }
+                for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
+                for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
+                std::cerr << "  String pool sorted: " << strings.size() << " strings" << std::endl;
+            }
+        }
+        log_phase("  Sort strings", _st, _sc);
+
+        // Helper: reinterpret float as uint32 for total ordering (works for IEEE 754)
+        auto float_bits = [](float v) -> uint32_t {
+            uint32_t bits;
+            memcpy(&bits, &v, 4);
+            // Handle negative floats: flip all bits if sign bit set, else flip sign bit
+            return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
+        };
+
+        // 2. Sort addr_points by (street_id, housenumber_id, lat_bits, lng_bits)
+        //    Using string offsets directly (already remapped to sorted pool) gives
+        //    deterministic order. Raw float bits as final tiebreaker for total order.
+        if (!data.sorted_addr_cells.empty()) {
+            size_t n = data.addr_points.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const auto& pa = data.addr_points[a];
+                const auto& pb = data.addr_points[b];
+                // Since strings are sorted alphabetically, comparing offsets
+                // gives the same order as strcmp — and it's O(1) not O(n)
+                if (pa.street_id != pb.street_id) return pa.street_id < pb.street_id;
+                if (pa.housenumber_id != pb.housenumber_id) return pa.housenumber_id < pb.housenumber_id;
+                uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
+                if (la != lb) return la < lb;
+                return float_bits(pa.lng) < float_bits(pb.lng);
+            });
+            std::vector<uint32_t> old_to_new(n);
+            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+            std::vector<AddrPoint> sorted(n);
+            for (uint32_t i = 0; i < n; i++) sorted[i] = data.addr_points[order[i]];
+            data.addr_points = std::move(sorted);
+            for (auto& p : data.sorted_addr_cells) p.item_id = old_to_new[p.item_id];
+            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
+                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+            };
+            std::sort(data.sorted_addr_cells.begin(), data.sorted_addr_cells.end(), cmp);
+            data.cell_to_addrs.clear();
+            std::cerr << "  Addr points sorted: " << n << std::endl;
+        }
+        log_phase("  Sort addr_points", _st, _sc);
+
+        // 3. Sort ways by (name, node_count, first_node) + reorder nodes
+        if (!data.ways.empty()) {
+            size_t n = data.ways.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            const auto& sp = data.string_pool.data();
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const auto& wa = data.ways[a];
+                const auto& wb = data.ways[b];
+                if (wa.name_id != wb.name_id) return wa.name_id < wb.name_id;
+                if (wa.node_count != wb.node_count) return wa.node_count < wb.node_count;
+                // Compare all nodes for total order
+                uint8_t nc = std::min(wa.node_count, wb.node_count);
+                for (uint8_t j = 0; j < nc; j++) {
+                    uint32_t la = float_bits(data.street_nodes[wa.node_offset + j].lat);
+                    uint32_t lb = float_bits(data.street_nodes[wb.node_offset + j].lat);
+                    if (la != lb) return la < lb;
+                    uint32_t ga = float_bits(data.street_nodes[wa.node_offset + j].lng);
+                    uint32_t gb = float_bits(data.street_nodes[wb.node_offset + j].lng);
+                    if (ga != gb) return ga < gb;
+                }
+                return false;
+            });
+            std::vector<uint32_t> old_to_new(n);
+            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+            std::vector<WayHeader> new_ways(n);
+            std::vector<NodeCoord> new_nodes;
+            new_nodes.reserve(data.street_nodes.size());
+            for (uint32_t i = 0; i < n; i++) {
+                auto w = data.ways[order[i]];
+                uint32_t old_off = w.node_offset;
+                w.node_offset = static_cast<uint32_t>(new_nodes.size());
+                for (uint8_t j = 0; j < w.node_count; j++)
+                    new_nodes.push_back(data.street_nodes[old_off + j]);
+                new_ways[i] = w;
+            }
+            data.ways = std::move(new_ways);
+            data.street_nodes = std::move(new_nodes);
+            for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
+            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
+                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+            };
+            std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
+            data.cell_to_ways.clear();
+            std::cerr << "  Ways sorted: " << n << std::endl;
+        }
+        log_phase("  Sort ways", _st, _sc);
+
+        // 4. Sort interps by (street, start, end, type) + reorder nodes
+        if (!data.interp_ways.empty()) {
+            size_t n = data.interp_ways.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            const auto& sp = data.string_pool.data();
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const auto& ia = data.interp_ways[a];
+                const auto& ib = data.interp_ways[b];
+                if (ia.street_id != ib.street_id) return ia.street_id < ib.street_id;
+                if (ia.start_number != ib.start_number) return ia.start_number < ib.start_number;
+                if (ia.end_number != ib.end_number) return ia.end_number < ib.end_number;
+                if (ia.interpolation != ib.interpolation) return ia.interpolation < ib.interpolation;
+                uint8_t nc = std::min(ia.node_count, ib.node_count);
+                for (uint8_t j = 0; j < nc; j++) {
+                    uint32_t la = float_bits(data.interp_nodes[ia.node_offset + j].lat);
+                    uint32_t lb = float_bits(data.interp_nodes[ib.node_offset + j].lat);
+                    if (la != lb) return la < lb;
+                    uint32_t ga = float_bits(data.interp_nodes[ia.node_offset + j].lng);
+                    uint32_t gb = float_bits(data.interp_nodes[ib.node_offset + j].lng);
+                    if (ga != gb) return ga < gb;
+                }
+                return ia.node_count < ib.node_count;
+            });
+            std::vector<uint32_t> old_to_new(n);
+            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+            std::vector<InterpWay> new_interps(n);
+            std::vector<NodeCoord> new_nodes;
+            new_nodes.reserve(data.interp_nodes.size());
+            for (uint32_t i = 0; i < n; i++) {
+                auto iw = data.interp_ways[order[i]];
+                uint32_t old_off = iw.node_offset;
+                iw.node_offset = static_cast<uint32_t>(new_nodes.size());
+                for (uint8_t j = 0; j < iw.node_count; j++)
+                    new_nodes.push_back(data.interp_nodes[old_off + j]);
+                new_interps[i] = iw;
+            }
+            data.interp_ways = std::move(new_interps);
+            data.interp_nodes = std::move(new_nodes);
+            for (auto& p : data.sorted_interp_cells) p.item_id = old_to_new[p.item_id];
+            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
+                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+            };
+            std::sort(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(), cmp);
+            data.cell_to_interps.clear();
+            std::cerr << "  Interps sorted: " << n << std::endl;
+        }
+        log_phase("  Sort interps", _st, _sc);
+
+        // 5. Sort admin polygons by (name, level, country, vertex_count) + reorder vertices
+        if (!data.admin_polygons.empty()) {
+            size_t n = data.admin_polygons.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            const auto& sp = data.string_pool.data();
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const auto& pa = data.admin_polygons[a];
+                const auto& pb = data.admin_polygons[b];
+                if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
+                if (pa.admin_level != pb.admin_level) return pa.admin_level < pb.admin_level;
+                if (pa.country_code != pb.country_code) return pa.country_code < pb.country_code;
+                if (pa.vertex_count != pb.vertex_count) return pa.vertex_count < pb.vertex_count;
+                // Compare first few vertices for tiebreaking
+                uint32_t nc = std::min(pa.vertex_count, pb.vertex_count);
+                nc = std::min(nc, 20u); // limit comparison depth
+                for (uint32_t j = 0; j < nc; j++) {
+                    uint32_t la = float_bits(data.admin_vertices[pa.vertex_offset + j].lat);
+                    uint32_t lb = float_bits(data.admin_vertices[pb.vertex_offset + j].lat);
+                    if (la != lb) return la < lb;
+                    uint32_t ga = float_bits(data.admin_vertices[pa.vertex_offset + j].lng);
+                    uint32_t gb = float_bits(data.admin_vertices[pb.vertex_offset + j].lng);
+                    if (ga != gb) return ga < gb;
+                }
+                return false;
+            });
+            std::vector<uint32_t> old_to_new(n);
+            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+            std::vector<AdminPolygon> new_polys(n);
+            std::vector<NodeCoord> new_verts;
+            new_verts.reserve(data.admin_vertices.size());
+            for (uint32_t i = 0; i < n; i++) {
+                auto p = data.admin_polygons[order[i]];
+                uint32_t old_off = p.vertex_offset;
+                p.vertex_offset = static_cast<uint32_t>(new_verts.size());
+                for (uint32_t j = 0; j < p.vertex_count; j++)
+                    new_verts.push_back(data.admin_vertices[old_off + j]);
+                new_polys[i] = p;
+            }
+            data.admin_polygons = std::move(new_polys);
+            data.admin_vertices = std::move(new_verts);
+            // Remap admin cell entries
+            for (auto& [cell_id, ids] : data.cell_to_admin) {
+                for (auto& id : ids) {
+                    uint32_t flags = id & 0x80000000u;
+                    uint32_t masked = id & 0x7FFFFFFFu;
+                    if (masked < old_to_new.size())
+                        id = old_to_new[masked] | flags;
+                }
+                std::sort(ids.begin(), ids.end());
+            }
+            std::cerr << "  Admin polygons sorted: " << n << std::endl;
+        }
+        log_phase("  Sort admin", _st, _sc);
+    }
+
     // --- Write index files ---
-    log_phase("Deduplication", _pt, _cpu);
+    log_phase("Deterministic ordering", _pt, _cpu);
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
 
     auto quality_dir_name = [](double scale) -> std::string {
