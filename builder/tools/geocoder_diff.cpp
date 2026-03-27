@@ -599,6 +599,26 @@ int main(int argc, char* argv[]) {
         write_fixups(PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", admin_id_remap, admin_stride);
     }
 
+    // Write record ID remap tables (for entry file reconstruction in patch tool)
+    // Marker: 0xFFFFFFFC, file_id, count, [(old_id, new_id)] pairs
+    {
+        auto write_id_remap = [&](PatchFileId id, const std::vector<uint32_t>& remap) {
+            uint32_t marker = 0xFFFFFFFC, fid = static_cast<uint32_t>(id);
+            std::vector<std::pair<uint32_t,uint32_t>> pairs;
+            for (uint32_t i = 0; i < remap.size(); i++)
+                if (remap[i] != 0xFFFFFFFF) pairs.push_back({i, remap[i]});
+            write_val(pf, &marker, 4); write_val(pf, &fid, 4);
+            uint32_t count = static_cast<uint32_t>(pairs.size());
+            write_val(pf, &count, 4);
+            for (auto& [o, n] : pairs) { write_val(pf, &o, 4); write_val(pf, &n, 4); }
+            std::cerr << "  id_remap file " << fid << ": " << count << " entries (" << count * 8 << " bytes)" << std::endl;
+        };
+        write_id_remap(PatchFileId::STREET_WAYS, way_id_remap);
+        write_id_remap(PatchFileId::ADDR_POINTS, addr_id_remap);
+        write_id_remap(PatchFileId::INTERP_WAYS, interp_id_remap);
+        write_id_remap(PatchFileId::ADMIN_POLYGONS, admin_id_remap);
+    }
+
     // Single-stage diffs: remapped_old → new (zstd --patch-from on temp files)
     auto diff_file = [&](PatchFileId id, const std::string& name, bool use_old_as_ref = false) {
         std::cerr << "  " << name << ": ";

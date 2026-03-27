@@ -159,6 +159,210 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    // Read ID remap tables
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t,uint32_t>> id_remaps; // file_id → (old→new)
+    while (pf) {
+        uint32_t marker; pf.read(reinterpret_cast<char*>(&marker), 4);
+        if (marker != 0xFFFFFFFC) {
+            pf.seekg(-4, std::ios::cur);
+            break;
+        }
+        uint32_t fid, count;
+        pf.read(reinterpret_cast<char*>(&fid), 4);
+        pf.read(reinterpret_cast<char*>(&count), 4);
+        auto& rm = id_remaps[fid];
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t old_id, new_id;
+            pf.read(reinterpret_cast<char*>(&old_id), 4);
+            pf.read(reinterpret_cast<char*>(&new_id), 4);
+            rm[old_id] = new_id;
+        }
+        std::cerr << "Loaded " << count << " ID remaps for file " << fid << std::endl;
+    }
+
+    // Helper: rebuild entry + cell files using ID remap
+    auto rebuild_entries = [&](const std::string& cells_file, const std::string& entries_file,
+                                size_t cell_stride, size_t offset_pos,
+                                const std::unordered_map<uint32_t,uint32_t>& id_rm, bool has_flags)
+        -> std::pair<std::vector<char>, std::vector<char>> // (entries_data, cells_data)
+    {
+        auto old_cells = read_file(cur_dir + "/" + cells_file);
+        auto old_entries = read_file(cur_dir + "/" + entries_file);
+        size_t n_cells = old_cells.size() / cell_stride;
+
+        // Parse old entries, remap IDs
+        struct CellEntry { uint64_t cell_id; std::vector<uint32_t> ids; };
+        std::vector<CellEntry> parsed;
+        for (size_t i = 0; i < n_cells; i++) {
+            uint64_t cid; uint32_t off;
+            memcpy(&cid, old_cells.data() + i * cell_stride, 8);
+            memcpy(&off, old_cells.data() + i * cell_stride + offset_pos, 4);
+            CellEntry ce; ce.cell_id = cid;
+            if (off != 0xFFFFFFFF && off + 2 <= old_entries.size()) {
+                uint16_t count; memcpy(&count, old_entries.data() + off, 2);
+                if (off + 2 + count * 4 <= old_entries.size()) {
+                    for (uint16_t j = 0; j < count; j++) {
+                        uint32_t id; memcpy(&id, old_entries.data() + off + 2 + j * 4, 4);
+                        uint32_t flags = has_flags ? (id & 0x80000000u) : 0;
+                        uint32_t masked = id & 0x7FFFFFFFu;
+                        auto it = id_rm.find(masked);
+                        if (it != id_rm.end())
+                            ce.ids.push_back(it->second | flags);
+                        else
+                            ce.ids.push_back(id); // keep unmapped IDs as-is
+                    }
+                }
+            }
+            std::sort(ce.ids.begin(), ce.ids.end());
+            parsed.push_back(std::move(ce));
+        }
+
+        // Rebuild entries + cells
+        std::vector<char> new_entries_buf, new_cells_buf;
+        uint32_t no_data = 0xFFFFFFFF;
+        for (auto& ce : parsed) {
+            new_cells_buf.insert(new_cells_buf.end(), (char*)&ce.cell_id, (char*)&ce.cell_id + 8);
+            if (ce.ids.empty()) {
+                new_cells_buf.insert(new_cells_buf.end(), (char*)&no_data, (char*)&no_data + 4);
+            } else {
+                uint32_t off = static_cast<uint32_t>(new_entries_buf.size());
+                new_cells_buf.insert(new_cells_buf.end(), (char*)&off, (char*)&off + 4);
+                uint16_t count = static_cast<uint16_t>(ce.ids.size());
+                new_entries_buf.insert(new_entries_buf.end(), (char*)&count, (char*)&count + 2);
+                new_entries_buf.insert(new_entries_buf.end(), (char*)ce.ids.data(),
+                                      (char*)ce.ids.data() + ce.ids.size() * 4);
+            }
+        }
+        return {new_entries_buf, new_cells_buf};
+    };
+
+    // Pre-rebuild entry/cell files using ID remaps (for use as zstd reference)
+    std::unordered_map<std::string, std::string> rebuilt_refs; // filename → temp path
+    if (!id_remaps.empty()) {
+        // Rebuild geo entries (street, addr, interp)
+        auto way_rm = id_remaps.count((uint32_t)PatchFileId::STREET_WAYS) ?
+                       id_remaps[(uint32_t)PatchFileId::STREET_WAYS] : std::unordered_map<uint32_t,uint32_t>{};
+        auto addr_rm = id_remaps.count((uint32_t)PatchFileId::ADDR_POINTS) ?
+                        id_remaps[(uint32_t)PatchFileId::ADDR_POINTS] : std::unordered_map<uint32_t,uint32_t>{};
+        auto interp_rm = id_remaps.count((uint32_t)PatchFileId::INTERP_WAYS) ?
+                          id_remaps[(uint32_t)PatchFileId::INTERP_WAYS] : std::unordered_map<uint32_t,uint32_t>{};
+        auto admin_rm = id_remaps.count((uint32_t)PatchFileId::ADMIN_POLYGONS) ?
+                         id_remaps[(uint32_t)PatchFileId::ADMIN_POLYGONS] : std::unordered_map<uint32_t,uint32_t>{};
+
+        // Rebuild geo: street_entries (off 8), addr_entries (off 12), interp_entries (off 16)
+        auto old_geo = read_file(cur_dir + "/geo_cells.bin");
+        auto old_se = read_file(cur_dir + "/street_entries.bin");
+        auto old_ae = read_file(cur_dir + "/addr_entries.bin");
+        auto old_ie = read_file(cur_dir + "/interp_entries.bin");
+
+        // Parse + remap each entry type
+        auto parse_and_remap = [&](const std::vector<char>& geo, size_t off_pos,
+                                     const std::vector<char>& entries,
+                                     const std::unordered_map<uint32_t,uint32_t>& rm) {
+            size_t n = geo.size() / 20;
+            std::vector<std::pair<uint64_t, std::vector<uint32_t>>> result;
+            for (size_t i = 0; i < n; i++) {
+                uint64_t cid; uint32_t off;
+                memcpy(&cid, geo.data() + i * 20, 8);
+                memcpy(&off, geo.data() + i * 20 + off_pos, 4);
+                std::vector<uint32_t> ids;
+                if (off != 0xFFFFFFFF && off + 2 <= entries.size()) {
+                    uint16_t count; memcpy(&count, entries.data() + off, 2);
+                    if (off + 2 + count * 4 <= entries.size()) {
+                        for (uint16_t j = 0; j < count; j++) {
+                            uint32_t id; memcpy(&id, entries.data() + off + 2 + j * 4, 4);
+                            auto it = rm.find(id);
+                            ids.push_back(it != rm.end() ? it->second : id);
+                        }
+                    }
+                }
+                std::sort(ids.begin(), ids.end());
+                result.push_back({cid, std::move(ids)});
+            }
+            return result;
+        };
+
+        auto sc = parse_and_remap(old_geo, 8, old_se, way_rm);
+        auto ac = parse_and_remap(old_geo, 12, old_ae, addr_rm);
+        auto ic = parse_and_remap(old_geo, 16, old_ie, interp_rm);
+
+        // Write rebuilt entries + geo_cells
+        auto write_rebuilt = [&](const std::string& name,
+                                  const std::vector<std::pair<uint64_t, std::vector<uint32_t>>>& entries) -> std::string {
+            std::string path = tmpdir + "/" + name;
+            std::vector<char> buf;
+            std::unordered_map<uint64_t, uint32_t> offsets;
+            for (auto& [cid, ids] : entries) {
+                if (ids.empty()) continue;
+                offsets[cid] = static_cast<uint32_t>(buf.size());
+                uint16_t count = static_cast<uint16_t>(ids.size());
+                buf.insert(buf.end(), (char*)&count, (char*)&count + 2);
+                buf.insert(buf.end(), (char*)ids.data(), (char*)ids.data() + ids.size() * 4);
+            }
+            write_file(path, buf);
+            return path;
+        };
+
+        rebuilt_refs["street_entries.bin"] = write_rebuilt("street_entries.bin", sc);
+        rebuilt_refs["addr_entries.bin"] = write_rebuilt("addr_entries.bin", ac);
+        rebuilt_refs["interp_entries.bin"] = write_rebuilt("interp_entries.bin", ic);
+
+        // Rebuild geo_cells from the remapped entries
+        {
+            uint32_t no_data = 0xFFFFFFFF;
+            std::vector<char> buf;
+            // Build offset maps for each entry type
+            std::unordered_map<uint64_t, uint32_t> s_off, a_off, i_off;
+            auto entries_data = [](const std::string& path) {
+                auto d = read_file(path);
+                std::unordered_map<uint64_t, uint32_t> offsets;
+                return d;
+            };
+            // Re-parse the rebuilt entries to get offsets
+            auto get_offsets = [](const std::vector<std::pair<uint64_t, std::vector<uint32_t>>>& entries) {
+                std::unordered_map<uint64_t, uint32_t> offsets;
+                uint32_t pos = 0;
+                for (auto& [cid, ids] : entries) {
+                    if (ids.empty()) continue;
+                    offsets[cid] = pos;
+                    pos += 2 + ids.size() * 4;
+                }
+                return offsets;
+            };
+            auto so = get_offsets(sc), ao = get_offsets(ac), io = get_offsets(ic);
+
+            size_t n = old_geo.size() / 20;
+            for (size_t i = 0; i < n; i++) {
+                uint64_t cid; memcpy(&cid, old_geo.data() + i * 20, 8);
+                buf.insert(buf.end(), (char*)&cid, (char*)&cid + 8);
+                auto get = [&](const auto& m) -> uint32_t {
+                    auto it = m.find(cid); return it != m.end() ? it->second : no_data;
+                };
+                uint32_t sv = get(so), av = get(ao), iv = get(io);
+                buf.insert(buf.end(), (char*)&sv, (char*)&sv + 4);
+                buf.insert(buf.end(), (char*)&av, (char*)&av + 4);
+                buf.insert(buf.end(), (char*)&iv, (char*)&iv + 4);
+            }
+            std::string path = tmpdir + "/geo_cells.bin";
+            write_file(path, buf);
+            rebuilt_refs["geo_cells.bin"] = path;
+        }
+
+        // Rebuild admin entries
+        {
+            auto [ae_data, ac_data] = rebuild_entries("admin_cells.bin", "admin_entries.bin",
+                                                        12, 8, admin_rm, true);
+            std::string ae_path = tmpdir + "/admin_entries.bin";
+            std::string ac_path = tmpdir + "/admin_cells.bin";
+            write_file(ae_path, ae_data);
+            write_file(ac_path, ac_data);
+            rebuilt_refs["admin_entries.bin"] = ae_path;
+            rebuilt_refs["admin_cells.bin"] = ac_path;
+        }
+
+        std::cerr << "Rebuilt " << rebuilt_refs.size() << " entry/cell files from ID remaps" << std::endl;
+    }
+
     // Process file sections
     while (pf) {
         uint32_t file_id; pf.read(reinterpret_cast<char*>(&file_id), 4);
@@ -198,12 +402,19 @@ int main(int argc, char* argv[]) {
             std::string zst = tmpdir + "/" + std::string(filename) + ".zst";
             write_temp(zst, delta_size);
 
-            // Load old file, apply string remap + fixups → write remapped ref
-            auto old_data = read_file(cur_dir + "/" + std::string(filename));
-            apply_str_remap(old_data, file_id);
-            apply_fixups(old_data, file_id);
-            std::string ref = tmpdir + "/" + std::string(filename) + ".ref";
-            write_file(ref, old_data);
+            // Check if we have a rebuilt ref (entry/cell files with ID remap)
+            std::string ref;
+            auto rit = rebuilt_refs.find(std::string(filename));
+            if (rit != rebuilt_refs.end()) {
+                ref = rit->second;
+            } else {
+                // Load old file, apply string remap + fixups → write remapped ref
+                auto old_data = read_file(cur_dir + "/" + std::string(filename));
+                apply_str_remap(old_data, file_id);
+                apply_fixups(old_data, file_id);
+                ref = tmpdir + "/" + std::string(filename) + ".ref";
+                write_file(ref, old_data);
+            }
 
             // Apply zstd delta
             std::string out = out_dir + "/" + std::string(filename);
