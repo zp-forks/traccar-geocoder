@@ -253,6 +253,11 @@ static constexpr uint32_t FIXUP_MARKER = 0xFFFFFFFD;
 static constexpr uint32_t CELL_CHANGES_GEO_MARKER = 0xFFFFFFFB;
 static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
 
+// Cell flag corrections marker: 0xFFFFFFF9
+// Format: marker, count(u32), [(cell_id:u64, flags:u8)] × count
+// flags: bit 0 = has_street, bit 1 = has_addr, bit 2 = has_interp
+static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
+
 // --- Shared entry rebuild logic ---
 // Used by both diff and patch tools to produce identical rebuilt entries.
 // Takes old geo_cells + old entries + ID remap → produces rebuilt entries + geo_cells.

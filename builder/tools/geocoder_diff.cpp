@@ -644,22 +644,40 @@ int main(int argc, char* argv[]) {
             remove(ref_path.c_str()); remove(zst_path.c_str());
         }
 
-        // Cell index files: full replacement (correction approach doesn't work
-        // because the derived geo_cells has wrong has/hasn't flags for ~7K cells,
-        // causing offset assignment desync)
-        for (const auto& cell_file : std::vector<std::pair<PatchFileId, std::string>>{
-            {PatchFileId::GEO_CELLS, "geo_cells.bin"},
-            {PatchFileId::ADMIN_CELLS, "admin_cells.bin"}})
+        // Cell flag corrections: identify cells whose has_street/has_addr/has_interp
+        // flags differ between old and new. Only ~3K cells typically.
+        // The patch tool uses these to correctly assign entry offsets during geo_cells rebuild.
         {
-            auto data = read_file(new_dir + "/" + cell_file.second);
-            uint32_t f = static_cast<uint32_t>(cell_file.first), st_v = 0;
-            uint64_t os = 0, ns = data.size();
-            uint32_t nfix = 0; uint64_t ss = data.size();
-            wval(patch, &f, 4); wval(patch, &st_v, 4);
-            wval(patch, &os, 8); wval(patch, &ns, 8);
-            wval(patch, &nfix, 4); wval(patch, &ss, 8);
-            patch.insert(patch.end(), data.begin(), data.end());
-            std::cerr << "  " << cell_file.second << ": full " << data.size() << " bytes" << std::endl;
+            auto new_geo_data = read_file(new_dir + "/geo_cells.bin");
+            std::unordered_map<uint64_t, uint8_t> old_cell_flags;
+            for (size_t i = 0; i < old_geo.size() / 20; i++) {
+                uint64_t cid; memcpy(&cid, old_geo.data() + i * 20, 8);
+                uint32_t s, a, ip;
+                memcpy(&s, old_geo.data()+i*20+8, 4); memcpy(&a, old_geo.data()+i*20+12, 4);
+                memcpy(&ip, old_geo.data()+i*20+16, 4);
+                uint8_t flags = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
+                old_cell_flags[cid] = flags;
+            }
+            std::vector<std::pair<uint64_t, uint8_t>> flag_corrections;
+            for (size_t i = 0; i < new_geo_data.size() / 20; i++) {
+                uint64_t cid; memcpy(&cid, new_geo_data.data() + i * 20, 8);
+                uint32_t s, a, ip;
+                memcpy(&s, new_geo_data.data()+i*20+8, 4); memcpy(&a, new_geo_data.data()+i*20+12, 4);
+                memcpy(&ip, new_geo_data.data()+i*20+16, 4);
+                uint8_t new_flags = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
+                auto it = old_cell_flags.find(cid);
+                uint8_t old_f = (it != old_cell_flags.end()) ? it->second : 0;
+                if (new_flags != old_f)
+                    flag_corrections.push_back({cid, new_flags});
+            }
+            uint32_t fm = CELL_FLAGS_MARKER;
+            uint32_t fc = static_cast<uint32_t>(flag_corrections.size());
+            wval(patch, &fm, 4); wval(patch, &fc, 4);
+            for (auto& [cid, flags] : flag_corrections) {
+                wval(patch, &cid, 8); wval(patch, &flags, 1);
+            }
+            std::cerr << "  Cell flag corrections: " << fc << " cells ("
+                      << fc * 9 << " bytes)" << std::endl;
         }
 
         if (false) { // disabled: correction approach doesn't produce matching rebuilds

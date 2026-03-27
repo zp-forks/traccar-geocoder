@@ -106,8 +106,9 @@ int main(int argc, char* argv[]) {
     struct PendingCorrection { uint32_t file_id; std::string filename; std::vector<char> delta; };
     std::vector<PendingCorrection> pending_corrections;
 
-    // Read cell changes (may appear before end marker)
+    // Read cell changes and flag corrections (may appear before end marker)
     std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed;
+    std::unordered_map<uint64_t, uint8_t> cell_flag_corrections;
 
     // Process sections
     while (pos < patch.size()) {
@@ -129,6 +130,16 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < na; i++) { uint64_t c; memcpy(&c, patch.data()+pos, 8); pos+=8; admin_added[i]=c; }
             for (uint32_t i = 0; i < nr; i++) { uint64_t c; memcpy(&c, patch.data()+pos, 8); pos+=8; admin_removed[i]=c; }
             std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl;
+            continue;
+        }
+        if (file_id == CELL_FLAGS_MARKER) {
+            uint32_t count = read_u32();
+            for (uint32_t i = 0; i < count; i++) {
+                uint64_t cid; memcpy(&cid, patch.data() + pos, 8); pos += 8;
+                uint8_t flags = static_cast<uint8_t>(patch[pos]); pos++;
+                cell_flag_corrections[cid] = flags;
+            }
+            std::cerr << "  Cell flag corrections: " << count << " cells" << std::endl;
             continue;
         }
 
@@ -351,12 +362,10 @@ int main(int argc, char* argv[]) {
         auto corr_ie = read_file(out_dir + "/interp_entries.bin");
         auto derived_geo = read_file(out_dir + "/geo_cells.bin");
 
-        // Only rebuild if geo_cells correction exists (not full replacement)
-        bool has_geo_correction = false;
-        for (auto& c : cell_corrections)
-            if (c.file_id == (uint32_t)PatchFileId::GEO_CELLS) has_geo_correction = true;
+        // Rebuild if we have cell flag corrections or cell changes (no full-replacement geo_cells)
+        bool need_geo_rebuild = !cell_flag_corrections.empty() || !geo_added.empty() || !geo_removed.empty();
 
-        if (!derived_geo.empty() && has_geo_correction) {
+        if (!derived_geo.empty() && need_geo_rebuild) {
             size_t n = derived_geo.size() / 20;
             uint32_t no_data = 0xFFFFFFFF;
 
@@ -394,14 +403,25 @@ int main(int argc, char* argv[]) {
                 // Copy cell_id
                 memcpy(new_geo.data() + c * 20, derived_geo.data() + c * 20, 8);
 
+                // Determine has/hasn't flags (from derived, with corrections applied)
+                uint64_t cid; memcpy(&cid, derived_geo.data() + c * 20, 8);
                 uint32_t old_s, old_a, old_i;
                 memcpy(&old_s, derived_geo.data() + c * 20 + 8, 4);
                 memcpy(&old_a, derived_geo.data() + c * 20 + 12, 4);
                 memcpy(&old_i, derived_geo.data() + c * 20 + 16, 4);
+                bool has_s = (old_s != no_data), has_a = (old_a != no_data), has_i = (old_i != no_data);
 
-                uint32_t new_s = (old_s != no_data && si < s_offsets.size()) ? s_offsets[si++] : no_data;
-                uint32_t new_a = (old_a != no_data && ai < a_offsets.size()) ? a_offsets[ai++] : no_data;
-                uint32_t new_i = (old_i != no_data && ii < i_offsets.size()) ? i_offsets[ii++] : no_data;
+                // Apply flag correction if this cell has one
+                auto fc_it = cell_flag_corrections.find(cid);
+                if (fc_it != cell_flag_corrections.end()) {
+                    has_s = (fc_it->second & 1) != 0;
+                    has_a = (fc_it->second & 2) != 0;
+                    has_i = (fc_it->second & 4) != 0;
+                }
+
+                uint32_t new_s = (has_s && si < s_offsets.size()) ? s_offsets[si++] : no_data;
+                uint32_t new_a = (has_a && ai < a_offsets.size()) ? a_offsets[ai++] : no_data;
+                uint32_t new_i = (has_i && ii < i_offsets.size()) ? i_offsets[ii++] : no_data;
 
                 memcpy(new_geo.data() + c * 20 + 8, &new_s, 4);
                 memcpy(new_geo.data() + c * 20 + 12, &new_a, 4);
