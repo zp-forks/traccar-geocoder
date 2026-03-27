@@ -273,8 +273,8 @@ int main(int argc, char* argv[]) {
 
             auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm,
                                                geo_added, geo_removed);
-            // Only write entry files (geo_cells may be full replacement)
-            if (!have_geo) write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
+            // Always write geo_cells (needed as correction prefix)
+            write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
             write_file(out_dir + "/street_entries.bin", geo.street_entries_data);
             write_file(out_dir + "/addr_entries.bin", geo.addr_entries_data);
             write_file(out_dir + "/interp_entries.bin", geo.interp_entries_data);
@@ -291,7 +291,7 @@ int main(int argc, char* argv[]) {
             auto old_ac = read_file(cur_dir + "/admin_cells.bin");
             auto old_ae = read_file(cur_dir + "/admin_entries.bin");
             auto admin = rebuild_admin_from_remap(old_ac, old_ae, ad_rm);
-            if (!have_admin) write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
+            write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
             write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
             std::cerr << "  Rebuilt admin_entries" << (have_admin ? "" : " + admin_cells") << std::endl;
         }

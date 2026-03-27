@@ -575,22 +575,6 @@ int main(int argc, char* argv[]) {
         for (auto c : a_removed) wval(patch, &c, 8);
         std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl;
 
-        // Cell index files: full replacement (they're pure index data, not large after zstd)
-        for (const auto& cell_file : std::vector<std::pair<PatchFileId, std::string>>{
-            {PatchFileId::GEO_CELLS, "geo_cells.bin"},
-            {PatchFileId::ADMIN_CELLS, "admin_cells.bin"}})
-        {
-            auto data = read_file(new_dir + "/" + cell_file.second);
-            uint32_t f = static_cast<uint32_t>(cell_file.first), st_v = 0;
-            uint64_t os = 0, ns = data.size();
-            uint32_t nfix = 0; uint64_t ss = data.size();
-            wval(patch, &f, 4); wval(patch, &st_v, 4);
-            wval(patch, &os, 8); wval(patch, &ns, 8);
-            wval(patch, &nfix, 4); wval(patch, &ss, 8);
-            patch.insert(patch.end(), data.begin(), data.end());
-            std::cerr << "  " << cell_file.second << ": full " << data.size() << " bytes" << std::endl;
-        }
-
         // Derive ID remaps from stored merge sequences (same as patch tool does)
         auto derive_remap = [&](PatchFileId id, size_t old_size, size_t stride) -> std::unordered_map<uint32_t,uint32_t> {
             auto it = stored_merges.find(static_cast<uint32_t>(id));
@@ -658,6 +642,31 @@ int main(int argc, char* argv[]) {
                       << std::fixed << std::setprecision(2)
                       << (ns > 0 ? ds * 100.0 / ns : 0) << "%)" << std::endl;
             remove(ref_path.c_str()); remove(zst_path.c_str());
+        }
+
+        // Cell index corrections: derived geo_cells/admin_cells → new versions
+        for (auto& [c_fid, c_label, c_data, c_fname] : std::vector<std::tuple<PatchFileId, std::string, std::vector<char>*, std::string>>{
+            {PatchFileId::GEO_CELLS, "geo_cells", &derived.geo_cells_data, "geo_cells.bin"},
+            {PatchFileId::ADMIN_CELLS, "admin_cells", &admin_derived.admin_cells_data, "admin_cells.bin"}})
+        {
+            auto c_new_data = read_file(new_dir + "/" + c_fname);
+            std::string c_ref = tmpdir + "/cell_" + c_label + ".ref";
+            std::string c_zst = tmpdir + "/cell_" + c_label + ".zst";
+            write_file(c_ref, *c_data);
+            system(("zstd --patch-from='" + c_ref + "' '" + new_dir + "/" + c_fname +
+                    "' -o '" + c_zst + "' -f --quiet 2>/dev/null").c_str());
+            auto c_zst_data = read_file(c_zst);
+            uint32_t cf = static_cast<uint32_t>(c_fid), c_st = 0xFE;
+            uint64_t c_rs = c_data->size(), c_ns = c_new_data.size();
+            uint32_t c_nfix = 0; uint64_t c_ds = c_zst_data.size();
+            wval(patch, &cf, 4); wval(patch, &c_st, 4);
+            wval(patch, &c_rs, 8); wval(patch, &c_ns, 8);
+            wval(patch, &c_nfix, 4); wval(patch, &c_ds, 8);
+            patch.insert(patch.end(), c_zst_data.begin(), c_zst_data.end());
+            std::cerr << "  " << c_fname << ": correction " << c_ds << " bytes ("
+                      << std::fixed << std::setprecision(2)
+                      << (c_ns > 0 ? c_ds * 100.0 / c_ns : 0) << "%)" << std::endl;
+            remove(c_ref.c_str()); remove(c_zst.c_str());
         }
     }
 
