@@ -304,6 +304,30 @@ static void fixup_interp_offsets(std::vector<char>& old_data, const std::vector<
     }
 }
 
+// --- Derive ID remap from merge sequence (same logic as patch tool) ---
+static std::vector<uint32_t> derive_id_remap_from_merge(
+    const MergeSequence& seq, size_t old_count, size_t stride)
+{
+    std::vector<uint32_t> id_map(old_count, 0xFFFFFFFF);
+    size_t pos = 0, old_rec = 0, new_rec = 0;
+    while (pos < seq.data.size()) {
+        uint8_t op = static_cast<uint8_t>(seq.data[pos]); pos++;
+        uint32_t count; memcpy(&count, seq.data.data() + pos, 4); pos += 4;
+        if (op == OP_MATCH_RUN) {
+            for (uint32_t k = 0; k < count; k++)
+                if (old_rec + k < id_map.size())
+                    id_map[old_rec + k] = static_cast<uint32_t>(new_rec + k);
+            old_rec += count; new_rec += count;
+        } else if (op == OP_INSERT_RUN) {
+            pos += count * stride;
+            new_rec += count;
+        } else if (op == OP_DELETE_RUN) {
+            old_rec += count;
+        }
+    }
+    return id_map;
+}
+
 // --- Write helpers ---
 static void wval(std::vector<char>& buf, const void* data, size_t size) {
     buf.insert(buf.end(), (const char*)data, (const char*)data + size);
@@ -360,10 +384,14 @@ int main(int argc, char* argv[]) {
     // Track fixups per file (applied before merge, included in patch for patch tool)
     std::unordered_map<uint32_t, std::vector<std::pair<uint32_t,uint32_t>>> file_fixups;
 
+    // Stored merge sequences for ID remap derivation
+    std::unordered_map<uint32_t, MergeSequence> stored_merges;
+
     auto write_merge = [&](PatchFileId id, const std::string& name,
                              const std::vector<char>& old_data, const std::vector<char>& new_data,
                              size_t stride) {
         auto seq = build_merge_seq(old_data, new_data, stride);
+        stored_merges[static_cast<uint32_t>(id)] = seq; // store for entry rebuild
         uint32_t fid = static_cast<uint32_t>(id);
         uint64_t os = old_data.size(), ns = new_data.size(), ss = seq.data.size();
 
@@ -547,24 +575,89 @@ int main(int argc, char* argv[]) {
         for (auto c : a_removed) wval(patch, &c, 8);
         std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl;
 
-        // Include entry/cell files as full replacement for byte-identical output.
-        for (const auto& fname : std::vector<std::pair<PatchFileId, std::string>>{
+        // Cell index files: full replacement (they're pure index data, not large after zstd)
+        for (const auto& cell_file : std::vector<std::pair<PatchFileId, std::string>>{
             {PatchFileId::GEO_CELLS, "geo_cells.bin"},
-            {PatchFileId::STREET_ENTRIES, "street_entries.bin"},
-            {PatchFileId::ADDR_ENTRIES, "addr_entries.bin"},
-            {PatchFileId::INTERP_ENTRIES, "interp_entries.bin"},
-            {PatchFileId::ADMIN_CELLS, "admin_cells.bin"},
-            {PatchFileId::ADMIN_ENTRIES, "admin_entries.bin"}})
+            {PatchFileId::ADMIN_CELLS, "admin_cells.bin"}})
         {
-            auto data = read_file(new_dir + "/" + fname.second);
-            uint32_t f = static_cast<uint32_t>(fname.first), stride_val = 0;
+            auto data = read_file(new_dir + "/" + cell_file.second);
+            uint32_t f = static_cast<uint32_t>(cell_file.first), st_v = 0;
             uint64_t os = 0, ns = data.size();
             uint32_t nfix = 0; uint64_t ss = data.size();
-            wval(patch, &f, 4); wval(patch, &stride_val, 4);
+            wval(patch, &f, 4); wval(patch, &st_v, 4);
             wval(patch, &os, 8); wval(patch, &ns, 8);
             wval(patch, &nfix, 4); wval(patch, &ss, 8);
             patch.insert(patch.end(), data.begin(), data.end());
-            std::cerr << "  " << fname.second << ": full " << data.size() << " bytes" << std::endl;
+            std::cerr << "  " << cell_file.second << ": full " << data.size() << " bytes" << std::endl;
+        }
+
+        // Derive ID remaps from stored merge sequences (same as patch tool does)
+        auto derive_remap = [&](PatchFileId id, size_t old_size, size_t stride) -> std::unordered_map<uint32_t,uint32_t> {
+            auto it = stored_merges.find(static_cast<uint32_t>(id));
+            if (it == stored_merges.end()) return {};
+            auto vec = derive_id_remap_from_merge(it->second, old_size / stride, stride);
+            std::unordered_map<uint32_t,uint32_t> m;
+            for (uint32_t i = 0; i < vec.size(); i++)
+                if (vec[i] != 0xFFFFFFFF) m[i] = vec[i];
+            return m;
+        };
+
+        auto w_rm_d = derive_remap(PatchFileId::STREET_WAYS,
+            read_file(old_dir + "/street_ways.bin").size(), way_stride);
+        auto a_rm_d = derive_remap(PatchFileId::ADDR_POINTS,
+            read_file(old_dir + "/addr_points.bin").size(), 16);
+        auto i_rm_d = derive_remap(PatchFileId::INTERP_WAYS,
+            read_file(old_dir + "/interp_ways.bin").size(), interp_stride);
+        auto ad_rm_d = derive_remap(PatchFileId::ADMIN_POLYGONS,
+            read_file(old_dir + "/admin_polygons.bin").size(), admin_stride);
+
+        // Rebuild entries using derived remaps (same as patch tool)
+        auto old_se2 = read_file(old_dir + "/street_entries.bin");
+        auto old_ae2 = read_file(old_dir + "/addr_entries.bin");
+        auto old_ie2 = read_file(old_dir + "/interp_entries.bin");
+        auto derived = rebuild_geo_from_remap(old_geo, old_se2, old_ae2, old_ie2,
+                                               w_rm_d, a_rm_d, i_rm_d, g_added, g_removed);
+        auto old_admc = read_file(old_dir + "/admin_cells.bin");
+        auto old_adme = read_file(old_dir + "/admin_entries.bin");
+        auto admin_derived = rebuild_admin_from_remap(old_admc, old_adme, ad_rm_d);
+
+        // Write correction deltas: derived → new (using zstd --patch-from)
+        struct CorrEntry { PatchFileId fid; std::string label; std::vector<char>* data; std::string fname; };
+        CorrEntry corr_entries[] = {
+            // SKIP: geo_cells and admin_cells are included as full replacement below
+            {PatchFileId::STREET_ENTRIES, "street_entries", &derived.street_entries_data, "street_entries.bin"},
+            {PatchFileId::ADDR_ENTRIES, "addr_entries", &derived.addr_entries_data, "addr_entries.bin"},
+            {PatchFileId::INTERP_ENTRIES, "interp_entries", &derived.interp_entries_data, "interp_entries.bin"},
+            // admin_cells included as full replacement above
+            {PatchFileId::ADMIN_ENTRIES, "admin_entries", &admin_derived.admin_entries_data, "admin_entries.bin"},
+        };
+        for (auto& ce : corr_entries) {
+            auto& derived_data = ce.data;
+            auto new_fname = ce.fname;
+            auto fname = ce.label;
+            auto fid = ce.fid;
+            auto new_data = read_file(new_dir + "/" + new_fname);
+
+            // Write derived → new as zstd --patch-from via temp files
+            std::string ref_path = tmpdir + "/corr_" + fname + ".ref";
+            std::string zst_path = tmpdir + "/corr_" + fname + ".zst";
+            write_file(ref_path, *derived_data);
+            system(("zstd --patch-from='" + ref_path + "' '" + new_dir + "/" + new_fname +
+                    "' -o '" + zst_path + "' -f --quiet 2>/dev/null").c_str());
+            auto zst_data = read_file(zst_path);
+
+            // Write as correction section: stride=0xFE (correction marker)
+            uint32_t f = static_cast<uint32_t>(fid), stride_corr = 0xFE;
+            uint64_t rs = derived_data->size(), ns = new_data.size();
+            uint32_t nfix = 0; uint64_t ds = zst_data.size();
+            wval(patch, &f, 4); wval(patch, &stride_corr, 4);
+            wval(patch, &rs, 8); wval(patch, &ns, 8);
+            wval(patch, &nfix, 4); wval(patch, &ds, 8);
+            patch.insert(patch.end(), zst_data.begin(), zst_data.end());
+            std::cerr << "  " << new_fname << ": correction " << ds << " bytes ("
+                      << std::fixed << std::setprecision(2)
+                      << (ns > 0 ? ds * 100.0 / ns : 0) << "%)" << std::endl;
+            remove(ref_path.c_str()); remove(zst_path.c_str());
         }
     }
 

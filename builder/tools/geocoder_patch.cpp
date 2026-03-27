@@ -102,6 +102,10 @@ int main(int argc, char* argv[]) {
     // ID remaps derived from merge sequences (populated during merge replay)
     std::unordered_map<uint32_t, std::vector<uint32_t>> derived_id_remaps;
 
+    // Buffered correction sections (applied after entry reconstruction)
+    struct PendingCorrection { uint32_t file_id; std::string filename; std::vector<char> delta; };
+    std::vector<PendingCorrection> pending_corrections;
+
     // Read cell changes (may appear before end marker)
     std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed;
 
@@ -138,13 +142,23 @@ int main(int argc, char* argv[]) {
         const char* filename = patch_file_names[file_id];
 
         if (stride == 0) {
-            // Full replacement: n_fixups=0, then seq_size = data size
-            uint32_t n_fix = read_u32(); (void)n_fix; // always 0 for full replacement
+            // Full replacement
+            uint32_t n_fix = read_u32(); (void)n_fix;
             uint64_t data_size = read_u64();
             std::vector<char> data(patch.data() + pos, patch.data() + pos + data_size);
             write_file(out_dir + "/" + std::string(filename), data);
             std::cerr << "  " << filename << ": full replacement " << data.size() << " bytes" << std::endl;
             pos += data_size;
+            continue;
+        }
+        if (stride == 0xFE) {
+            // Correction section: buffer for processing AFTER entry reconstruction
+            uint32_t n_fix = read_u32(); (void)n_fix;
+            uint64_t delta_size = read_u64();
+            pending_corrections.push_back({file_id, std::string(filename),
+                std::vector<char>(patch.data() + pos, patch.data() + pos + delta_size)});
+            pos += delta_size;
+            std::cerr << "  " << filename << ": correction buffered (" << delta_size << " bytes)" << std::endl;
             continue;
         }
 
@@ -236,7 +250,7 @@ int main(int argc, char* argv[]) {
         have_geo = check("geo_cells.bin");
         have_admin = check("admin_cells.bin");
 
-        if (!have_geo && !derived_id_remaps.empty()) {
+        if (!derived_id_remaps.empty()) { // always reconstruct entries (needed for corrections)
             std::cerr << "Reconstructing entry/cell files from derived ID remaps..." << std::endl;
             auto convert = [](const std::vector<uint32_t>& vec) {
                 std::unordered_map<uint32_t,uint32_t> m;
@@ -259,14 +273,15 @@ int main(int argc, char* argv[]) {
 
             auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm,
                                                geo_added, geo_removed);
-            write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
+            // Only write entry files (geo_cells may be full replacement)
+            if (!have_geo) write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
             write_file(out_dir + "/street_entries.bin", geo.street_entries_data);
             write_file(out_dir + "/addr_entries.bin", geo.addr_entries_data);
             write_file(out_dir + "/interp_entries.bin", geo.interp_entries_data);
-            std::cerr << "  Rebuilt geo_cells + 3 entry files" << std::endl;
+            std::cerr << "  Rebuilt 3 entry files" << (have_geo ? "" : " + geo_cells") << std::endl;
         }
 
-        if (!have_admin && !derived_id_remaps.empty()) {
+        if (!derived_id_remaps.empty()) { // always reconstruct admin entries for corrections
             std::unordered_map<uint32_t,uint32_t> ad_rm;
             if (derived_id_remaps.count((uint32_t)PatchFileId::ADMIN_POLYGONS)) {
                 auto& vec = derived_id_remaps[(uint32_t)PatchFileId::ADMIN_POLYGONS];
@@ -276,9 +291,129 @@ int main(int argc, char* argv[]) {
             auto old_ac = read_file(cur_dir + "/admin_cells.bin");
             auto old_ae = read_file(cur_dir + "/admin_entries.bin");
             auto admin = rebuild_admin_from_remap(old_ac, old_ae, ad_rm);
-            write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
+            if (!have_admin) write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
             write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
-            std::cerr << "  Rebuilt admin_cells + admin_entries" << std::endl;
+            std::cerr << "  Rebuilt admin_entries" << (have_admin ? "" : " + admin_cells") << std::endl;
+        }
+    }
+
+    // Apply buffered corrections to derived entry files
+    for (auto& corr : pending_corrections) {
+        std::string derived_path = out_dir + "/" + corr.filename;
+        std::string zst_path = tmpdir + "/corr_" + corr.filename + ".zst";
+        std::string corrected_path = tmpdir + "/corr_" + corr.filename + ".out";
+        write_file(zst_path, corr.delta);
+        std::string cmd = "zstd --patch-from='" + derived_path + "' -d '" + zst_path +
+                          "' -o '" + corrected_path + "' -f --long=31 --quiet 2>/dev/null";
+        if (system(cmd.c_str()) != 0) {
+            std::cerr << "  " << corr.filename << ": correction FAILED" << std::endl;
+        } else {
+            auto corrected = read_file(corrected_path);
+            write_file(derived_path, corrected);
+            std::cerr << "  " << corr.filename << ": corrected → " << corrected.size() << " bytes" << std::endl;
+        }
+        remove(zst_path.c_str()); remove(corrected_path.c_str());
+    }
+
+    // Post-correction cell index rebuild: disabled when cells are full replacement
+    if (false) {
+        auto se = read_file(out_dir + "/street_entries.bin");
+        auto ae = read_file(out_dir + "/addr_entries.bin");
+        auto ie = read_file(out_dir + "/interp_entries.bin");
+        auto existing_geo = read_file(out_dir + "/geo_cells.bin");
+
+        if (!existing_geo.empty()) {
+            // Parse the existing (derived) geo_cells for cell IDs, rebuild offsets from corrected entries
+            size_t n = existing_geo.size() / 20;
+
+            // Parse each entry file to build cell→offset maps
+            // Walk entries sequentially, matching against geo_cells cell order
+            auto build_offsets_from_geo = [](const std::vector<char>& geo, size_t off_pos,
+                                              const std::vector<char>& old_entries,
+                                              const std::vector<char>& new_entries) -> std::vector<char> {
+                // The corrected entries file has the right content.
+                // We need to map cell_ids to byte offsets in the corrected entries.
+                // The cell order is the same as in the derived geo_cells.
+                // We just need to recompute offsets.
+                return new_entries; // entries are already correct, just need geo_cells offsets
+            };
+
+            // Actually: re-walk the derived geo_cells, find each cell's entries in the corrected files
+            // Since the cell IDs are the same and entries are in the same order, we just recompute offsets.
+            // The corrected entry files have entries in cell_id order (from the rebuild).
+            // We can walk them to compute offsets.
+
+            // For each entry type, build cell_id → offset by scanning the entry file
+            auto scan_entries = [](const std::vector<char>& entries) -> std::vector<uint32_t> {
+                // Returns a vector of entry start positions
+                std::vector<uint32_t> positions;
+                uint32_t pos = 0;
+                while (pos + 2 <= entries.size()) {
+                    positions.push_back(pos);
+                    uint16_t count; memcpy(&count, entries.data() + pos, 2);
+                    pos += 2 + count * 4;
+                }
+                return positions;
+            };
+
+            auto s_pos = scan_entries(se);
+            auto a_pos = scan_entries(ae);
+            auto i_pos = scan_entries(ie);
+
+            // The derived geo_cells has cell_ids + offsets into derived entries.
+            // The corrected entries have the same cell order but potentially different byte offsets.
+            // Rebuild geo_cells with corrected offsets.
+            uint32_t no_data = 0xFFFFFFFF;
+            size_t si = 0, ai = 0, ii = 0;
+            std::vector<char> new_geo;
+            for (size_t c = 0; c < n; c++) {
+                uint64_t cid; memcpy(&cid, existing_geo.data() + c * 20, 8);
+                new_geo.insert(new_geo.end(), (char*)&cid, (char*)&cid + 8);
+
+                // For each entry type, check if this cell has data
+                uint32_t old_s, old_a, old_i;
+                memcpy(&old_s, existing_geo.data() + c * 20 + 8, 4);
+                memcpy(&old_a, existing_geo.data() + c * 20 + 12, 4);
+                memcpy(&old_i, existing_geo.data() + c * 20 + 16, 4);
+
+                uint32_t new_s = (old_s != no_data && si < s_pos.size()) ? s_pos[si++] : no_data;
+                uint32_t new_a = (old_a != no_data && ai < a_pos.size()) ? a_pos[ai++] : no_data;
+                uint32_t new_i = (old_i != no_data && ii < i_pos.size()) ? i_pos[ii++] : no_data;
+
+                new_geo.insert(new_geo.end(), (char*)&new_s, (char*)&new_s + 4);
+                new_geo.insert(new_geo.end(), (char*)&new_a, (char*)&new_a + 4);
+                new_geo.insert(new_geo.end(), (char*)&new_i, (char*)&new_i + 4);
+            }
+            write_file(out_dir + "/geo_cells.bin", new_geo);
+            std::cerr << "  Rebuilt geo_cells.bin from corrected entries (" << new_geo.size() << " bytes)" << std::endl;
+        }
+    }
+
+    // Similarly for admin_cells from admin_entries
+    {
+        auto ae = read_file(out_dir + "/admin_entries.bin");
+        auto existing_ac = read_file(out_dir + "/admin_cells.bin");
+        if (!existing_ac.empty()) {
+            size_t n = existing_ac.size() / 12;
+            uint32_t no_data = 0xFFFFFFFF;
+            std::vector<uint32_t> a_pos;
+            uint32_t p = 0;
+            while (p + 2 <= ae.size()) {
+                a_pos.push_back(p);
+                uint16_t count; memcpy(&count, ae.data() + p, 2);
+                p += 2 + count * 4;
+            }
+            size_t ai = 0;
+            std::vector<char> new_ac;
+            for (size_t c = 0; c < n; c++) {
+                uint64_t cid; memcpy(&cid, existing_ac.data() + c * 12, 8);
+                uint32_t old_off; memcpy(&old_off, existing_ac.data() + c * 12 + 8, 4);
+                new_ac.insert(new_ac.end(), (char*)&cid, (char*)&cid + 8);
+                uint32_t new_off = (old_off != no_data && ai < a_pos.size()) ? a_pos[ai++] : no_data;
+                new_ac.insert(new_ac.end(), (char*)&new_off, (char*)&new_off + 4);
+            }
+            write_file(out_dir + "/admin_cells.bin", new_ac);
+            std::cerr << "  Rebuilt admin_cells.bin from corrected entries (" << new_ac.size() << " bytes)" << std::endl;
         }
     }
 
