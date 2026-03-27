@@ -559,7 +559,126 @@ int main(int argc, char* argv[]) {
         std::sort(geo_removed.begin(), geo_removed.end());
         std::cerr << "  Cell changes: " << geo_added.size() << " added, " << geo_removed.size() << " removed" << std::endl;
 
+        // Parse new build's entries for added cells
+        auto new_geo_data = read_file(new_dir + "/geo_cells.bin");
+        auto new_se = read_file(new_dir + "/street_entries.bin");
+        auto new_ae = read_file(new_dir + "/addr_entries.bin");
+        auto new_ie = read_file(new_dir + "/interp_entries.bin");
+        std::unordered_set<uint64_t> added_set(geo_added.begin(), geo_added.end());
+
+        // Extract entries for new cells from new build
+        struct NewCellEntry { uint64_t cid; std::vector<uint32_t> streets, addrs, interps; };
+        std::vector<NewCellEntry> new_cell_entries;
+        {
+            auto parse_entry = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
+                if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
+                uint16_t count; memcpy(&count, data.data() + off, 2);
+                if (off + 2 + count * 4 > data.size()) return {};
+                std::vector<uint32_t> ids(count);
+                memcpy(ids.data(), data.data() + off + 2, count * 4);
+                return ids;
+            };
+            size_t nn = new_geo_data.size() / 20;
+            for (size_t i = 0; i < nn; i++) {
+                uint64_t cid; memcpy(&cid, new_geo_data.data() + i * 20, 8);
+                if (!added_set.count(cid)) continue;
+                uint32_t s_off, a_off, i_off;
+                memcpy(&s_off, new_geo_data.data() + i * 20 + 8, 4);
+                memcpy(&a_off, new_geo_data.data() + i * 20 + 12, 4);
+                memcpy(&i_off, new_geo_data.data() + i * 20 + 16, 4);
+                NewCellEntry e;
+                e.cid = cid;
+                e.streets = parse_entry(new_se, s_off);
+                e.addrs = parse_entry(new_ae, a_off);
+                e.interps = parse_entry(new_ie, i_off);
+                new_cell_entries.push_back(std::move(e));
+            }
+        }
+
         auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm, geo_added, geo_removed);
+
+        // Inject new cell entries into rebuilt data
+        // Re-parse the rebuilt geo_cells to find new cells and update their entries
+        {
+            // Parse rebuilt data
+            size_t n = geo.geo_cells_data.size() / 20;
+            std::unordered_map<uint64_t, size_t> cell_idx;
+            for (size_t i = 0; i < n; i++) {
+                uint64_t cid; memcpy(&cid, geo.geo_cells_data.data() + i * 20, 8);
+                cell_idx[cid] = i;
+            }
+
+            // Re-build entries with new cell data injected
+            struct CellData { uint64_t cell_id; std::vector<uint32_t> streets, addrs, interps; };
+            std::vector<CellData> all_cells(n);
+            auto parse_rebuilt = [](const std::vector<char>& entries, const std::vector<char>& cells_data,
+                                     size_t off_pos, size_t n) {
+                std::vector<std::vector<uint32_t>> result(n);
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t off; memcpy(&off, cells_data.data() + i * 20 + off_pos, 4);
+                    if (off == 0xFFFFFFFF || off + 2 > entries.size()) continue;
+                    uint16_t count; memcpy(&count, entries.data() + off, 2);
+                    if (off + 2 + count * 4 > entries.size()) continue;
+                    result[i].resize(count);
+                    memcpy(result[i].data(), entries.data() + off + 2, count * 4);
+                }
+                return result;
+            };
+            auto s_lists = parse_rebuilt(geo.street_entries_data, geo.geo_cells_data, 8, n);
+            auto a_lists = parse_rebuilt(geo.addr_entries_data, geo.geo_cells_data, 12, n);
+            auto i_lists = parse_rebuilt(geo.interp_entries_data, geo.geo_cells_data, 16, n);
+
+            for (size_t i = 0; i < n; i++) {
+                uint64_t cid; memcpy(&cid, geo.geo_cells_data.data() + i * 20, 8);
+                all_cells[i] = {cid, std::move(s_lists[i]), std::move(a_lists[i]), std::move(i_lists[i])};
+            }
+
+            // Inject new cell entries
+            for (auto& nce : new_cell_entries) {
+                auto it = cell_idx.find(nce.cid);
+                if (it != cell_idx.end()) {
+                    auto& c = all_cells[it->second];
+                    c.streets = std::move(nce.streets);
+                    c.addrs = std::move(nce.addrs);
+                    c.interps = std::move(nce.interps);
+                }
+            }
+
+            // Re-write entries + geo_cells
+            geo.street_entries_data.clear();
+            geo.addr_entries_data.clear();
+            geo.interp_entries_data.clear();
+            geo.geo_cells_data.clear();
+
+            uint32_t no_data = 0xFFFFFFFF;
+            auto write_ent = [&](std::vector<char>& buf, auto getter) -> std::unordered_map<uint64_t, uint32_t> {
+                std::unordered_map<uint64_t, uint32_t> offsets;
+                for (auto& c : all_cells) {
+                    auto& ids = getter(c);
+                    if (ids.empty()) continue;
+                    offsets[c.cell_id] = static_cast<uint32_t>(buf.size());
+                    uint16_t count = static_cast<uint16_t>(ids.size());
+                    buf.insert(buf.end(), (const char*)&count, (const char*)&count + 2);
+                    buf.insert(buf.end(), (const char*)ids.data(), (const char*)ids.data() + ids.size() * 4);
+                }
+                return offsets;
+            };
+            auto so = write_ent(geo.street_entries_data, [](CellData& c) -> std::vector<uint32_t>& { return c.streets; });
+            auto ao = write_ent(geo.addr_entries_data, [](CellData& c) -> std::vector<uint32_t>& { return c.addrs; });
+            auto io = write_ent(geo.interp_entries_data, [](CellData& c) -> std::vector<uint32_t>& { return c.interps; });
+
+            for (auto& c : all_cells) {
+                geo.geo_cells_data.insert(geo.geo_cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
+                auto get = [&](const auto& m) -> uint32_t {
+                    auto it = m.find(c.cell_id); return it != m.end() ? it->second : no_data;
+                };
+                uint32_t sv = get(so), av = get(ao), iv = get(io);
+                geo.geo_cells_data.insert(geo.geo_cells_data.end(), (const char*)&sv, (const char*)&sv + 4);
+                geo.geo_cells_data.insert(geo.geo_cells_data.end(), (const char*)&av, (const char*)&av + 4);
+                geo.geo_cells_data.insert(geo.geo_cells_data.end(), (const char*)&iv, (const char*)&iv + 4);
+            }
+        }
+
         write_file(tmpdir + "/geo_cells.bin", geo.geo_cells_data);
         write_file(tmpdir + "/street_entries.bin", geo.street_entries_data);
         write_file(tmpdir + "/addr_entries.bin", geo.addr_entries_data);

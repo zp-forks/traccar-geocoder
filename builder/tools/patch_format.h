@@ -321,6 +321,7 @@ inline RebuiltGeo rebuild_geo_from_remap(
     if (!added_cells.empty()) {
         for (uint64_t cid : added_cells) {
             CellData cd; cd.cell_id = cid;
+            // New cell entry data is provided via the new_cell_entries parameter (if available)
             cells.push_back(cd);
         }
         // Re-sort to maintain cell_id order
