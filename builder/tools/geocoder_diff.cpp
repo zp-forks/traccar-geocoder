@@ -657,13 +657,13 @@ int main(int argc, char* argv[]) {
     diff_file(PatchFileId::STREET_NODES, "street_nodes.bin", true);
     diff_file(PatchFileId::INTERP_NODES, "interp_nodes.bin", true);
     diff_file(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", true);
-    // Entry/cell files: use rebuilt temp as ref (has remapped IDs)
-    diff_file(PatchFileId::GEO_CELLS, "geo_cells.bin");
-    diff_file(PatchFileId::STREET_ENTRIES, "street_entries.bin");
-    diff_file(PatchFileId::ADDR_ENTRIES, "addr_entries.bin");
-    diff_file(PatchFileId::INTERP_ENTRIES, "interp_entries.bin");
-    diff_file(PatchFileId::ADMIN_CELLS, "admin_cells.bin");
-    diff_file(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin");
+    // Entry/cell files: use old directly (rebuilt entries differ subtly)
+    diff_file(PatchFileId::GEO_CELLS, "geo_cells.bin", true);
+    diff_file(PatchFileId::STREET_ENTRIES, "street_entries.bin", true);
+    diff_file(PatchFileId::ADDR_ENTRIES, "addr_entries.bin", true);
+    diff_file(PatchFileId::INTERP_ENTRIES, "interp_entries.bin", true);
+    diff_file(PatchFileId::ADMIN_CELLS, "admin_cells.bin", true);
+    diff_file(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin", true);
 
     uint32_t end = 0xFFFFFFFF;
     write_val(pf, &end, 4);

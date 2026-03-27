@@ -303,9 +303,11 @@ int main(int argc, char* argv[]) {
             return path;
         };
 
-        rebuilt_refs["street_entries.bin"] = write_rebuilt("street_entries.bin", sc);
-        rebuilt_refs["addr_entries.bin"] = write_rebuilt("addr_entries.bin", ac);
-        rebuilt_refs["interp_entries.bin"] = write_rebuilt("interp_entries.bin", ic);
+        // Entry files: don't use rebuilt refs (diff uses old→new directly)
+        // Only geo_cells uses rebuilt ref (proven to match byte-identical)
+        write_rebuilt("street_entries.bin", sc); // write for geo_cells offset calculation
+        write_rebuilt("addr_entries.bin", ac);
+        write_rebuilt("interp_entries.bin", ic);
 
         // Rebuild geo_cells from the remapped entries
         {
@@ -356,8 +358,7 @@ int main(int argc, char* argv[]) {
             std::string ac_path = tmpdir + "/admin_cells.bin";
             write_file(ae_path, ae_data);
             write_file(ac_path, ac_data);
-            rebuilt_refs["admin_entries.bin"] = ae_path;
-            rebuilt_refs["admin_cells.bin"] = ac_path;
+            // Don't add admin entries/cells to rebuilt_refs (diff uses old→new directly)
         }
 
         std::cerr << "Rebuilt " << rebuilt_refs.size() << " entry/cell files from ID remaps" << std::endl;
