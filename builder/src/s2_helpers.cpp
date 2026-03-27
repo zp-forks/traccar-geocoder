@@ -273,7 +273,8 @@ void add_admin_polygon(ParsedData& data,
         data.admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
     }
 
-    AdminPolygon poly{};
+    AdminPolygon poly;
+    memset(&poly, 0, sizeof(poly)); // zero ALL bytes including padding
     poly.vertex_offset = vertex_offset;
     poly.vertex_count = static_cast<uint32_t>(simplified.size());
     poly.name_id = data.string_pool.intern(name);

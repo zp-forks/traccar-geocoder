@@ -494,9 +494,16 @@ int main(int argc, char* argv[]) {
     // admin_polygons.bin
     {
         auto old_data = read_file(old_dir + "/admin_polygons.bin");
+        auto new_data = read_file(new_dir + "/admin_polygons.bin");
+        // Zero padding bytes (offset 13-15 between admin_level and area) for deterministic comparison
+        if (admin_stride == 24) {
+            for (size_t i = 0; i + admin_stride <= old_data.size(); i += admin_stride)
+                memset(old_data.data() + i + 13, 0, 3);
+            for (size_t i = 0; i + admin_stride <= new_data.size(); i += admin_stride)
+                memset(new_data.data() + i + 13, 0, 3);
+        }
         remap_field(old_data, admin_stride, 8, str_remap);
         auto old_v = read_file(old_dir + "/admin_vertices.bin");
-        auto new_data = read_file(new_dir + "/admin_polygons.bin");
         auto new_v = read_file(new_dir + "/admin_vertices.bin");
         auto& fixups = file_fixups[static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS)];
         size_t an = old_data.size() / admin_stride;
