@@ -644,7 +644,25 @@ int main(int argc, char* argv[]) {
             remove(ref_path.c_str()); remove(zst_path.c_str());
         }
 
-        // Cell index corrections against the entry-corrected rebuild:
+        // Cell index files: full replacement (correction approach doesn't work
+        // because the derived geo_cells has wrong has/hasn't flags for ~7K cells,
+        // causing offset assignment desync)
+        for (const auto& cell_file : std::vector<std::pair<PatchFileId, std::string>>{
+            {PatchFileId::GEO_CELLS, "geo_cells.bin"},
+            {PatchFileId::ADMIN_CELLS, "admin_cells.bin"}})
+        {
+            auto data = read_file(new_dir + "/" + cell_file.second);
+            uint32_t f = static_cast<uint32_t>(cell_file.first), st_v = 0;
+            uint64_t os = 0, ns = data.size();
+            uint32_t nfix = 0; uint64_t ss = data.size();
+            wval(patch, &f, 4); wval(patch, &st_v, 4);
+            wval(patch, &os, 8); wval(patch, &ns, 8);
+            wval(patch, &nfix, 4); wval(patch, &ss, 8);
+            patch.insert(patch.end(), data.begin(), data.end());
+            std::cerr << "  " << cell_file.second << ": full " << data.size() << " bytes" << std::endl;
+        }
+
+        if (false) { // disabled: correction approach doesn't produce matching rebuilds
         // Rebuild geo_cells from NEW entry files (which the patch tool will have after corrections)
         // using the derived cell structure. This produces a nearly-correct geo_cells.
         auto rebuild_geo_from_entries = [&](const std::vector<char>& derived_geo,
@@ -701,7 +719,7 @@ int main(int argc, char* argv[]) {
                       << (c_ns > 0 ? c_ds * 100.0 / c_ns : 0) << "%)" << std::endl;
             remove(c_ref.c_str()); remove(c_zst.c_str());
         }
-    }
+    } } // end disabled correction block
 
     if (false) // disabled — entry files not included
     for (auto& [id, name] : std::vector<std::pair<PatchFileId, std::string>>{

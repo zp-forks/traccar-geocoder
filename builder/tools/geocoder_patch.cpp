@@ -273,8 +273,8 @@ int main(int argc, char* argv[]) {
 
             auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm,
                                                geo_added, geo_removed);
-            // Always write geo_cells (needed as correction prefix)
-            write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
+            // Only write geo_cells if not already provided as full replacement
+            if (!have_geo) write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
             write_file(out_dir + "/street_entries.bin", geo.street_entries_data);
             write_file(out_dir + "/addr_entries.bin", geo.addr_entries_data);
             write_file(out_dir + "/interp_entries.bin", geo.interp_entries_data);
@@ -351,7 +351,12 @@ int main(int argc, char* argv[]) {
         auto corr_ie = read_file(out_dir + "/interp_entries.bin");
         auto derived_geo = read_file(out_dir + "/geo_cells.bin");
 
-        if (!derived_geo.empty() && !cell_corrections.empty()) {
+        // Only rebuild if geo_cells correction exists (not full replacement)
+        bool has_geo_correction = false;
+        for (auto& c : cell_corrections)
+            if (c.file_id == (uint32_t)PatchFileId::GEO_CELLS) has_geo_correction = true;
+
+        if (!derived_geo.empty() && has_geo_correction) {
             size_t n = derived_geo.size() / 20;
             uint32_t no_data = 0xFFFFFFFF;
 
