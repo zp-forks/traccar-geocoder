@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
@@ -961,7 +962,14 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     // Limit concurrent I/O to avoid saturating slow storage.
     // On fast storage, all threads get through the semaphore quickly.
     // On slow storage, excess threads do decode+callback while waiting.
-    unsigned max_io = std::min(num_threads_, std::max(8u, num_threads_ / 2));
+    unsigned max_io;
+    const char* max_io_env = getenv("BUILD_MAX_IO");
+    if (max_io_env) {
+        max_io = static_cast<unsigned>(std::atoi(max_io_env));
+        if (max_io == 0) max_io = num_threads_;
+    } else {
+        max_io = std::min(num_threads_, std::max(8u, num_threads_ / 2));
+    }
     IoSemaphore io_sem(max_io);
 
     std::atomic<size_t> next_idx{0};
@@ -1016,7 +1024,14 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
         if (blobs_[i].type == "OSMData") data_indices.push_back(i);
     if (data_indices.empty()) return;
 
-    unsigned max_io = std::min(num_threads_, std::max(8u, num_threads_ / 2));
+    unsigned max_io;
+    const char* max_io_env = getenv("BUILD_MAX_IO");
+    if (max_io_env) {
+        max_io = static_cast<unsigned>(std::atoi(max_io_env));
+        if (max_io == 0) max_io = num_threads_;
+    } else {
+        max_io = std::min(num_threads_, std::max(8u, num_threads_ / 2));
+    }
     IoSemaphore io_sem(max_io);
 
     std::atomic<size_t> next_idx{0};
