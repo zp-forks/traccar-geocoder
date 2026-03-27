@@ -368,37 +368,25 @@ static void remap_and_rebuild_entries(
         remap_ids(ac, addr_remap);
         remap_ids(ic, interp_remap);
 
-        // Merge: start with remapped old, overlay with new for changed/added cells
-        // For cells that exist in new but not old: add from new
-        // For cells that exist in old but not new: remove
-        for (auto& [cid, ids] : new_sc) sc[cid] = ids;
-        for (auto& [cid, ids] : new_ac) ac[cid] = ids;
-        for (auto& [cid, ids] : new_ic) ic[cid] = ids;
-
-        // Collect all cells from new build
-        std::unordered_map<uint64_t, bool> new_cells;
-        size_t nn = new_geo.size() / 20;
-        for (size_t i = 0; i < nn; i++) {
-            uint64_t cid; memcpy(&cid, new_geo.data() + i * 20, 8);
-            new_cells[cid] = true;
-        }
-        // Remove cells not in new
-        for (auto it = sc.begin(); it != sc.end(); )
-            new_cells.count(it->first) ? ++it : it = sc.erase(it);
-        for (auto it = ac.begin(); it != ac.end(); )
-            new_cells.count(it->first) ? ++it : it = ac.erase(it);
-        for (auto it = ic.begin(); it != ic.end(); )
-            new_cells.count(it->first) ? ++it : it = ic.erase(it);
+        // Don't overlay new entries — use pure ID remap only.
+        // This ensures the diff tool's rebuild matches the patch tool's rebuild exactly.
+        // The zstd delta will encode the remaining differences (new/removed records).
+        (void)new_sc; (void)new_ac; (void)new_ic; // not used for overlay
 
         // Write merged entries + geo_cells
-        // (This produces files almost identical to new build's entries)
+        // Write rebuilt entries + geo_cells using old cell set + remapped IDs.
+        // This produces the same output as the patch tool's rebuild.
         auto write_geo = [&](const std::string& dir,
                               const std::unordered_map<uint64_t, std::vector<uint32_t>>& s,
                               const std::unordered_map<uint64_t, std::vector<uint32_t>>& a,
                               const std::unordered_map<uint64_t, std::vector<uint32_t>>& ip) {
-            // Collect all cells
+            // Use OLD cell set (patch tool only has old cells)
             std::vector<uint64_t> all_cells;
-            for (auto& [id, _] : new_cells) all_cells.push_back(id);
+            size_t n_old = old_geo.size() / 20;
+            for (size_t i = 0; i < n_old; i++) {
+                uint64_t cid; memcpy(&cid, old_geo.data() + i * 20, 8);
+                all_cells.push_back(cid);
+            }
             std::sort(all_cells.begin(), all_cells.end());
 
             auto write_ent = [&](const std::string& path,
@@ -451,20 +439,8 @@ static void remap_and_rebuild_entries(
         auto new_ae = read_file(new_dir + "/admin_entries.bin");
 
         auto cells = parse_entries(old_ac, 12, 8, old_ae);
-        auto new_cells_map = parse_entries(new_ac, 12, 8, new_ae);
+        (void)new_ac; (void)new_ae; // not used — pure ID remap to match patch tool
         remap_ids(cells, admin_remap, true);
-
-        // Merge with new
-        for (auto& [cid, ids] : new_cells_map) cells[cid] = ids;
-        // Remove cells not in new
-        std::unordered_map<uint64_t, bool> new_cell_set;
-        size_t nn = new_ac.size() / 12;
-        for (size_t i = 0; i < nn; i++) {
-            uint64_t cid; memcpy(&cid, new_ac.data() + i * 12, 8);
-            new_cell_set[cid] = true;
-        }
-        for (auto it = cells.begin(); it != cells.end(); )
-            new_cell_set.count(it->first) ? ++it : it = cells.erase(it);
 
         write_entries_cells(tmpdir + "/admin_cells.bin", tmpdir + "/admin_entries.bin", cells, 12);
     }
@@ -554,7 +530,18 @@ int main(int argc, char* argv[]) {
     uint32_t ver = GCPATCH_VERSION, flags = 0;
     write_val(pf, &ver, 4); write_val(pf, &flags, 4);
 
-    // Write string remap
+    // Helper: compress a blob with zstd via CLI, return compressed data
+    auto zstd_compress_blob = [&](const std::vector<char>& data) -> std::vector<char> {
+        std::string raw_path = tmpdir + "/blob.raw";
+        std::string zst_path = tmpdir + "/blob.zst";
+        write_file(raw_path, data);
+        system(("zstd -19 '" + raw_path + "' -o '" + zst_path + "' -f --quiet 2>/dev/null").c_str());
+        auto result = read_file(zst_path);
+        remove(raw_path.c_str()); remove(zst_path.c_str());
+        return result;
+    };
+
+    // Write string remap (compressed)
     {
         uint32_t marker = 0xFFFFFFFE;
         write_val(pf, &marker, 4);
@@ -566,10 +553,19 @@ int main(int argc, char* argv[]) {
             entries.push_back({old_off, (it != str_remap.end()) ? it->second : old_off});
             pos += strlen(old_strings.data() + pos) + 1;
         }
+        // Serialize to blob
+        std::vector<char> blob(entries.size() * 8);
+        for (size_t i = 0; i < entries.size(); i++) {
+            memcpy(blob.data() + i * 8, &entries[i].first, 4);
+            memcpy(blob.data() + i * 8 + 4, &entries[i].second, 4);
+        }
+        auto compressed = zstd_compress_blob(blob);
         uint32_t count = static_cast<uint32_t>(entries.size());
+        uint64_t comp_size = compressed.size();
         write_val(pf, &count, 4);
-        for (auto& [o, n] : entries) { write_val(pf, &o, 4); write_val(pf, &n, 4); }
-        std::cerr << "  Remap: " << count << " entries" << std::endl;
+        write_val(pf, &comp_size, 8);
+        pf.write(compressed.data(), compressed.size());
+        std::cerr << "  Remap: " << count << " entries (" << blob.size() << " -> " << compressed.size() << " bytes)" << std::endl;
     }
 
     // Write offset fixup tables for ways/interps/admin (node_offset/vertex_offset)
@@ -587,12 +583,21 @@ int main(int argc, char* argv[]) {
                     fixups.push_back({i, new_val});
                 }
             }
+            // Serialize + compress
+            std::vector<char> blob(fixups.size() * 8);
+            for (size_t i = 0; i < fixups.size(); i++) {
+                memcpy(blob.data() + i * 8, &fixups[i].first, 4);
+                memcpy(blob.data() + i * 8 + 4, &fixups[i].second, 4);
+            }
+            auto compressed = zstd_compress_blob(blob);
             write_val(pf, &marker, 4); write_val(pf, &fid, 4);
             write_val(pf, &st, 4);
             uint32_t count = static_cast<uint32_t>(fixups.size());
+            uint64_t comp_size = compressed.size();
             write_val(pf, &count, 4);
-            for (auto& [idx, val] : fixups) { write_val(pf, &idx, 4); write_val(pf, &val, 4); }
-            std::cerr << "  fixup " << name << ": " << count << " entries" << std::endl;
+            write_val(pf, &comp_size, 8);
+            pf.write(compressed.data(), compressed.size());
+            std::cerr << "  fixup " << name << ": " << count << " entries (" << blob.size() << " -> " << compressed.size() << ")" << std::endl;
         };
         write_fixups(PatchFileId::STREET_WAYS, "street_ways.bin", way_id_remap, way_stride);
         write_fixups(PatchFileId::INTERP_WAYS, "interp_ways.bin", interp_id_remap, interp_stride);
@@ -607,11 +612,19 @@ int main(int argc, char* argv[]) {
             std::vector<std::pair<uint32_t,uint32_t>> pairs;
             for (uint32_t i = 0; i < remap.size(); i++)
                 if (remap[i] != 0xFFFFFFFF) pairs.push_back({i, remap[i]});
+            std::vector<char> blob(pairs.size() * 8);
+            for (size_t i = 0; i < pairs.size(); i++) {
+                memcpy(blob.data() + i * 8, &pairs[i].first, 4);
+                memcpy(blob.data() + i * 8 + 4, &pairs[i].second, 4);
+            }
+            auto compressed = zstd_compress_blob(blob);
             write_val(pf, &marker, 4); write_val(pf, &fid, 4);
             uint32_t count = static_cast<uint32_t>(pairs.size());
+            uint64_t comp_size = compressed.size();
             write_val(pf, &count, 4);
-            for (auto& [o, n] : pairs) { write_val(pf, &o, 4); write_val(pf, &n, 4); }
-            std::cerr << "  id_remap file " << fid << ": " << count << " entries (" << count * 8 << " bytes)" << std::endl;
+            write_val(pf, &comp_size, 8);
+            pf.write(compressed.data(), compressed.size());
+            std::cerr << "  id_remap file " << fid << ": " << count << " (" << blob.size() << " -> " << compressed.size() << ")" << std::endl;
         };
         write_id_remap(PatchFileId::STREET_WAYS, way_id_remap);
         write_id_remap(PatchFileId::ADDR_POINTS, addr_id_remap);
@@ -657,13 +670,13 @@ int main(int argc, char* argv[]) {
     diff_file(PatchFileId::STREET_NODES, "street_nodes.bin", true);
     diff_file(PatchFileId::INTERP_NODES, "interp_nodes.bin", true);
     diff_file(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", true);
-    // Entry/cell files: use old directly (rebuilt entries differ subtly)
-    diff_file(PatchFileId::GEO_CELLS, "geo_cells.bin", true);
-    diff_file(PatchFileId::STREET_ENTRIES, "street_entries.bin", true);
-    diff_file(PatchFileId::ADDR_ENTRIES, "addr_entries.bin", true);
-    diff_file(PatchFileId::INTERP_ENTRIES, "interp_entries.bin", true);
-    diff_file(PatchFileId::ADMIN_CELLS, "admin_cells.bin", true);
-    diff_file(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin", true);
+    // Entry/cell files: use rebuilt temp as ref (with remapped IDs)
+    diff_file(PatchFileId::GEO_CELLS, "geo_cells.bin");
+    diff_file(PatchFileId::STREET_ENTRIES, "street_entries.bin");
+    diff_file(PatchFileId::ADDR_ENTRIES, "addr_entries.bin");
+    diff_file(PatchFileId::INTERP_ENTRIES, "interp_entries.bin");
+    diff_file(PatchFileId::ADMIN_CELLS, "admin_cells.bin");
+    diff_file(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin");
 
     uint32_t end = 0xFFFFFFFF;
     write_val(pf, &end, 4);

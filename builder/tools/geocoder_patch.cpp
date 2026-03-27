@@ -64,16 +64,31 @@ int main(int argc, char* argv[]) {
         std::cerr << "Unsupported version " << version << std::endl; return 1;
     }
 
-    // Read string remap
+    // Helper: decompress zstd blob via CLI
+    auto zstd_decompress_blob = [&](const std::vector<char>& compressed, size_t expected_size) -> std::vector<char> {
+        std::string zst_path = tmpdir + "/blob.zst";
+        std::string raw_path = tmpdir + "/blob.raw";
+        write_file(zst_path, compressed);
+        system(("zstd -d '" + zst_path + "' -o '" + raw_path + "' -f --quiet 2>/dev/null").c_str());
+        auto result = read_file(raw_path);
+        remove(zst_path.c_str()); remove(raw_path.c_str());
+        return result;
+    };
+
+    // Read string remap (compressed)
     std::unordered_map<uint32_t, uint32_t> str_remap;
     {
         uint32_t section_id; pf.read(reinterpret_cast<char*>(&section_id), 4);
         if (section_id == 0xFFFFFFFE) {
             uint32_t count; pf.read(reinterpret_cast<char*>(&count), 4);
+            uint64_t comp_size; pf.read(reinterpret_cast<char*>(&comp_size), 8);
+            std::vector<char> compressed(comp_size);
+            pf.read(compressed.data(), comp_size);
+            auto blob = zstd_decompress_blob(compressed, count * 8);
             for (uint32_t i = 0; i < count; i++) {
                 uint32_t old_off, new_off;
-                pf.read(reinterpret_cast<char*>(&old_off), 4);
-                pf.read(reinterpret_cast<char*>(&new_off), 4);
+                memcpy(&old_off, blob.data() + i * 8, 4);
+                memcpy(&new_off, blob.data() + i * 8 + 4, 4);
                 if (old_off != new_off) str_remap[old_off] = new_off;
             }
             std::cerr << "Loaded " << str_remap.size() << " string remap entries" << std::endl;
@@ -94,12 +109,16 @@ int main(int argc, char* argv[]) {
         pf.read(reinterpret_cast<char*>(&fid), 4);
         pf.read(reinterpret_cast<char*>(&stride), 4);
         pf.read(reinterpret_cast<char*>(&count), 4);
+        uint64_t comp_size; pf.read(reinterpret_cast<char*>(&comp_size), 8);
+        std::vector<char> compressed(comp_size);
+        pf.read(compressed.data(), comp_size);
+        auto blob = zstd_decompress_blob(compressed, count * 8);
         auto& vec = fixup_tables[fid];
         fixup_strides[fid] = stride;
         vec.resize(count);
         for (uint32_t i = 0; i < count; i++) {
-            pf.read(reinterpret_cast<char*>(&vec[i].record_idx), 4);
-            pf.read(reinterpret_cast<char*>(&vec[i].new_value), 4);
+            memcpy(&vec[i].record_idx, blob.data() + i * 8, 4);
+            memcpy(&vec[i].new_value, blob.data() + i * 8 + 4, 4);
         }
         std::cerr << "Loaded " << count << " fixups for file " << fid << std::endl;
     }
@@ -170,11 +189,15 @@ int main(int argc, char* argv[]) {
         uint32_t fid, count;
         pf.read(reinterpret_cast<char*>(&fid), 4);
         pf.read(reinterpret_cast<char*>(&count), 4);
+        uint64_t comp_size; pf.read(reinterpret_cast<char*>(&comp_size), 8);
+        std::vector<char> compressed(comp_size);
+        pf.read(compressed.data(), comp_size);
+        auto blob = zstd_decompress_blob(compressed, count * 8);
         auto& rm = id_remaps[fid];
         for (uint32_t i = 0; i < count; i++) {
             uint32_t old_id, new_id;
-            pf.read(reinterpret_cast<char*>(&old_id), 4);
-            pf.read(reinterpret_cast<char*>(&new_id), 4);
+            memcpy(&old_id, blob.data() + i * 8, 4);
+            memcpy(&new_id, blob.data() + i * 8 + 4, 4);
             rm[old_id] = new_id;
         }
         std::cerr << "Loaded " << count << " ID remaps for file " << fid << std::endl;
