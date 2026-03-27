@@ -492,6 +492,7 @@ int main(int argc, char* argv[]) {
     // --- Section: Entry/cell files as full new data ---
     // These are small relative to data files and rebuilt by patch tool isn't reliable.
     // Include them as full replacement. zstd transport compression handles the rest.
+    // Entry/cell files: full replacement (zstd transport handles compression)
     for (auto& [id, name] : std::vector<std::pair<PatchFileId, std::string>>{
         {PatchFileId::GEO_CELLS, "geo_cells.bin"},
         {PatchFileId::STREET_ENTRIES, "street_entries.bin"},
