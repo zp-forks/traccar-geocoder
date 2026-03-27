@@ -492,14 +492,65 @@ int main(int argc, char* argv[]) {
     // --- Section: Entry/cell files as full new data ---
     // These are small relative to data files and rebuilt by patch tool isn't reliable.
     // Include them as full replacement. zstd transport compression handles the rest.
-    // Entry/cell files: full replacement (zstd transport handles compression)
+    // Entry/cell files: NOT included.
+    // The patch tool reconstructs them from the derived ID remaps
+    // (extracted implicitly from the merge sequences above).
+    // geo_cells.bin, admin_cells.bin, and all entry files are rebuilt.
+    std::cerr << "  (entry/cell files: omitted, rebuilt by patch tool)" << std::endl;
+
+    // Include cell_id changes for entry reconstruction
+    {
+        // Geo cell changes
+        auto new_geo = read_file(new_dir + "/geo_cells.bin");
+        auto old_geo = read_file(old_dir + "/geo_cells.bin");
+        std::unordered_set<uint64_t> old_set, new_set;
+        for (size_t i = 0; i < old_geo.size() / 20; i++) {
+            uint64_t c; memcpy(&c, old_geo.data() + i * 20, 8); old_set.insert(c);
+        }
+        for (size_t i = 0; i < new_geo.size() / 20; i++) {
+            uint64_t c; memcpy(&c, new_geo.data() + i * 20, 8); new_set.insert(c);
+        }
+        std::vector<uint64_t> g_added, g_removed;
+        for (auto c : new_set) if (!old_set.count(c)) g_added.push_back(c);
+        for (auto c : old_set) if (!new_set.count(c)) g_removed.push_back(c);
+        std::sort(g_added.begin(), g_added.end());
+        std::sort(g_removed.begin(), g_removed.end());
+
+        uint32_t marker = CELL_CHANGES_GEO_MARKER;
+        uint32_t na = g_added.size(), nr = g_removed.size();
+        wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
+        for (auto c : g_added) wval(patch, &c, 8);
+        for (auto c : g_removed) wval(patch, &c, 8);
+        std::cerr << "  Geo cell changes: +" << na << " -" << nr << " ("
+                  << (na + nr) * 8 << " bytes)" << std::endl;
+
+        // Admin cell changes
+        auto new_ac = read_file(new_dir + "/admin_cells.bin");
+        auto old_ac = read_file(old_dir + "/admin_cells.bin");
+        old_set.clear(); new_set.clear();
+        for (size_t i = 0; i < old_ac.size() / 12; i++) {
+            uint64_t c; memcpy(&c, old_ac.data() + i * 12, 8); old_set.insert(c);
+        }
+        for (size_t i = 0; i < new_ac.size() / 12; i++) {
+            uint64_t c; memcpy(&c, new_ac.data() + i * 12, 8); new_set.insert(c);
+        }
+        std::vector<uint64_t> a_added, a_removed;
+        for (auto c : new_set) if (!old_set.count(c)) a_added.push_back(c);
+        for (auto c : old_set) if (!new_set.count(c)) a_removed.push_back(c);
+        std::sort(a_added.begin(), a_added.end());
+        std::sort(a_removed.begin(), a_removed.end());
+
+        marker = CELL_CHANGES_ADMIN_MARKER;
+        na = a_added.size(); nr = a_removed.size();
+        wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
+        for (auto c : a_added) wval(patch, &c, 8);
+        for (auto c : a_removed) wval(patch, &c, 8);
+        std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl;
+    }
+
+    if (false) // disabled — entry files not included
     for (auto& [id, name] : std::vector<std::pair<PatchFileId, std::string>>{
-        {PatchFileId::GEO_CELLS, "geo_cells.bin"},
-        {PatchFileId::STREET_ENTRIES, "street_entries.bin"},
-        {PatchFileId::ADDR_ENTRIES, "addr_entries.bin"},
-        {PatchFileId::INTERP_ENTRIES, "interp_entries.bin"},
-        {PatchFileId::ADMIN_CELLS, "admin_cells.bin"},
-        {PatchFileId::ADMIN_ENTRIES, "admin_entries.bin"}}) {
+        {PatchFileId::GEO_CELLS, "geo_cells.bin"}}) {
         auto data = read_file(new_dir + "/" + name);
         uint32_t fid = static_cast<uint32_t>(id);
         uint32_t st = 0; // stride 0 = full replacement

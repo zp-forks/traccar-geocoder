@@ -99,10 +99,34 @@ int main(int argc, char* argv[]) {
             }
     };
 
+    // ID remaps derived from merge sequences (populated during merge replay)
+    std::unordered_map<uint32_t, std::vector<uint32_t>> derived_id_remaps;
+
+    // Read cell changes (may appear before end marker)
+    std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed;
+
     // Process sections
     while (pos < patch.size()) {
         uint32_t file_id = read_u32();
         if (file_id == 0xFFFFFFFF) break;
+
+        // Cell change sections
+        if (file_id == CELL_CHANGES_GEO_MARKER) {
+            uint32_t na = read_u32(), nr = read_u32();
+            geo_added.resize(na); geo_removed.resize(nr);
+            for (uint32_t i = 0; i < na; i++) { uint64_t c; memcpy(&c, patch.data()+pos, 8); pos+=8; geo_added[i]=c; }
+            for (uint32_t i = 0; i < nr; i++) { uint64_t c; memcpy(&c, patch.data()+pos, 8); pos+=8; geo_removed[i]=c; }
+            std::cerr << "  Geo cell changes: +" << na << " -" << nr << std::endl;
+            continue;
+        }
+        if (file_id == CELL_CHANGES_ADMIN_MARKER) {
+            uint32_t na = read_u32(), nr = read_u32();
+            admin_added.resize(na); admin_removed.resize(nr);
+            for (uint32_t i = 0; i < na; i++) { uint64_t c; memcpy(&c, patch.data()+pos, 8); pos+=8; admin_added[i]=c; }
+            for (uint32_t i = 0; i < nr; i++) { uint64_t c; memcpy(&c, patch.data()+pos, 8); pos+=8; admin_removed[i]=c; }
+            std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl;
+            continue;
+        }
 
         uint32_t stride = read_u32();
         uint64_t old_size = read_u64(), new_size = read_u64();
@@ -145,38 +169,117 @@ int main(int argc, char* argv[]) {
         }
         if (n_fixups > 0) std::cerr << "    Applied " << n_fixups << " fixups" << std::endl;
 
-        // Read merge sequence size and replay
+        // Read merge sequence size and replay, tracking old→new ID mapping
         uint64_t seq_size = read_u64();
         std::vector<char> output;
         output.reserve(new_size);
-        size_t old_pos = 0;
+        size_t old_rec = 0, new_rec = 0; // record indices
+        size_t old_pos_bytes = 0;
         size_t seq_end = pos + seq_size;
+
+        // ID remap for this file (old_record_index → new_record_index)
+        std::vector<uint32_t> id_map;
+        bool track_ids = (file_id == (uint32_t)PatchFileId::ADDR_POINTS ||
+                          file_id == (uint32_t)PatchFileId::STREET_WAYS ||
+                          file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
+                          file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS);
+        if (track_ids) id_map.assign(old_data.size() / actual_stride, 0xFFFFFFFF);
 
         while (pos < seq_end) {
             uint8_t op = static_cast<uint8_t>(patch[pos]); pos++;
             uint32_t count; memcpy(&count, patch.data() + pos, 4); pos += 4;
 
             if (op == OP_MATCH_RUN) {
-                // Copy count records from old
                 size_t bytes = count * actual_stride;
-                if (old_pos + bytes <= old_data.size()) {
-                    output.insert(output.end(), old_data.data() + old_pos,
-                                 old_data.data() + old_pos + bytes);
-                }
-                old_pos += bytes;
+                if (old_pos_bytes + bytes <= old_data.size())
+                    output.insert(output.end(), old_data.data() + old_pos_bytes,
+                                 old_data.data() + old_pos_bytes + bytes);
+                if (track_ids)
+                    for (uint32_t k = 0; k < count; k++)
+                        if (old_rec + k < id_map.size())
+                            id_map[old_rec + k] = static_cast<uint32_t>(new_rec + k);
+                old_rec += count; new_rec += count;
+                old_pos_bytes += bytes;
             } else if (op == OP_INSERT_RUN) {
-                // Read count records from patch
                 size_t bytes = count * actual_stride;
                 output.insert(output.end(), patch.data() + pos, patch.data() + pos + bytes);
                 pos += bytes;
+                new_rec += count;
             } else if (op == OP_DELETE_RUN) {
-                // Skip count records in old
-                old_pos += count * actual_stride;
+                old_rec += count;
+                old_pos_bytes += count * actual_stride;
             }
         }
 
         write_file(out_dir + "/" + std::string(filename), output);
-        std::cerr << "  " << filename << ": " << output.size() << " bytes" << std::endl;
+
+        // Store ID remap for entry reconstruction
+        if (track_ids) {
+            derived_id_remaps[file_id] = std::move(id_map);
+            size_t matched = 0;
+            for (auto v : derived_id_remaps[file_id]) if (v != 0xFFFFFFFF) matched++;
+            std::cerr << "  " << filename << ": " << output.size() << " bytes (mapped "
+                      << matched << "/" << derived_id_remaps[file_id].size() << " IDs)" << std::endl;
+        } else {
+            std::cerr << "  " << filename << ": " << output.size() << " bytes" << std::endl;
+        }
+    }
+
+    // Reconstruct entry/cell files from derived ID remaps (if not provided as full replacement)
+    {
+        bool have_geo = false, have_admin = false;
+        // Check if geo_cells was already written (full replacement)
+        auto check = [&](const std::string& name) -> bool {
+            auto d = read_file(out_dir + "/" + name);
+            return !d.empty();
+        };
+        have_geo = check("geo_cells.bin");
+        have_admin = check("admin_cells.bin");
+
+        if (!have_geo && !derived_id_remaps.empty()) {
+            std::cerr << "Reconstructing entry/cell files from derived ID remaps..." << std::endl;
+            auto convert = [](const std::vector<uint32_t>& vec) {
+                std::unordered_map<uint32_t,uint32_t> m;
+                for (uint32_t i = 0; i < vec.size(); i++)
+                    if (vec[i] != 0xFFFFFFFF) m[i] = vec[i];
+                return m;
+            };
+            std::unordered_map<uint32_t,uint32_t> w_rm, a_rm, i_rm;
+            if (derived_id_remaps.count((uint32_t)PatchFileId::STREET_WAYS))
+                w_rm = convert(derived_id_remaps[(uint32_t)PatchFileId::STREET_WAYS]);
+            if (derived_id_remaps.count((uint32_t)PatchFileId::ADDR_POINTS))
+                a_rm = convert(derived_id_remaps[(uint32_t)PatchFileId::ADDR_POINTS]);
+            if (derived_id_remaps.count((uint32_t)PatchFileId::INTERP_WAYS))
+                i_rm = convert(derived_id_remaps[(uint32_t)PatchFileId::INTERP_WAYS]);
+
+            auto old_geo = read_file(cur_dir + "/geo_cells.bin");
+            auto old_se = read_file(cur_dir + "/street_entries.bin");
+            auto old_ae = read_file(cur_dir + "/addr_entries.bin");
+            auto old_ie = read_file(cur_dir + "/interp_entries.bin");
+
+            auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm,
+                                               geo_added, geo_removed);
+            write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
+            write_file(out_dir + "/street_entries.bin", geo.street_entries_data);
+            write_file(out_dir + "/addr_entries.bin", geo.addr_entries_data);
+            write_file(out_dir + "/interp_entries.bin", geo.interp_entries_data);
+            std::cerr << "  Rebuilt geo_cells + 3 entry files" << std::endl;
+        }
+
+        if (!have_admin && !derived_id_remaps.empty()) {
+            std::unordered_map<uint32_t,uint32_t> ad_rm;
+            if (derived_id_remaps.count((uint32_t)PatchFileId::ADMIN_POLYGONS)) {
+                auto& vec = derived_id_remaps[(uint32_t)PatchFileId::ADMIN_POLYGONS];
+                for (uint32_t i = 0; i < vec.size(); i++)
+                    if (vec[i] != 0xFFFFFFFF) ad_rm[i] = vec[i];
+            }
+            auto old_ac = read_file(cur_dir + "/admin_cells.bin");
+            auto old_ae = read_file(cur_dir + "/admin_entries.bin");
+            auto admin = rebuild_admin_from_remap(old_ac, old_ae, ad_rm);
+            write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
+            write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
+            std::cerr << "  Rebuilt admin_cells + admin_entries" << std::endl;
+        }
     }
 
     std::string rm_cmd = "rm -rf '" + tmpdir + "'";
