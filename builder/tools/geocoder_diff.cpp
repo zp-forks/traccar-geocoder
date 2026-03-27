@@ -644,9 +644,42 @@ int main(int argc, char* argv[]) {
             remove(ref_path.c_str()); remove(zst_path.c_str());
         }
 
-        // Cell index corrections: derived geo_cells/admin_cells → new versions
+        // Cell index corrections against the entry-corrected rebuild:
+        // Rebuild geo_cells from NEW entry files (which the patch tool will have after corrections)
+        // using the derived cell structure. This produces a nearly-correct geo_cells.
+        auto rebuild_geo_from_entries = [&](const std::vector<char>& derived_geo,
+                                             const std::string& se_path, const std::string& ae_path,
+                                             const std::string& ie_path) -> std::vector<char> {
+            auto se = read_file(se_path), ae = read_file(ae_path), ie = read_file(ie_path);
+            auto build_offsets = [](const std::vector<char>& ef) -> std::vector<uint32_t> {
+                std::vector<uint32_t> offs; uint32_t p = 0;
+                while (p + 2 <= ef.size()) { offs.push_back(p); uint16_t c; memcpy(&c, ef.data()+p, 2); p += 2+c*4; }
+                return offs;
+            };
+            auto so = build_offsets(se), ao = build_offsets(ae), io = build_offsets(ie);
+            size_t n = derived_geo.size() / 20, si = 0, ai = 0, ii = 0;
+            uint32_t no_data = 0xFFFFFFFF;
+            std::vector<char> result(derived_geo.size());
+            for (size_t c = 0; c < n; c++) {
+                memcpy(result.data() + c*20, derived_geo.data() + c*20, 8);
+                uint32_t os, oa, oi;
+                memcpy(&os, derived_geo.data()+c*20+8, 4); memcpy(&oa, derived_geo.data()+c*20+12, 4);
+                memcpy(&oi, derived_geo.data()+c*20+16, 4);
+                uint32_t ns = (os != no_data && si < so.size()) ? so[si++] : no_data;
+                uint32_t na = (oa != no_data && ai < ao.size()) ? ao[ai++] : no_data;
+                uint32_t ni = (oi != no_data && ii < io.size()) ? io[ii++] : no_data;
+                memcpy(result.data()+c*20+8, &ns, 4); memcpy(result.data()+c*20+12, &na, 4);
+                memcpy(result.data()+c*20+16, &ni, 4);
+            }
+            return result;
+        };
+
+        // For geo_cells: rebuild from new entries + derived cell structure
+        auto geo_from_new_entries = rebuild_geo_from_entries(derived.geo_cells_data,
+            new_dir + "/street_entries.bin", new_dir + "/addr_entries.bin", new_dir + "/interp_entries.bin");
+
         for (auto& [c_fid, c_label, c_data, c_fname] : std::vector<std::tuple<PatchFileId, std::string, std::vector<char>*, std::string>>{
-            {PatchFileId::GEO_CELLS, "geo_cells", &derived.geo_cells_data, "geo_cells.bin"},
+            {PatchFileId::GEO_CELLS, "geo_cells", &geo_from_new_entries, "geo_cells.bin"},
             {PatchFileId::ADMIN_CELLS, "admin_cells", &admin_derived.admin_cells_data, "admin_cells.bin"}})
         {
             auto c_new_data = read_file(new_dir + "/" + c_fname);
