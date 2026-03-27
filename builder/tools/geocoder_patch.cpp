@@ -64,19 +64,100 @@ int main(int argc, char* argv[]) {
         std::cerr << "Unsupported version " << version << std::endl; return 1;
     }
 
-    // Skip string remap section (two-stage encoding handles remapping internally)
+    // Read string remap
+    std::unordered_map<uint32_t, uint32_t> str_remap;
     {
         uint32_t section_id; pf.read(reinterpret_cast<char*>(&section_id), 4);
         if (section_id == 0xFFFFFFFE) {
             uint32_t count; pf.read(reinterpret_cast<char*>(&count), 4);
-            pf.seekg(count * 8, std::ios::cur);
-            std::cerr << "Skipped string remap (" << count << " entries, handled by two-stage)" << std::endl;
-        } else {
-            std::cerr << "Warning: expected remap section, got " << section_id << std::endl;
-            // Seek back so section processing can handle it
-            pf.seekg(-4, std::ios::cur);
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t old_off, new_off;
+                pf.read(reinterpret_cast<char*>(&old_off), 4);
+                pf.read(reinterpret_cast<char*>(&new_off), 4);
+                if (old_off != new_off) str_remap[old_off] = new_off;
+            }
+            std::cerr << "Loaded " << str_remap.size() << " string remap entries" << std::endl;
         }
     }
+
+    // Read offset fixup tables
+    struct Fixup { uint32_t record_idx; uint32_t new_value; };
+    std::unordered_map<uint32_t, std::vector<Fixup>> fixup_tables; // file_id → fixups
+    std::unordered_map<uint32_t, uint32_t> fixup_strides; // file_id → stride
+    while (pf) {
+        uint32_t marker; pf.read(reinterpret_cast<char*>(&marker), 4);
+        if (marker != FIXUP_MARKER) {
+            pf.seekg(-4, std::ios::cur);
+            break;
+        }
+        uint32_t fid, stride, count;
+        pf.read(reinterpret_cast<char*>(&fid), 4);
+        pf.read(reinterpret_cast<char*>(&stride), 4);
+        pf.read(reinterpret_cast<char*>(&count), 4);
+        auto& vec = fixup_tables[fid];
+        fixup_strides[fid] = stride;
+        vec.resize(count);
+        for (uint32_t i = 0; i < count; i++) {
+            pf.read(reinterpret_cast<char*>(&vec[i].record_idx), 4);
+            pf.read(reinterpret_cast<char*>(&vec[i].new_value), 4);
+        }
+        std::cerr << "Loaded " << count << " fixups for file " << fid << std::endl;
+    }
+
+    // Detect struct strides from current files
+    auto detect_stride = [&](const std::string& name, std::vector<size_t> cs) -> size_t {
+        auto d = read_file(cur_dir + "/" + name);
+        for (size_t s : cs) if (d.size() % s == 0 && d.size() > 0) return s;
+        return cs[0];
+    };
+    size_t way_stride = detect_stride("street_ways.bin", {12, 9});
+    size_t interp_stride = detect_stride("interp_ways.bin", {20, 18});
+    size_t admin_stride = detect_stride("admin_polygons.bin", {24, 20, 19});
+
+    // Helper: apply string remap to old data file
+    auto apply_str_remap = [&](std::vector<char>& data, uint32_t file_id) {
+        if (str_remap.empty()) return;
+        if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) {
+            for (size_t i = 0; i + 16 <= data.size(); i += 16)
+                for (size_t off : {8, 12}) {
+                    uint32_t v; memcpy(&v, data.data() + i + off, 4);
+                    auto it = str_remap.find(v);
+                    if (it != str_remap.end()) memcpy(data.data() + i + off, &it->second, 4);
+                }
+        } else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) {
+            size_t name_off = (way_stride == 12) ? 8 : 5;
+            for (size_t i = 0; i + way_stride <= data.size(); i += way_stride) {
+                uint32_t v; memcpy(&v, data.data() + i + name_off, 4);
+                auto it = str_remap.find(v);
+                if (it != str_remap.end()) memcpy(data.data() + i + name_off, &it->second, 4);
+            }
+        } else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) {
+            size_t soff = (interp_stride >= 20) ? 8 : 5;
+            for (size_t i = 0; i + interp_stride <= data.size(); i += interp_stride) {
+                uint32_t v; memcpy(&v, data.data() + i + soff, 4);
+                auto it = str_remap.find(v);
+                if (it != str_remap.end()) memcpy(data.data() + i + soff, &it->second, 4);
+            }
+        } else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) {
+            for (size_t i = 0; i + admin_stride <= data.size(); i += admin_stride) {
+                uint32_t v; memcpy(&v, data.data() + i + 8, 4);
+                auto it = str_remap.find(v);
+                if (it != str_remap.end()) memcpy(data.data() + i + 8, &it->second, 4);
+            }
+        }
+    };
+
+    // Helper: apply offset fixups
+    auto apply_fixups = [&](std::vector<char>& data, uint32_t file_id) {
+        auto it = fixup_tables.find(file_id);
+        if (it == fixup_tables.end()) return;
+        uint32_t stride = fixup_strides[file_id];
+        for (auto& f : it->second) {
+            size_t pos = (size_t)f.record_idx * stride;
+            if (pos + 4 <= data.size())
+                memcpy(data.data() + pos, &f.new_value, 4);
+        }
+    };
 
     // Process file sections
     while (pf) {
@@ -107,52 +188,30 @@ int main(int argc, char* argv[]) {
             return system(cmd.c_str()) == 0;
         };
 
-        if (encoding == (uint32_t)PatchEncoding::COPY_INSERT) {
-            // Single-stage: old → new
+        if (encoding == (uint32_t)PatchEncoding::ZSTD_DELTA) {
             uint64_t old_size, new_size, delta_size;
             pf.read(reinterpret_cast<char*>(&old_size), 8);
             pf.read(reinterpret_cast<char*>(&new_size), 8);
             pf.read(reinterpret_cast<char*>(&delta_size), 8);
 
+            // Write zstd frame to temp
             std::string zst = tmpdir + "/" + std::string(filename) + ".zst";
             write_temp(zst, delta_size);
 
-            std::string ref = cur_dir + "/" + std::string(filename);
+            // Load old file, apply string remap + fixups → write remapped ref
+            auto old_data = read_file(cur_dir + "/" + std::string(filename));
+            apply_str_remap(old_data, file_id);
+            apply_fixups(old_data, file_id);
+            std::string ref = tmpdir + "/" + std::string(filename) + ".ref";
+            write_file(ref, old_data);
+
+            // Apply zstd delta
             std::string out = out_dir + "/" + std::string(filename);
             if (!zstd_apply(ref, zst, out)) {
                 std::cerr << "FAILED: " << filename << std::endl; return 1;
             }
             std::cerr << "  " << filename << ": " << read_file(out).size() << " bytes" << std::endl;
-            remove(zst.c_str());
-
-        } else if (encoding == (uint32_t)PatchEncoding::TWO_STAGE) {
-            // Two-stage: old → remapped → new
-            uint64_t old_size, remap_size, new_size, s1_size, s2_size;
-            pf.read(reinterpret_cast<char*>(&old_size), 8);
-            pf.read(reinterpret_cast<char*>(&remap_size), 8);
-            pf.read(reinterpret_cast<char*>(&new_size), 8);
-            pf.read(reinterpret_cast<char*>(&s1_size), 8);
-            pf.read(reinterpret_cast<char*>(&s2_size), 8);
-
-            std::string zst1 = tmpdir + "/" + std::string(filename) + ".s1.zst";
-            std::string zst2 = tmpdir + "/" + std::string(filename) + ".s2.zst";
-            std::string mid = tmpdir + "/" + std::string(filename) + ".mid";
-            std::string out = out_dir + "/" + std::string(filename);
-
-            write_temp(zst1, s1_size);
-            write_temp(zst2, s2_size);
-
-            // Stage 1: old → remapped
-            std::string ref = cur_dir + "/" + std::string(filename);
-            if (!zstd_apply(ref, zst1, mid)) {
-                std::cerr << "FAILED stage1: " << filename << std::endl; return 1;
-            }
-            // Stage 2: remapped → new
-            if (!zstd_apply(mid, zst2, out)) {
-                std::cerr << "FAILED stage2: " << filename << std::endl; return 1;
-            }
-            std::cerr << "  " << filename << ": " << read_file(out).size() << " bytes" << std::endl;
-            remove(zst1.c_str()); remove(zst2.c_str()); remove(mid.c_str());
+            remove(zst.c_str()); remove(ref.c_str());
 
         } else {
             std::cerr << "  Unknown encoding " << encoding << " for " << filename << std::endl;

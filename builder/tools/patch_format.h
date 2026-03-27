@@ -212,8 +212,7 @@ static const char* patch_file_names[] = {
 // Encoding types for each section
 enum class PatchEncoding : uint32_t {
     RAW_REPLACE = 0,  // Full replacement (zlib compressed)
-    COPY_INSERT = 1,  // Single zstd delta frame (zstd --patch-from)
-    TWO_STAGE = 2,    // Two zstd delta frames: old→remapped, remapped→new
+    ZSTD_DELTA = 1,   // Single zstd delta frame (zstd --patch-from on remapped old)
 };
 
 // Patch file header
