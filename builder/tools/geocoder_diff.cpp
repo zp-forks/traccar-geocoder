@@ -520,6 +520,9 @@ int main(int argc, char* argv[]) {
         write_file(tmpdir + "/admin_vertices.bin", new_v);
     }
 
+    // Cell changes (shared between rebuild and patch writing)
+    std::vector<uint64_t> geo_added, geo_removed;
+
     // Rebuild entry/cell files using shared function (identical to patch tool)
     {
         auto old_geo = read_file(old_dir + "/geo_cells.bin");
@@ -537,7 +540,26 @@ int main(int argc, char* argv[]) {
         for (uint32_t j = 0; j < admin_id_remap.size(); j++)
             if (admin_id_remap[j] != 0xFFFFFFFF) ad_rm[j] = admin_id_remap[j];
 
-        auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm);
+        // Compute cell changes (added/removed cells between old and new)
+        auto new_geo = read_file(new_dir + "/geo_cells.bin");
+        std::unordered_set<uint64_t> old_cell_set, new_cell_set;
+        for (size_t i = 0; i < old_geo.size() / 20; i++) {
+            uint64_t cid; memcpy(&cid, old_geo.data() + i * 20, 8);
+            old_cell_set.insert(cid);
+        }
+        for (size_t i = 0; i < new_geo.size() / 20; i++) {
+            uint64_t cid; memcpy(&cid, new_geo.data() + i * 20, 8);
+            new_cell_set.insert(cid);
+        }
+        for (uint64_t cid : new_cell_set)
+            if (!old_cell_set.count(cid)) geo_added.push_back(cid);
+        for (uint64_t cid : old_cell_set)
+            if (!new_cell_set.count(cid)) geo_removed.push_back(cid);
+        std::sort(geo_added.begin(), geo_added.end());
+        std::sort(geo_removed.begin(), geo_removed.end());
+        std::cerr << "  Cell changes: " << geo_added.size() << " added, " << geo_removed.size() << " removed" << std::endl;
+
+        auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm, geo_added, geo_removed);
         write_file(tmpdir + "/geo_cells.bin", geo.geo_cells_data);
         write_file(tmpdir + "/street_entries.bin", geo.street_entries_data);
         write_file(tmpdir + "/addr_entries.bin", geo.addr_entries_data);
@@ -657,6 +679,20 @@ int main(int argc, char* argv[]) {
         write_id_remap(PatchFileId::ADDR_POINTS, addr_id_remap);
         write_id_remap(PatchFileId::INTERP_WAYS, interp_id_remap);
         write_id_remap(PatchFileId::ADMIN_POLYGONS, admin_id_remap);
+    }
+
+    // Write geo cell changes (added/removed cells)
+    {
+        uint32_t marker = CELL_CHANGES_GEO_MARKER;
+        uint32_t n_added = static_cast<uint32_t>(geo_added.size());
+        uint32_t n_removed = static_cast<uint32_t>(geo_removed.size());
+        write_val(pf, &marker, 4);
+        write_val(pf, &n_added, 4);
+        write_val(pf, &n_removed, 4);
+        for (uint64_t cid : geo_added) write_val(pf, &cid, 8);
+        for (uint64_t cid : geo_removed) write_val(pf, &cid, 8);
+        std::cerr << "  Cell changes: " << n_added << " added, " << n_removed
+                  << " removed (" << (n_added + n_removed) * 8 << " bytes)" << std::endl;
     }
 
     // Single-stage diffs: remapped_old → new (zstd --patch-from on temp files)

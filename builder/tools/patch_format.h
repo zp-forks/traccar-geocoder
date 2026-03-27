@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 // --- Binary record structs (must match types.h and server) ---
@@ -245,6 +246,13 @@ enum : uint8_t {
 
 static constexpr uint32_t FIXUP_MARKER = 0xFFFFFFFD;
 
+// Cell changes section marker: 0xFFFFFFFB
+// Format: marker, num_added(u32), num_removed(u32),
+//         [added_cell_id(u64)] * num_added, [removed_cell_id(u64)] * num_removed
+// For both geo and admin cell sets.
+static constexpr uint32_t CELL_CHANGES_GEO_MARKER = 0xFFFFFFFB;
+static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
+
 // --- Shared entry rebuild logic ---
 // Used by both diff and patch tools to produce identical rebuilt entries.
 // Takes old geo_cells + old entries + ID remap → produces rebuilt entries + geo_cells.
@@ -261,7 +269,9 @@ inline RebuiltGeo rebuild_geo_from_remap(
     const std::vector<char>& old_se, const std::vector<char>& old_ae, const std::vector<char>& old_ie,
     const std::unordered_map<uint32_t,uint32_t>& way_rm,
     const std::unordered_map<uint32_t,uint32_t>& addr_rm,
-    const std::unordered_map<uint32_t,uint32_t>& interp_rm)
+    const std::unordered_map<uint32_t,uint32_t>& interp_rm,
+    const std::vector<uint64_t>& added_cells = {},
+    const std::vector<uint64_t>& removed_cells = {})
 {
     size_t n_cells = old_geo.size() / 20;
 
@@ -300,6 +310,22 @@ inline RebuiltGeo rebuild_geo_from_remap(
         remap_ids(cells[i].streets, way_rm);
         remap_ids(cells[i].addrs, addr_rm);
         remap_ids(cells[i].interps, interp_rm);
+    }
+
+    // Apply cell set changes (add new cells, remove old cells)
+    if (!removed_cells.empty()) {
+        std::unordered_set<uint64_t> removed_set(removed_cells.begin(), removed_cells.end());
+        cells.erase(std::remove_if(cells.begin(), cells.end(),
+            [&](const CellData& c) { return removed_set.count(c.cell_id); }), cells.end());
+    }
+    if (!added_cells.empty()) {
+        for (uint64_t cid : added_cells) {
+            CellData cd; cd.cell_id = cid;
+            cells.push_back(cd);
+        }
+        // Re-sort to maintain cell_id order
+        std::sort(cells.begin(), cells.end(),
+            [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
     }
 
     // Write rebuilt files

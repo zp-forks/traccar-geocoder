@@ -203,6 +203,26 @@ int main(int argc, char* argv[]) {
         std::cerr << "Loaded " << count << " ID remaps for file " << fid << std::endl;
     }
 
+    // Read cell changes
+    std::vector<uint64_t> geo_added, geo_removed;
+    {
+        uint32_t marker; pf.read(reinterpret_cast<char*>(&marker), 4);
+        if (marker == CELL_CHANGES_GEO_MARKER) {
+            uint32_t n_added, n_removed;
+            pf.read(reinterpret_cast<char*>(&n_added), 4);
+            pf.read(reinterpret_cast<char*>(&n_removed), 4);
+            geo_added.resize(n_added);
+            geo_removed.resize(n_removed);
+            for (uint32_t i = 0; i < n_added; i++)
+                pf.read(reinterpret_cast<char*>(&geo_added[i]), 8);
+            for (uint32_t i = 0; i < n_removed; i++)
+                pf.read(reinterpret_cast<char*>(&geo_removed[i]), 8);
+            std::cerr << "Loaded cell changes: " << n_added << " added, " << n_removed << " removed" << std::endl;
+        } else {
+            pf.seekg(-4, std::ios::cur);
+        }
+    }
+
     // Helper: rebuild entry + cell files using ID remap (LEGACY, unused)
     auto rebuild_entries_legacy = [&](const std::string& cells_file, const std::string& entries_file,
                                 size_t cell_stride, size_t offset_pos,
@@ -272,7 +292,7 @@ int main(int argc, char* argv[]) {
         auto old_ae = read_file(cur_dir + "/addr_entries.bin");
         auto old_ie = read_file(cur_dir + "/interp_entries.bin");
 
-        auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm);
+        auto geo = rebuild_geo_from_remap(old_geo, old_se, old_ae, old_ie, w_rm, a_rm, i_rm, geo_added, geo_removed);
         write_file(tmpdir + "/geo_cells.bin", geo.geo_cells_data);
         write_file(tmpdir + "/street_entries.bin", geo.street_entries_data);
         write_file(tmpdir + "/addr_entries.bin", geo.addr_entries_data);
