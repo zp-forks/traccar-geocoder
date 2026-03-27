@@ -69,6 +69,23 @@ static MergeSequence build_merge_seq(
     auto flush_match = [&]() { if (match_run > 0) { seq.add_match(match_run); match_run = 0; } };
     auto flush_del = [&]() { if (del_run > 0) { seq.add_delete(del_run); del_run = 0; } };
 
+    // For small strides (<=8), records aren't unique enough for hash matching.
+    // Use simple sequential scan instead.
+    bool use_hash = (stride > 8);
+
+    // Pre-build hash index of new records for fast mismatch resolution
+    auto record_hash = [&](const char* p, size_t s) -> uint64_t {
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t i = 0; i < s; i++) { h ^= (uint8_t)p[i]; h *= 1099511628211ULL; }
+        return h;
+    };
+    std::unordered_multimap<uint64_t, uint32_t> new_hash;
+    if (use_hash) {
+        new_hash.reserve(new_n);
+        for (uint32_t i = 0; i < new_n; i++)
+            new_hash.emplace(record_hash(new_data.data() + i * stride, stride), i);
+    }
+
     while (oi < old_n && ni < new_n) {
         const char* op = old_data.data() + oi * stride;
         const char* np = new_data.data() + ni * stride;
@@ -77,41 +94,41 @@ static MergeSequence build_merge_seq(
             flush_del();
             match_run++;
             oi++; ni++;
+        } else if (use_hash) {
+            // Hash-based mismatch resolution (for records with unique content)
+            uint64_t oh = record_hash(op, stride);
+            auto range = new_hash.equal_range(oh);
+            uint32_t best_ni = UINT32_MAX;
+            for (auto it = range.first; it != range.second; ++it) {
+                if (it->second >= ni && it->second < ni + 10000 &&
+                    memcmp(op, new_data.data() + it->second * stride, stride) == 0) {
+                    if (it->second < best_ni) best_ni = it->second;
+                }
+            }
+            if (best_ni != UINT32_MAX && best_ni > ni) {
+                flush_match(); flush_del();
+                seq.add_insert(new_data.data() + ni * stride, best_ni - ni, stride);
+                ni = best_ni;
+            } else if (best_ni == ni) {
+                flush_del(); match_run++; oi++; ni++;
+            } else {
+                flush_match(); del_run++; oi++;
+            }
         } else {
-            // Mismatch: look ahead to determine if it's a deletion in old or insertion in new.
-            // Check: does the OLD record appear later in new? If so, there are inserts before it.
-            // Check: does the NEW record appear later in old? If so, there are deletes before it.
-            // Simple heuristic: look ahead up to 100 records in each direction.
-            bool found_old_in_new = false, found_new_in_old = false;
+            // Sequential scan (for coordinate files where records aren't unique)
             size_t lookahead = std::min((size_t)200, std::min(old_n - oi, new_n - ni));
+            bool found = false;
             for (size_t k = 1; k <= lookahead; k++) {
                 if (ni + k < new_n && memcmp(op, new_data.data() + (ni + k) * stride, stride) == 0) {
-                    found_old_in_new = true;
-                    // Insert k records from new before continuing
                     flush_match(); flush_del();
                     seq.add_insert(new_data.data() + ni * stride, k, stride);
-                    ni += k;
-                    break;
+                    ni += k; found = true; break;
                 }
                 if (oi + k < old_n && memcmp(np, old_data.data() + (oi + k) * stride, stride) == 0) {
-                    found_new_in_old = true;
-                    // Delete k records from old
-                    flush_match();
-                    del_run += k;
-                    oi += k;
-                    break;
+                    flush_match(); del_run += k; oi += k; found = true; break;
                 }
             }
-            if (!found_old_in_new && !found_new_in_old) {
-                // Both records are different and neither appears nearby.
-                // Treat as delete old + insert new.
-                flush_match();
-                del_run++;
-                oi++;
-                flush_del();
-                seq.add_insert(np, 1, stride);
-                ni++;
-            }
+            if (!found) { flush_match(); del_run++; oi++; flush_del(); seq.add_insert(np, 1, stride); ni++; }
         }
     }
 
@@ -370,8 +387,19 @@ int main(int argc, char* argv[]) {
                   << (ns > 0 ? ss * 100.0 / ns : 0) << "%)" << std::endl;
     };
 
-    // strings.bin: byte-level merge (using write_merge lambda)
-    write_merge(PatchFileId::STRINGS, "strings.bin", old_strings, new_strings, 1);
+    // strings.bin: full replacement (byte-level merge is inefficient for string pools)
+    {
+        uint32_t fid = static_cast<uint32_t>(PatchFileId::STRINGS);
+        uint32_t st = 0; // full replacement
+        uint64_t os = 0, ns = new_strings.size();
+        uint32_t nfix = 0;
+        uint64_t ss = new_strings.size();
+        wval(patch, &fid, 4); wval(patch, &st, 4);
+        wval(patch, &os, 8); wval(patch, &ns, 8);
+        wval(patch, &nfix, 4); wval(patch, &ss, 8);
+        patch.insert(patch.end(), new_strings.begin(), new_strings.end());
+        std::cerr << "  strings.bin: full " << new_strings.size() << " bytes" << std::endl;
+    }
 
     // addr_points.bin
     {
