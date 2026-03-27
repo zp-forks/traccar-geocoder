@@ -468,9 +468,21 @@ int main(int argc, char* argv[]) {
     // interp_ways.bin
     {
         auto old_data = read_file(old_dir + "/interp_ways.bin");
+        auto new_idata = read_file(new_dir + "/interp_ways.bin");
+        // Zero padding bytes for deterministic comparison
+        if (interp_stride == 24) {
+            for (size_t i = 0; i + interp_stride <= old_data.size(); i += interp_stride) {
+                memset(old_data.data() + i + 5, 0, 3);  // after node_count
+                memset(old_data.data() + i + 21, 0, 3);  // after interpolation
+            }
+            for (size_t i = 0; i + interp_stride <= new_idata.size(); i += interp_stride) {
+                memset(new_idata.data() + i + 5, 0, 3);
+                memset(new_idata.data() + i + 21, 0, 3);
+            }
+        }
         remap_field(old_data, interp_stride, interp_stride >= 20 ? 8 : 5, str_remap);
         auto old_n = read_file(old_dir + "/interp_nodes.bin");
-        auto new_data = read_file(new_dir + "/interp_ways.bin");
+        auto& new_data = new_idata; // use padding-zeroed version
         auto new_n = read_file(new_dir + "/interp_nodes.bin");
         auto& fixups = file_fixups[static_cast<uint32_t>(PatchFileId::INTERP_WAYS)];
         size_t in_count = old_data.size() / interp_stride;

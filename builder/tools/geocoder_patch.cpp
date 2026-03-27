@@ -180,10 +180,16 @@ int main(int argc, char* argv[]) {
         else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) actual_stride = interp_stride;
         else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) actual_stride = admin_stride;
 
-        // Zero admin polygon padding bytes for deterministic comparison
+        // Zero struct padding bytes for deterministic comparison
         if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24) {
             for (size_t i = 0; i + actual_stride <= old_data.size(); i += actual_stride)
                 memset(old_data.data() + i + 13, 0, 3);
+        }
+        if (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24) {
+            for (size_t i = 0; i + actual_stride <= old_data.size(); i += actual_stride) {
+                memset(old_data.data() + i + 5, 0, 3);
+                memset(old_data.data() + i + 21, 0, 3);
+            }
         }
 
         // Apply string remap to old data

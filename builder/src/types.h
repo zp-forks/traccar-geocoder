@@ -21,10 +21,12 @@ struct AddrPoint {
 struct InterpWay {
     uint32_t node_offset;
     uint8_t node_count;
+    uint8_t _pad1 = 0, _pad2 = 0, _pad3 = 0; // explicit padding
     uint32_t street_id;
     uint32_t start_number;
     uint32_t end_number;
     uint8_t interpolation;
+    uint8_t _pad4 = 0, _pad5 = 0, _pad6 = 0; // explicit padding
 };
 
 struct AdminPolygon {
@@ -32,8 +34,10 @@ struct AdminPolygon {
     uint32_t vertex_count;
     uint32_t name_id;
     uint8_t admin_level;
+    uint8_t _pad1 = 0, _pad2 = 0, _pad3 = 0; // explicit padding (zeroed)
     float area;
     uint16_t country_code;
+    uint16_t _pad4 = 0; // explicit padding
 };
 
 struct NodeCoord {
