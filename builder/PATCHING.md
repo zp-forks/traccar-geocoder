@@ -27,8 +27,8 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 | Gap | Patch Size | Per Day | All Match? |
 |-----|-----------|---------|------------|
-| 2 days (Mar 25→27) | 78 MiB | ~39 MiB | YES (14/14) — old approach |
-| 6 days (Mar 21→27) | 79 MiB | ~13 MiB | YES (14/14) — with parent merges + string diff |
+| 2 days (Mar 25→27) | 78 MiB | ~39 MiB | YES — old approach |
+| 6 days (Mar 21→27) | **68 MiB** | **~11 MiB** | YES — parent merges + string diff + no explicit remap |
 
 ### Planet (17 GiB dataset)
 
