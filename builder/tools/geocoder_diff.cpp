@@ -458,11 +458,82 @@ int main(int argc, char* argv[]) {
         write_merge(PatchFileId::STREET_WAYS, "street_ways.bin", old_w, new_w, way_stride);
     }
 
-    // street_nodes.bin (no remap)
+    // street_nodes.bin — derive from street_ways merge (parent-aware)
+    // Instead of merging 8-byte records independently (fails at scale),
+    // use the way merge to determine which node blocks to COPY vs INSERT.
     {
-        auto old_data = read_file(old_dir + "/street_nodes.bin");
-        auto new_data = read_file(new_dir + "/street_nodes.bin");
-        write_merge(PatchFileId::STREET_NODES, "street_nodes.bin", old_data, new_data, 8);
+        auto& way_seq = stored_merges[static_cast<uint32_t>(PatchFileId::STREET_WAYS)];
+        // Read ORIGINAL old ways (before fixup) to get correct old node offsets
+        auto old_w_orig = read_file(old_dir + "/street_ways.bin");
+        auto new_w = read_file(new_dir + "/street_ways.bin");
+        auto old_n = read_file(old_dir + "/street_nodes.bin");
+        auto new_n = read_file(new_dir + "/street_nodes.bin");
+        // For MATCH: use original old node_offsets (not the fixup'd ones)
+        // For INSERT: read from new node file using new way's node_offset
+        auto& old_w = old_w_orig; // original offsets
+
+        // Walk the way merge to build a node merge
+        MergeSequence node_seq;
+        size_t way_oi = 0, way_ni = 0;
+        size_t wpos = 0;
+        while (wpos < way_seq.data.size()) {
+            uint8_t op = static_cast<uint8_t>(way_seq.data[wpos]); wpos++;
+            uint32_t count; memcpy(&count, way_seq.data.data() + wpos, 4); wpos += 4;
+
+            if (op == OP_MATCH_RUN) {
+                // Matched ways: verify node blocks are actually identical
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t old_no; memcpy(&old_no, old_w.data() + (way_oi + k) * way_stride, 4);
+                    uint8_t nc = static_cast<uint8_t>(old_w[(way_oi + k) * way_stride + 4]);
+                    // Get new way's node_offset (from new_w at way_ni + k)
+                    uint32_t new_no; memcpy(&new_no, new_w.data() + (way_ni + k) * way_stride, 4);
+                    if (nc > 0) {
+                        // Check if node data is actually identical
+                        bool nodes_match = (old_no + nc) * 8 <= old_n.size() &&
+                                          (new_no + nc) * 8 <= new_n.size() &&
+                                          memcmp(old_n.data() + old_no * 8,
+                                                 new_n.data() + new_no * 8, nc * 8) == 0;
+                        if (nodes_match) {
+                            node_seq.add_match(nc);
+                        } else {
+                            // Way matched but nodes differ → INSERT new nodes
+                            node_seq.add_delete(nc);
+                            node_seq.add_insert(new_n.data() + new_no * 8, nc, 8);
+                        }
+                    }
+                }
+                way_oi += count; way_ni += count;
+            } else if (op == OP_INSERT_RUN) {
+                // New ways: their nodes are new data → INSERT from new
+                for (uint32_t k = 0; k < count; k++) {
+                    const char* new_way = way_seq.data.data() + wpos + k * way_stride;
+                    uint32_t new_node_off; memcpy(&new_node_off, new_way, 4);
+                    uint8_t nc = static_cast<uint8_t>(new_way[4]);
+                    if (nc > 0 && (new_node_off + nc) * 8 <= new_n.size())
+                        node_seq.add_insert(new_n.data() + new_node_off * 8, nc, 8);
+                }
+                wpos += count * way_stride;
+                way_ni += count;
+            } else if (op == OP_DELETE_RUN) {
+                // Deleted ways: skip their nodes
+                for (uint32_t k = 0; k < count; k++) {
+                    uint8_t nc = static_cast<uint8_t>(old_w[(way_oi + k) * way_stride + 4]);
+                    if (nc > 0) node_seq.add_delete(nc);
+                }
+                way_oi += count;
+            }
+        }
+
+        // Write the derived node merge
+        uint32_t fid = static_cast<uint32_t>(PatchFileId::STREET_NODES);
+        uint64_t os = old_n.size(), ns = new_n.size(), ss = node_seq.data.size();
+        uint32_t st = 8, n_fixups = 0;
+        wval(patch, &fid, 4); wval(patch, &st, 4);
+        wval(patch, &os, 8); wval(patch, &ns, 8);
+        wval(patch, &n_fixups, 4); wval(patch, &ss, 8);
+        patch.insert(patch.end(), node_seq.data.begin(), node_seq.data.end());
+        std::cerr << "  street_nodes.bin: parent-derived seq=" << ss << " bytes ("
+                  << std::fixed << std::setprecision(2) << (ns > 0 ? ss * 100.0 / ns : 0) << "%)" << std::endl;
     }
 
     // interp_ways.bin
@@ -496,11 +567,61 @@ int main(int argc, char* argv[]) {
         write_merge(PatchFileId::INTERP_WAYS, "interp_ways.bin", old_data, new_data, interp_stride);
     }
 
-    // interp_nodes.bin
+    // interp_nodes.bin — derive from interp_ways merge (parent-aware)
     {
-        auto old_data = read_file(old_dir + "/interp_nodes.bin");
-        auto new_data = read_file(new_dir + "/interp_nodes.bin");
-        write_merge(PatchFileId::INTERP_NODES, "interp_nodes.bin", old_data, new_data, 8);
+        auto& iw_seq = stored_merges[static_cast<uint32_t>(PatchFileId::INTERP_WAYS)];
+        auto old_iw_data = read_file(old_dir + "/interp_ways.bin");
+        auto new_iw_data = read_file(new_dir + "/interp_ways.bin");
+        auto& old_iw = old_iw_data;
+        auto& new_iw = new_iw_data;
+        auto old_in = read_file(old_dir + "/interp_nodes.bin");
+        auto new_in = read_file(new_dir + "/interp_nodes.bin");
+        MergeSequence in_seq;
+        size_t iw_oi = 0, iw_ni = 0;
+        size_t iwpos = 0;
+        while (iwpos < iw_seq.data.size()) {
+            uint8_t op = static_cast<uint8_t>(iw_seq.data[iwpos]); iwpos++;
+            uint32_t count; memcpy(&count, iw_seq.data.data() + iwpos, 4); iwpos += 4;
+            if (op == OP_MATCH_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t old_no; memcpy(&old_no, old_iw.data() + (iw_oi + k) * interp_stride, 4);
+                    uint8_t nc = static_cast<uint8_t>(old_iw[(iw_oi + k) * interp_stride + 4]);
+                    uint32_t new_no; memcpy(&new_no, new_iw.data() + (iw_ni + k) * interp_stride, 4);
+                    if (nc > 0) {
+                        bool match = (old_no + nc) * 8 <= old_in.size() &&
+                                    (new_no + nc) * 8 <= new_in.size() &&
+                                    memcmp(old_in.data() + old_no * 8, new_in.data() + new_no * 8, nc * 8) == 0;
+                        if (match) in_seq.add_match(nc);
+                        else { in_seq.add_delete(nc); in_seq.add_insert(new_in.data() + new_no * 8, nc, 8); }
+                    }
+                }
+                iw_oi += count; iw_ni += count;
+            } else if (op == OP_INSERT_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    const char* rec = iw_seq.data.data() + iwpos + k * interp_stride;
+                    uint32_t no; memcpy(&no, rec, 4);
+                    uint8_t nc = static_cast<uint8_t>(rec[4]);
+                    if (nc > 0 && (no + nc) * 8 <= new_in.size())
+                        in_seq.add_insert(new_in.data() + no * 8, nc, 8);
+                }
+                iwpos += count * interp_stride;
+                iw_ni += count;
+            } else if (op == OP_DELETE_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    uint8_t nc = static_cast<uint8_t>(old_iw[(iw_oi + k) * interp_stride + 4]);
+                    if (nc > 0) in_seq.add_delete(nc);
+                }
+                iw_oi += count;
+            }
+        }
+        uint32_t fid = static_cast<uint32_t>(PatchFileId::INTERP_NODES);
+        uint64_t os = old_in.size(), ns = new_in.size(), ss = in_seq.data.size();
+        uint32_t st = 8, n_fixups = 0;
+        wval(patch, &fid, 4); wval(patch, &st, 4);
+        wval(patch, &os, 8); wval(patch, &ns, 8);
+        wval(patch, &n_fixups, 4); wval(patch, &ss, 8);
+        patch.insert(patch.end(), in_seq.data.begin(), in_seq.data.end());
+        std::cerr << "  interp_nodes.bin: parent-derived seq=" << ss << " bytes" << std::endl;
     }
 
     // admin_polygons.bin
@@ -529,11 +650,66 @@ int main(int argc, char* argv[]) {
         write_merge(PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", old_data, new_data, admin_stride);
     }
 
-    // admin_vertices.bin
+    // admin_vertices.bin — derive from admin_polygons merge (parent-aware)
     {
-        auto old_data = read_file(old_dir + "/admin_vertices.bin");
-        auto new_data = read_file(new_dir + "/admin_vertices.bin");
-        write_merge(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", old_data, new_data, 8);
+        auto& ap_seq = stored_merges[static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS)];
+        auto old_ap = read_file(old_dir + "/admin_polygons.bin");
+        auto new_ap = read_file(new_dir + "/admin_polygons.bin");
+        auto old_av = read_file(old_dir + "/admin_vertices.bin");
+        auto new_av = read_file(new_dir + "/admin_vertices.bin");
+        MergeSequence av_seq;
+        size_t ap_oi = 0, ap_ni = 0;
+        size_t appos = 0;
+        while (appos < ap_seq.data.size()) {
+            uint8_t op = static_cast<uint8_t>(ap_seq.data[appos]); appos++;
+            uint32_t count; memcpy(&count, ap_seq.data.data() + appos, 4); appos += 4;
+            if (op == OP_MATCH_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t old_vo, vc;
+                    memcpy(&old_vo, old_ap.data() + (ap_oi + k) * admin_stride, 4);
+                    memcpy(&vc, old_ap.data() + (ap_oi + k) * admin_stride + 4, 4);
+                    uint32_t new_vo;
+                    memcpy(&new_vo, new_ap.data() + (ap_ni + k) * admin_stride, 4);
+                    if (vc > 0) {
+                        bool verts_match = (old_vo + vc) * 8 <= old_av.size() &&
+                                          (new_vo + vc) * 8 <= new_av.size() &&
+                                          memcmp(old_av.data() + old_vo * 8,
+                                                 new_av.data() + new_vo * 8, vc * 8) == 0;
+                        if (verts_match) {
+                            av_seq.add_match(vc);
+                        } else {
+                            av_seq.add_delete(vc);
+                            av_seq.add_insert(new_av.data() + new_vo * 8, vc, 8);
+                        }
+                    }
+                }
+                ap_oi += count; ap_ni += count;
+            } else if (op == OP_INSERT_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    const char* rec = ap_seq.data.data() + appos + k * admin_stride;
+                    uint32_t vo, vc; memcpy(&vo, rec, 4); memcpy(&vc, rec + 4, 4);
+                    if (vc > 0 && (vo + vc) * 8 <= new_av.size())
+                        av_seq.add_insert(new_av.data() + vo * 8, vc, 8);
+                }
+                appos += count * admin_stride;
+                ap_ni += count;
+            } else if (op == OP_DELETE_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t vc; memcpy(&vc, old_ap.data() + (ap_oi + k) * admin_stride + 4, 4);
+                    if (vc > 0) av_seq.add_delete(vc);
+                }
+                ap_oi += count;
+            }
+        }
+        uint32_t fid = static_cast<uint32_t>(PatchFileId::ADMIN_VERTICES);
+        uint64_t os = old_av.size(), ns = new_av.size(), ss = av_seq.data.size();
+        uint32_t st = 8, n_fixups = 0;
+        wval(patch, &fid, 4); wval(patch, &st, 4);
+        wval(patch, &os, 8); wval(patch, &ns, 8);
+        wval(patch, &n_fixups, 4); wval(patch, &ss, 8);
+        patch.insert(patch.end(), av_seq.data.begin(), av_seq.data.end());
+        std::cerr << "  admin_vertices.bin: parent-derived seq=" << ss << " bytes ("
+                  << std::fixed << std::setprecision(2) << (ns > 0 ? ss * 100.0 / ns : 0) << "%)" << std::endl;
     }
 
     // --- Section: Entry/cell files as full new data ---
