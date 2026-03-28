@@ -35,8 +35,9 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 | Gap | Patch Size | Per Day | All Match? |
 |-----|-----------|---------|------------|
 | 7 days (Mar 9→16) | ~850 MiB (est) | ~121 MiB | PENDING |
-| 7 days (Mar 9→16) | 852 MiB | ~122 MiB | YES (14/14) — sequential step 1 |
-| 7 days (Mar 16→23) | 229 MiB | ~33 MiB | YES (14/14) — sequential step 2 |
+| 7 days (Mar 9→16) | 852 MiB | ~122 MiB | YES — old approach, sequential step 1 |
+| 7 days (Mar 16→23) | 229 MiB | ~33 MiB | YES — old approach, sequential step 2 |
+| **7 days (Mar 16→23)** | **186 MiB** | **~27 MiB** | **YES — with parent merges + string diff** |
 | Sequential (Mar 9→16→23) | N/A | N/A | PASS — both steps byte-identical |
 
 ### Per-File Breakdown (Planet 7-day gap, Mar 16→23)
@@ -185,9 +186,13 @@ End marker: 0xFFFFFFFF (u32)
 3. ~~Parent-aware coordinate merge~~ — **DONE** (street_nodes 33%→7.5%, admin_vertices 28%→2.4%)
 4. ~~String-level merge~~ — **DONE** (83 MiB → ~100 KB per patch)
 
+### Done (continued)
+5. ~~Run planet test with latest optimizations~~ — **DONE** (852 MiB → 186 MiB, all 14 MATCH)
+6. ~~Build determinism (Germany)~~ — **PASS** (two runs byte-identical)
+
 ### Must Do
-2. **Verify build determinism thoroughly** — Run same PBF twice on planet, confirm byte-identical output
-5. **Run planet test with latest optimizations** — Parent merges + string diff not yet tested on planet
+2. **Verify build determinism on planet** — Germany passes; need to confirm planet
+7. **Sequential test with optimized diff** — The sequential test used old diff; need to re-run with parent merges + string diff
 
 ### Nice to Have (Performance)
 5. **Parallel merge building** — Merge sequences are built sequentially; could parallelize across files
