@@ -622,7 +622,7 @@ int main(int argc, char* argv[]) {
                                                w_rm_d, a_rm_d, i_rm_d, g_added, g_removed);
         auto old_admc = read_file(old_dir + "/admin_cells.bin");
         auto old_adme = read_file(old_dir + "/admin_entries.bin");
-        auto admin_derived = rebuild_admin_from_remap(old_admc, old_adme, ad_rm_d);
+        auto admin_derived = rebuild_admin_from_remap(old_admc, old_adme, ad_rm_d, a_added, a_removed);
 
         // Cell-level entry corrections: compare derived vs new entries cell by cell.
         // Include only cells whose entry data differs.

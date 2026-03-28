@@ -333,7 +333,7 @@ int main(int argc, char* argv[]) {
             }
             auto old_ac = read_file(cur_dir + "/admin_cells.bin");
             auto old_ae = read_file(cur_dir + "/admin_entries.bin");
-            auto admin = rebuild_admin_from_remap(old_ac, old_ae, ad_rm);
+            auto admin = rebuild_admin_from_remap(old_ac, old_ae, ad_rm, admin_added, admin_removed);
             write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
             if (!have_adme) write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
             std::cerr << "  Rebuilt admin_entries" << (have_admin ? "" : " + admin_cells") << std::endl;
@@ -375,14 +375,27 @@ int main(int argc, char* argv[]) {
             std::unordered_map<uint64_t, const std::vector<uint32_t>*> corr_map;
             for (auto& c : corrections) corr_map[c.cell_id] = &c.ids;
 
+            // Apply corrections to existing cells
             size_t applied = 0;
+            std::unordered_set<uint64_t> existing_cells;
             for (auto& ce : cell_entries) {
+                existing_cells.insert(ce.cid);
                 auto it = corr_map.find(ce.cid);
                 if (it != corr_map.end()) {
                     ce.ids = *it->second;
                     applied++;
                 }
             }
+            // Add cells from corrections that don't exist in derived
+            for (auto& c : corrections) {
+                if (!existing_cells.count(c.cell_id) && !c.ids.empty()) {
+                    cell_entries.push_back({c.cell_id, c.ids});
+                    applied++;
+                }
+            }
+            // Re-sort by cell_id to maintain order
+            std::sort(cell_entries.begin(), cell_entries.end(),
+                [](const CellEntry& a, const CellEntry& b) { return a.cid < b.cid; });
 
             // Rewrite entry file
             std::vector<char> new_entries;

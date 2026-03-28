@@ -384,7 +384,9 @@ struct RebuiltAdmin {
 
 inline RebuiltAdmin rebuild_admin_from_remap(
     const std::vector<char>& old_ac, const std::vector<char>& old_ae,
-    const std::unordered_map<uint32_t,uint32_t>& admin_rm)
+    const std::unordered_map<uint32_t,uint32_t>& admin_rm,
+    const std::vector<uint64_t>& added_cells = {},
+    const std::vector<uint64_t>& removed_cells = {})
 {
     size_t n_cells = old_ac.size() / 12;
 
@@ -407,6 +409,21 @@ inline RebuiltAdmin rebuild_admin_from_remap(
                 std::sort(cells[i].ids.begin(), cells[i].ids.end());
             }
         }
+    }
+
+    // Apply cell changes (add/remove)
+    if (!removed_cells.empty()) {
+        std::unordered_set<uint64_t> removed_set(removed_cells.begin(), removed_cells.end());
+        cells.erase(std::remove_if(cells.begin(), cells.end(),
+            [&](const CellData& c) { return removed_set.count(c.cell_id); }), cells.end());
+    }
+    if (!added_cells.empty()) {
+        for (uint64_t cid : added_cells) {
+            CellData cd; cd.cell_id = cid;
+            cells.push_back(cd);
+        }
+        std::sort(cells.begin(), cells.end(),
+            [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
     }
 
     RebuiltAdmin result;
