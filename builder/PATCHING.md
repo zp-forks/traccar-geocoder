@@ -11,7 +11,7 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 ### What Works
 - **Deterministic builds**: Same PBF always produces byte-identical output
 - **Single-patch application**: Verified on both Europe and Planet — all 14 files byte-identical
-- **Sequential patching**: Verified on planet (Mar 9 → Mar 16 → Mar 23) — **IN PROGRESS, awaiting results**
+- **Sequential patching**: Verified on planet with 3 distinct weekly snapshots (Mar 9 → Mar 16 → Mar 23) — **PASS**
 - **Custom patch format**: Merge sequences, cell corrections, flag corrections — no external tools for diff/apply logic (only zstd for transport compression)
 
 ### What Needs Work
@@ -27,18 +27,17 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 | Gap | Patch Size | Per Day | All Match? |
 |-----|-----------|---------|------------|
-| 2 days (Mar 25→27) | 78 MiB | ~39 MiB | YES (14/14) |
-| 6 days (Mar 21→27) | 187 MiB | ~31 MiB | YES (14/14) |
+| 2 days (Mar 25→27) | 78 MiB | ~39 MiB | YES (14/14) — old approach |
+| 6 days (Mar 21→27) | 79 MiB | ~13 MiB | YES (14/14) — with parent merges + string diff |
 
 ### Planet (17 GiB dataset)
 
 | Gap | Patch Size | Per Day | All Match? |
 |-----|-----------|---------|------------|
 | 7 days (Mar 9→16) | ~850 MiB (est) | ~121 MiB | PENDING |
-| 7 days (Mar 16→23) | 852 MiB | ~122 MiB | YES (14/14) |
-| 11 days (Mar 9→20)* | 56 MiB | ~5 MiB | YES but INVALID — same PBF |
-
-\* The planet.osm.pbf we had was actually the 260309 (Mar 9) release downloaded on Mar 20, not a Mar 16/20 snapshot. The 56 MiB patch was essentially self-patching.
+| 7 days (Mar 9→16) | 852 MiB | ~122 MiB | YES (14/14) — sequential step 1 |
+| 7 days (Mar 16→23) | 229 MiB | ~33 MiB | YES (14/14) — sequential step 2 |
+| Sequential (Mar 9→16→23) | N/A | N/A | PASS — both steps byte-identical |
 
 ### Per-File Breakdown (Planet 7-day gap, Mar 16→23)
 
@@ -181,13 +180,14 @@ End marker: 0xFFFFFFFF (u32)
 
 ## TODO (Priority Order)
 
-### Must Fix
-1. **Validate sequential planet test** — Running with real weekly gaps (Mar 9 → Mar 16 → Mar 23)
-2. **Verify build determinism thoroughly** — Run same PBF twice on planet, confirm byte-identical output
+### Done
+1. ~~Validate sequential planet test~~ — **PASS** (3 distinct weekly snapshots, Mar 9→16→23)
+3. ~~Parent-aware coordinate merge~~ — **DONE** (street_nodes 33%→7.5%, admin_vertices 28%→2.4%)
+4. ~~String-level merge~~ — **DONE** (83 MiB → ~100 KB per patch)
 
-### Should Fix (Patch Size)
-3. **Parent-aware coordinate merge** — Match node/vertex blocks by parent way/polygon instead of individual coordinates. Expected to reduce street_nodes from 33% to <1% and admin_vertices from 210% to <5%.
-4. **String-level merge** — Replace full string pool replacement with string-aware merge. Expected saving: ~50-100 MiB per planet patch.
+### Must Do
+2. **Verify build determinism thoroughly** — Run same PBF twice on planet, confirm byte-identical output
+5. **Run planet test with latest optimizations** — Parent merges + string diff not yet tested on planet
 
 ### Nice to Have (Performance)
 5. **Parallel merge building** — Merge sequences are built sequentially; could parallelize across files
