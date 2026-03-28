@@ -37,22 +37,26 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 ### Per-File Breakdown (Planet 7-day gap, Mar 16→23, latest approach)
 
-| File | Size | Merge/Diff | % | Notes |
-|------|------|-----------|---|-------|
-| strings.bin | 205 MiB | ~100 KB (string diff) | <0.01% | String-level merge |
-| addr_points.bin | 2.4 GiB | 6.1 MiB | 0.24% | Excellent |
-| street_ways.bin | 547 MiB | 5.3 MiB | 0.92% | Excellent |
-| street_nodes.bin | 3.8 GiB | 264 MiB | 6.65% | Parent-aware merge |
-| interp_ways.bin | 1.7 MiB | 7.3 KB | 0.42% | Excellent |
-| interp_nodes.bin | 3.3 MiB | 372 KB | — | Parent-aware merge |
-| admin_polygons.bin | 22.7 MiB | 212 KB | 0.93% | Good |
-| admin_vertices.bin | 716 MiB | 16.8 MiB | 2.34% | Parent-aware merge |
-| Way fixups | — | 48 MiB | — | node_offset fixes for matched ways |
-| Cell corrections | — | 43 MiB | — | 2M street + 116K addr + 193K admin |
-| Flag corrections | — | 2 MiB | — | 224K cells with changed has_type flags |
-| Cell changes | — | 1.8 MiB | — | 184K added, 46K removed cells |
-| **Total uncompressed** | | **786 MiB** | | |
-| **Compressed (zstd)** | | **186 MiB** | | |
+| Component | Raw Size | % of Patch | Notes |
+|-----------|---------|-----------|-------|
+| **Way fixups (47.7M pairs)** | **364 MiB** | **46.3%** | **Biggest item — node_offset fixes** |
+| **street_nodes merge** | **252 MiB** | **32.0%** | **Parent-aware, 6.65% of file** |
+| String remap (explicit)* | 91 MiB | 11.5% | *Eliminated in latest code — will be 0* |
+| street_entries corrections (2M cells) | 31 MiB | 4.0% | |
+| admin_vertices merge | 16 MiB | 2.0% | Parent-aware, 2.34% of file |
+| admin_polygons fixups (945K pairs) | 7.2 MiB | 0.9% | vertex_offset fixes |
+| admin_entries corrections (193K cells) | 7.1 MiB | 0.9% | |
+| addr_points merge | 5.9 MiB | 0.7% | 0.24% of file — excellent |
+| street_ways merge | 5.1 MiB | 0.6% | 0.92% of file — excellent |
+| addr_entries corrections (116K cells) | 2.9 MiB | 0.4% | |
+| Flag corrections (224K cells) | 1.9 MiB | 0.2% | |
+| Cell changes (184K added, 46K removed) | 1.8 MiB | 0.2% | |
+| String diff (~11K added, ~4K deleted) | 0.2 MiB | <0.1% | |
+| interp + other | 1.1 MiB | 0.1% | |
+| **Total uncompressed** | **786 MiB** | | |
+| **Compressed (zstd transport)** | **186 MiB** | | *~150 MiB estimated without explicit remap* |
+
+\* The 91 MiB explicit string remap was eliminated in the latest code (remap is now derived from the string-level diff). This test was run before that change. Estimated savings: ~36 MiB compressed.
 
 ### Per-File Breakdown (Europe 6-day gap, Mar 21→27, latest approach)
 
