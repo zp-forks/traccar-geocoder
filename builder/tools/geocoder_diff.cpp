@@ -624,44 +624,108 @@ int main(int argc, char* argv[]) {
         auto old_adme = read_file(old_dir + "/admin_entries.bin");
         auto admin_derived = rebuild_admin_from_remap(old_admc, old_adme, ad_rm_d);
 
-        // Write correction deltas: derived → new (using zstd --patch-from)
-        struct CorrEntry { PatchFileId fid; std::string label; std::vector<char>* data; std::string fname; };
-        CorrEntry corr_entries[] = {
-            // SKIP: geo_cells and admin_cells are included as full replacement below
-            {PatchFileId::STREET_ENTRIES, "street_entries", &derived.street_entries_data, "street_entries.bin"},
-            {PatchFileId::ADDR_ENTRIES, "addr_entries", &derived.addr_entries_data, "addr_entries.bin"},
-            {PatchFileId::INTERP_ENTRIES, "interp_entries", &derived.interp_entries_data, "interp_entries.bin"},
-            // admin_cells included as full replacement above
-            {PatchFileId::ADMIN_ENTRIES, "admin_entries", &admin_derived.admin_entries_data, "admin_entries.bin"},
+        // Cell-level entry corrections: compare derived vs new entries cell by cell.
+        // Include only cells whose entry data differs.
+        // This is fully custom — no zstd, no temp files.
+        auto write_entry_correction = [&](PatchFileId fid, const std::string& fname,
+                                           const std::vector<char>& derived_entries,
+                                           const std::vector<char>& derived_cells, size_t cell_stride,
+                                           size_t offset_pos) {
+            auto new_entries = read_file(new_dir + "/" + fname);
+            auto new_cells_data = read_file(new_dir + "/" +
+                (fid == PatchFileId::ADMIN_ENTRIES ? "admin_cells.bin" : "geo_cells.bin"));
+
+            // Parse both derived and new entries by cell
+            auto parse_all = [](const std::vector<char>& cells, size_t stride, size_t off_pos,
+                                 const std::vector<char>& entries)
+                -> std::vector<std::pair<uint64_t, std::vector<uint32_t>>>
+            {
+                size_t n = cells.size() / stride;
+                std::vector<std::pair<uint64_t, std::vector<uint32_t>>> result;
+                result.reserve(n);
+                for (size_t i = 0; i < n; i++) {
+                    uint64_t cid; memcpy(&cid, cells.data() + i * stride, 8);
+                    uint32_t off; memcpy(&off, cells.data() + i * stride + off_pos, 4);
+                    std::vector<uint32_t> ids;
+                    if (off != 0xFFFFFFFF && off + 2 <= entries.size()) {
+                        uint16_t count; memcpy(&count, entries.data() + off, 2);
+                        if (off + 2 + count * 4 <= entries.size()) {
+                            ids.resize(count);
+                            memcpy(ids.data(), entries.data() + off + 2, count * 4);
+                        }
+                    }
+                    result.push_back({cid, std::move(ids)});
+                }
+                return result;
+            };
+
+            auto derived_parsed = parse_all(derived_cells, cell_stride, offset_pos, derived_entries);
+            auto new_parsed = parse_all(new_cells_data,
+                cell_stride == 12 ? 12 : 20,
+                cell_stride == 12 ? 8 : offset_pos,
+                new_entries);
+
+            // Build new cell map for lookup
+            std::unordered_map<uint64_t, const std::vector<uint32_t>*> new_map;
+            for (auto& [cid, ids] : new_parsed) new_map[cid] = &ids;
+
+            // Find differing cells
+            std::vector<char> corr_data;
+            uint32_t diff_count = 0;
+            for (auto& [cid, d_ids] : derived_parsed) {
+                auto it = new_map.find(cid);
+                const std::vector<uint32_t>* n_ids = nullptr;
+                if (it != new_map.end()) n_ids = it->second;
+
+                bool differs = false;
+                if (!n_ids) { differs = !d_ids.empty(); }
+                else if (d_ids.size() != n_ids->size()) { differs = true; }
+                else if (!d_ids.empty() && memcmp(d_ids.data(), n_ids->data(), d_ids.size() * 4) != 0) { differs = true; }
+
+                if (differs) {
+                    wval(corr_data, &cid, 8);
+                    uint16_t count = n_ids ? static_cast<uint16_t>(n_ids->size()) : 0;
+                    wval(corr_data, &count, 2);
+                    if (n_ids && !n_ids->empty())
+                        corr_data.insert(corr_data.end(), (const char*)n_ids->data(),
+                                        (const char*)n_ids->data() + n_ids->size() * 4);
+                    diff_count++;
+                }
+            }
+            // Also check for cells only in new (not in derived)
+            std::unordered_set<uint64_t> derived_set;
+            for (auto& [cid, _] : derived_parsed) derived_set.insert(cid);
+            for (auto& [cid, ids] : new_parsed) {
+                if (!derived_set.count(cid) && !ids.empty()) {
+                    wval(corr_data, &cid, 8);
+                    uint16_t count = static_cast<uint16_t>(ids.size());
+                    wval(corr_data, &count, 2);
+                    corr_data.insert(corr_data.end(), (const char*)ids.data(),
+                                    (const char*)ids.data() + ids.size() * 4);
+                    diff_count++;
+                }
+            }
+
+            uint32_t marker = ENTRY_CORRECTION_MARKER;
+            uint32_t file = static_cast<uint32_t>(fid);
+            wval(patch, &marker, 4);
+            wval(patch, &file, 4);
+            wval(patch, &diff_count, 4);
+            patch.insert(patch.end(), corr_data.begin(), corr_data.end());
+            std::cerr << "  " << fname << ": " << diff_count << " cell corrections ("
+                      << corr_data.size() << " bytes)" << std::endl;
         };
-        for (auto& ce : corr_entries) {
-            auto& derived_data = ce.data;
-            auto new_fname = ce.fname;
-            auto fname = ce.label;
-            auto fid = ce.fid;
-            auto new_data = read_file(new_dir + "/" + new_fname);
 
-            // Write derived → new as zstd --patch-from via temp files
-            std::string ref_path = tmpdir + "/corr_" + fname + ".ref";
-            std::string zst_path = tmpdir + "/corr_" + fname + ".zst";
-            write_file(ref_path, *derived_data);
-            system(("zstd --patch-from='" + ref_path + "' '" + new_dir + "/" + new_fname +
-                    "' -o '" + zst_path + "' -f --quiet 2>/dev/null").c_str());
-            auto zst_data = read_file(zst_path);
-
-            // Write as correction section: stride=0xFE (correction marker)
-            uint32_t f = static_cast<uint32_t>(fid), stride_corr = 0xFE;
-            uint64_t rs = derived_data->size(), ns = new_data.size();
-            uint32_t nfix = 0; uint64_t ds = zst_data.size();
-            wval(patch, &f, 4); wval(patch, &stride_corr, 4);
-            wval(patch, &rs, 8); wval(patch, &ns, 8);
-            wval(patch, &nfix, 4); wval(patch, &ds, 8);
-            patch.insert(patch.end(), zst_data.begin(), zst_data.end());
-            std::cerr << "  " << new_fname << ": correction " << ds << " bytes ("
-                      << std::fixed << std::setprecision(2)
-                      << (ns > 0 ? ds * 100.0 / ns : 0) << "%)" << std::endl;
-            remove(ref_path.c_str()); remove(zst_path.c_str());
-        }
+        // Geo entries: street, addr, interp
+        write_entry_correction(PatchFileId::STREET_ENTRIES, "street_entries.bin",
+            derived.street_entries_data, derived.geo_cells_data, 20, 8);
+        write_entry_correction(PatchFileId::ADDR_ENTRIES, "addr_entries.bin",
+            derived.addr_entries_data, derived.geo_cells_data, 20, 12);
+        write_entry_correction(PatchFileId::INTERP_ENTRIES, "interp_entries.bin",
+            derived.interp_entries_data, derived.geo_cells_data, 20, 16);
+        // Admin entries
+        write_entry_correction(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin",
+            admin_derived.admin_entries_data, admin_derived.admin_cells_data, 12, 8);
 
         // Cell flag corrections: identify cells whose has_street/has_addr/has_interp
         // flags differ between old and new. Only ~3K cells typically.

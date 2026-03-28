@@ -253,6 +253,13 @@ static constexpr uint32_t FIXUP_MARKER = 0xFFFFFFFD;
 static constexpr uint32_t CELL_CHANGES_GEO_MARKER = 0xFFFFFFFB;
 static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
 
+// Entry correction marker: 0xFFFFFFF8
+// Cell-level diff of entries: lists cells whose entries differ between derived and new.
+// Format: marker(4), file_id(4), count(4),
+//   for each: cell_index(4), entry_count(2), [id(4)] * entry_count
+// cell_index is the position in the geo_cells/admin_cells array.
+static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
+
 // Cell flag corrections marker: 0xFFFFFFF9
 // Format: marker, count(u32), [(cell_id:u64, flags:u8)] × count
 // flags: bit 0 = has_street, bit 1 = has_addr, bit 2 = has_interp

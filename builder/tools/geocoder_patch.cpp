@@ -106,9 +106,11 @@ int main(int argc, char* argv[]) {
     struct PendingCorrection { uint32_t file_id; std::string filename; std::vector<char> delta; };
     std::vector<PendingCorrection> pending_corrections;
 
-    // Read cell changes and flag corrections (may appear before end marker)
+    // Read cell changes, flag corrections, and entry corrections
     std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed;
     std::unordered_map<uint64_t, uint8_t> cell_flag_corrections;
+    struct CellCorrection { uint64_t cell_id; std::vector<uint32_t> ids; };
+    std::unordered_map<uint32_t, std::vector<CellCorrection>> entry_cell_corrections;
 
     // Process sections
     while (pos < patch.size()) {
@@ -142,6 +144,22 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Cell flag corrections: " << count << " cells" << std::endl;
             continue;
         }
+        if (file_id == ENTRY_CORRECTION_MARKER) {
+            uint32_t corr_fid = read_u32();
+            uint32_t count = read_u32();
+            // Buffer cell-level corrections for application after entry reconstruction
+            struct CellCorrection { uint64_t cell_id; std::vector<uint32_t> ids; };
+            auto& corr_list = entry_cell_corrections[corr_fid];
+            for (uint32_t i = 0; i < count; i++) {
+                uint64_t cid; memcpy(&cid, patch.data() + pos, 8); pos += 8;
+                uint16_t ec; memcpy(&ec, patch.data() + pos, 2); pos += 2;
+                std::vector<uint32_t> ids(ec);
+                if (ec > 0) { memcpy(ids.data(), patch.data() + pos, ec * 4); pos += ec * 4; }
+                corr_list.push_back({cid, std::move(ids)});
+            }
+            std::cerr << "  Entry correction for file " << corr_fid << ": " << count << " cells" << std::endl;
+            continue;
+        }
 
         uint32_t stride = read_u32();
         uint64_t old_size = read_u64(), new_size = read_u64();
@@ -163,13 +181,11 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (stride == 0xFE) {
-            // Correction section: buffer for processing AFTER entry reconstruction
+            // Legacy zstd correction — skip (replaced by ENTRY_CORRECTION_MARKER)
             uint32_t n_fix = read_u32(); (void)n_fix;
             uint64_t delta_size = read_u64();
-            pending_corrections.push_back({file_id, std::string(filename),
-                std::vector<char>(patch.data() + pos, patch.data() + pos + delta_size)});
             pos += delta_size;
-            std::cerr << "  " << filename << ": correction buffered (" << delta_size << " bytes)" << std::endl;
+            std::cerr << "  " << filename << ": legacy correction skipped" << std::endl;
             continue;
         }
 
@@ -272,6 +288,10 @@ int main(int argc, char* argv[]) {
         };
         have_geo = check("geo_cells.bin");
         have_admin = check("admin_cells.bin");
+        bool have_se = check("street_entries.bin");
+        bool have_ae = check("addr_entries.bin");
+        bool have_ie = check("interp_entries.bin");
+        bool have_adme = check("admin_entries.bin");
 
         if (!derived_id_remaps.empty()) { // always reconstruct entries (needed for corrections)
             std::cerr << "Reconstructing entry/cell files from derived ID remaps..." << std::endl;
@@ -298,9 +318,9 @@ int main(int argc, char* argv[]) {
                                                geo_added, geo_removed);
             // Only write geo_cells if not already provided as full replacement
             if (!have_geo) write_file(out_dir + "/geo_cells.bin", geo.geo_cells_data);
-            write_file(out_dir + "/street_entries.bin", geo.street_entries_data);
-            write_file(out_dir + "/addr_entries.bin", geo.addr_entries_data);
-            write_file(out_dir + "/interp_entries.bin", geo.interp_entries_data);
+            if (!have_se) write_file(out_dir + "/street_entries.bin", geo.street_entries_data);
+            if (!have_ae) write_file(out_dir + "/addr_entries.bin", geo.addr_entries_data);
+            if (!have_ie) write_file(out_dir + "/interp_entries.bin", geo.interp_entries_data);
             std::cerr << "  Rebuilt 3 entry files" << (have_geo ? "" : " + geo_cells") << std::endl;
         }
 
@@ -315,13 +335,104 @@ int main(int argc, char* argv[]) {
             auto old_ae = read_file(cur_dir + "/admin_entries.bin");
             auto admin = rebuild_admin_from_remap(old_ac, old_ae, ad_rm);
             write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
-            write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
+            if (!have_adme) write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
             std::cerr << "  Rebuilt admin_entries" << (have_admin ? "" : " + admin_cells") << std::endl;
         }
     }
 
-    // Apply buffered corrections: entry files first, then cell files
-    // Entry corrections must be applied before geo_cells rebuild.
+    // Apply cell-level entry corrections (custom format, no zstd)
+    if (!entry_cell_corrections.empty()) {
+        std::cerr << "Applying cell-level entry corrections..." << std::endl;
+        for (auto& [fid, corrections] : entry_cell_corrections) {
+            const char* fname = patch_file_names[fid];
+            std::string entry_path = out_dir + "/" + std::string(fname);
+            // Determine which cells file to use
+            bool is_admin = (fid == (uint32_t)PatchFileId::ADMIN_ENTRIES);
+            std::string cells_fname = is_admin ? "admin_cells.bin" : "geo_cells.bin";
+            auto cells_data = read_file(out_dir + "/" + cells_fname);
+            auto entries_data = read_file(entry_path);
+            size_t cell_stride = is_admin ? 12 : 20;
+            size_t off_pos = is_admin ? 8 : (fid == (uint32_t)PatchFileId::STREET_ENTRIES ? 8 :
+                                              fid == (uint32_t)PatchFileId::ADDR_ENTRIES ? 12 : 16);
+
+            // Parse current entries into cell map
+            size_t n = cells_data.size() / cell_stride;
+            struct CellEntry { uint64_t cid; std::vector<uint32_t> ids; };
+            std::vector<CellEntry> cell_entries(n);
+            for (size_t i = 0; i < n; i++) {
+                memcpy(&cell_entries[i].cid, cells_data.data() + i * cell_stride, 8);
+                uint32_t off; memcpy(&off, cells_data.data() + i * cell_stride + off_pos, 4);
+                if (off != 0xFFFFFFFF && off + 2 <= entries_data.size()) {
+                    uint16_t count; memcpy(&count, entries_data.data() + off, 2);
+                    if (off + 2 + count * 4 <= entries_data.size()) {
+                        cell_entries[i].ids.resize(count);
+                        memcpy(cell_entries[i].ids.data(), entries_data.data() + off + 2, count * 4);
+                    }
+                }
+            }
+
+            // Apply corrections: replace entry data for specific cells
+            std::unordered_map<uint64_t, const std::vector<uint32_t>*> corr_map;
+            for (auto& c : corrections) corr_map[c.cell_id] = &c.ids;
+
+            size_t applied = 0;
+            for (auto& ce : cell_entries) {
+                auto it = corr_map.find(ce.cid);
+                if (it != corr_map.end()) {
+                    ce.ids = *it->second;
+                    applied++;
+                }
+            }
+
+            // Rewrite entry file
+            std::vector<char> new_entries;
+            std::unordered_map<uint64_t, uint32_t> offsets;
+            uint32_t no_data = 0xFFFFFFFF;
+            for (auto& ce : cell_entries) {
+                if (ce.ids.empty()) continue;
+                offsets[ce.cid] = static_cast<uint32_t>(new_entries.size());
+                uint16_t count = static_cast<uint16_t>(ce.ids.size());
+                new_entries.insert(new_entries.end(), (const char*)&count, (const char*)&count + 2);
+                new_entries.insert(new_entries.end(), (const char*)ce.ids.data(),
+                                  (const char*)ce.ids.data() + ce.ids.size() * 4);
+            }
+            write_file(entry_path, new_entries);
+
+            // Rebuild the cells file with corrected offsets
+            std::vector<char> new_cells;
+            for (auto& ce : cell_entries) {
+                new_cells.insert(new_cells.end(), (const char*)&ce.cid, (const char*)&ce.cid + 8);
+                if (cell_stride == 20) {
+                    // geo_cells: 3 offset columns. Only update the relevant one.
+                    // Read old offsets from cells_data for the other columns
+                    size_t idx = &ce - &cell_entries[0];
+                    for (size_t col_off : {8, 12, 16}) {
+                        if (col_off == off_pos) {
+                            auto it = offsets.find(ce.cid);
+                            uint32_t off = it != offsets.end() ? it->second : no_data;
+                            new_cells.insert(new_cells.end(), (const char*)&off, (const char*)&off + 4);
+                        } else {
+                            // Keep existing offset
+                            uint32_t old_off;
+                            memcpy(&old_off, cells_data.data() + idx * 20 + col_off, 4);
+                            new_cells.insert(new_cells.end(), (const char*)&old_off, (const char*)&old_off + 4);
+                        }
+                    }
+                } else {
+                    // admin_cells: single offset
+                    auto it = offsets.find(ce.cid);
+                    uint32_t off = it != offsets.end() ? it->second : no_data;
+                    new_cells.insert(new_cells.end(), (const char*)&off, (const char*)&off + 4);
+                }
+            }
+            write_file(out_dir + "/" + cells_fname, new_cells);
+
+            std::cerr << "  " << fname << ": applied " << applied << " cell corrections ("
+                      << corrections.size() << " total)" << std::endl;
+        }
+    }
+
+    // Apply old zstd-based corrections (legacy, will be removed)
     std::vector<PendingCorrection> cell_corrections;
     for (auto& corr : pending_corrections) {
         if (corr.file_id == (uint32_t)PatchFileId::GEO_CELLS ||
