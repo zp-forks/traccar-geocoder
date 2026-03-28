@@ -58,17 +58,76 @@ int main(int argc, char* argv[]) {
     uint32_t flags = read_u32();
     (void)flags;
 
-    // Read string remap
+    // Read string-level diff OR string remap
     std::unordered_map<uint32_t, uint32_t> str_remap;
     {
         uint32_t marker = read_u32();
-        if (marker != 0xFFFFFFFE) { std::cerr << "Expected remap section" << std::endl; return 1; }
-        uint32_t count = read_u32();
-        for (uint32_t i = 0; i < count; i++) {
-            uint32_t old_off = read_u32(), new_off = read_u32();
-            if (old_off != new_off) str_remap[old_off] = new_off;
+
+        if (marker == 0xFFFFFFF7) {
+            // String-level diff: merge new/deleted strings into old pool
+            uint32_t n_added = read_u32(), n_deleted = read_u32();
+            std::vector<std::string> added;
+            for (uint32_t i = 0; i < n_added; i++) {
+                const char* s = patch.data() + pos;
+                added.push_back(s);
+                pos += strlen(s) + 1;
+            }
+            std::vector<uint32_t> del_idx(n_deleted);
+            for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = read_u32();
+            std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
+
+            // Parse old pool
+            auto old_pool = read_file(cur_dir + "/strings.bin");
+            std::vector<std::pair<uint32_t, std::string>> old_strs;
+            size_t sp = 0;
+            while (sp < old_pool.size()) {
+                const char* s = old_pool.data() + sp;
+                old_strs.push_back({(uint32_t)sp, std::string(s)});
+                sp += strlen(s) + 1;
+            }
+
+            // Merge: keep non-deleted + add new, sort
+            std::vector<std::string> merged;
+            for (size_t i = 0; i < old_strs.size(); i++)
+                if (!del_set.count(i)) merged.push_back(old_strs[i].second);
+            for (auto& s : added) merged.push_back(s);
+            std::sort(merged.begin(), merged.end());
+
+            // Build new pool
+            std::vector<char> new_pool;
+            std::unordered_map<std::string, uint32_t> new_offs;
+            for (auto& s : merged) {
+                new_offs[s] = (uint32_t)new_pool.size();
+                new_pool.insert(new_pool.end(), s.begin(), s.end());
+                new_pool.push_back('\0');
+            }
+            write_file(out_dir + "/strings.bin", new_pool);
+
+            // Build remap
+            for (auto& [old_off, s] : old_strs) {
+                auto it = new_offs.find(s);
+                if (it != new_offs.end() && it->second != old_off)
+                    str_remap[old_off] = it->second;
+            }
+            std::cerr << "Rebuilt strings: +" << n_added << " -" << n_deleted
+                      << " → " << merged.size() << " strings, "
+                      << str_remap.size() << " remapped" << std::endl;
+
+            marker = read_u32(); // read next section marker
         }
-        std::cerr << "Loaded " << str_remap.size() << " string remap entries (pos=" << pos << ")" << std::endl;
+
+        if (marker == 0xFFFFFFFE) {
+            // Explicit remap entries (supplements the derived remap)
+            uint32_t count = read_u32();
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t old_off = read_u32(), new_off = read_u32();
+                str_remap[old_off] = new_off; // override with explicit
+            }
+            std::cerr << "Total string remap: " << str_remap.size() << " entries" << std::endl;
+        } else {
+            // Not a remap section — seek back
+            pos -= 4;
+        }
     }
 
     // Detect strides
@@ -118,6 +177,52 @@ int main(int argc, char* argv[]) {
         if (file_id == 0xFFFFFFFF) break;
 
         // Cell change sections
+        if (file_id == 0xFFFFFFF7) {
+            // String-level diff (appears in main section loop)
+            uint32_t n_added = read_u32(), n_deleted = read_u32();
+            std::vector<std::string> added;
+            for (uint32_t i = 0; i < n_added; i++) {
+                const char* s = patch.data() + pos;
+                added.push_back(s);
+                pos += strlen(s) + 1;
+            }
+            std::vector<uint32_t> del_idx(n_deleted);
+            for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = read_u32();
+            std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
+
+            auto old_pool = read_file(cur_dir + "/strings.bin");
+            std::vector<std::pair<uint32_t, std::string>> old_strs;
+            size_t sp = 0;
+            while (sp < old_pool.size()) {
+                const char* s = old_pool.data() + sp;
+                old_strs.push_back({(uint32_t)sp, std::string(s)});
+                sp += strlen(s) + 1;
+            }
+            std::vector<std::string> merged;
+            for (size_t i = 0; i < old_strs.size(); i++)
+                if (!del_set.count(i)) merged.push_back(old_strs[i].second);
+            for (auto& s : added) merged.push_back(s);
+            std::sort(merged.begin(), merged.end());
+
+            std::vector<char> new_pool;
+            std::unordered_map<std::string, uint32_t> new_offs;
+            for (auto& s : merged) {
+                new_offs[s] = (uint32_t)new_pool.size();
+                new_pool.insert(new_pool.end(), s.begin(), s.end());
+                new_pool.push_back('\0');
+            }
+            write_file(out_dir + "/strings.bin", new_pool);
+            // Update remap with newly computed offsets
+            for (auto& [old_off, s] : old_strs) {
+                auto it = new_offs.find(s);
+                if (it != new_offs.end() && it->second != old_off)
+                    str_remap[old_off] = it->second;
+            }
+            std::cerr << "  Rebuilt strings: +" << n_added << " -" << n_deleted
+                      << " → " << merged.size() << " strings, "
+                      << str_remap.size() << " remapped" << std::endl;
+            continue;
+        }
         if (file_id == CELL_CHANGES_GEO_MARKER) {
             uint32_t na = read_u32(), nr = read_u32();
             geo_added.resize(na); geo_removed.resize(nr);

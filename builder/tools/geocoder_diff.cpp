@@ -366,18 +366,21 @@ int main(int argc, char* argv[]) {
 
     // --- Section: String remap ---
     {
+        // Only include entries where old_off != new_off (saves space)
         std::vector<std::pair<uint32_t,uint32_t>> entries;
         size_t pos = 0;
         while (pos < old_strings.size()) {
             uint32_t old_off = static_cast<uint32_t>(pos);
             auto it = str_remap.find(old_off);
-            entries.push_back({old_off, (it != str_remap.end()) ? it->second : old_off});
+            uint32_t new_off = (it != str_remap.end()) ? it->second : old_off;
+            if (old_off != new_off)
+                entries.push_back({old_off, new_off});
             pos += strlen(old_strings.data() + pos) + 1;
         }
         uint32_t marker = 0xFFFFFFFE, count = static_cast<uint32_t>(entries.size());
         wval(patch, &marker, 4); wval(patch, &count, 4);
         for (auto& [o, n] : entries) { wval(patch, &o, 4); wval(patch, &n, 4); }
-        std::cerr << "  String remap: " << count << " entries (" << count * 8 << " bytes)" << std::endl;
+        std::cerr << "  String remap: " << count << " changed entries (" << count * 8 << " bytes)" << std::endl;
     }
 
     // --- Section: Per-file merge sequences ---
@@ -415,18 +418,57 @@ int main(int argc, char* argv[]) {
                   << (ns > 0 ? ss * 100.0 / ns : 0) << "%)" << std::endl;
     };
 
-    // strings.bin: full replacement (byte-level merge is inefficient for string pools)
+    // strings.bin: string-level diff (both pools are sorted alphabetically)
+    // Walk both pools, emit new strings to insert and indices of deleted strings.
+    // The patch tool merges new strings into old pool alphabetically.
     {
-        uint32_t fid = static_cast<uint32_t>(PatchFileId::STRINGS);
-        uint32_t st = 0; // full replacement
-        uint64_t os = 0, ns = new_strings.size();
-        uint32_t nfix = 0;
-        uint64_t ss = new_strings.size();
-        wval(patch, &fid, 4); wval(patch, &st, 4);
-        wval(patch, &os, 8); wval(patch, &ns, 8);
-        wval(patch, &nfix, 4); wval(patch, &ss, 8);
-        patch.insert(patch.end(), new_strings.begin(), new_strings.end());
-        std::cerr << "  strings.bin: full " << new_strings.size() << " bytes" << std::endl;
+        // Parse both pools into string lists
+        std::vector<std::string> old_strs, new_strs;
+        {
+            size_t p = 0;
+            while (p < old_strings.size()) {
+                const char* s = old_strings.data() + p;
+                old_strs.push_back(s);
+                p += strlen(s) + 1;
+            }
+        }
+        {
+            size_t p = 0;
+            while (p < new_strings.size()) {
+                const char* s = new_strings.data() + p;
+                new_strs.push_back(s);
+                p += strlen(s) + 1;
+            }
+        }
+
+        // Merge-walk to find insertions and deletions
+        std::vector<std::string> added_strings;
+        std::vector<uint32_t> deleted_indices;
+        size_t oi = 0, ni = 0;
+        while (oi < old_strs.size() && ni < new_strs.size()) {
+            int c = old_strs[oi].compare(new_strs[ni]);
+            if (c == 0) { oi++; ni++; } // same string
+            else if (c < 0) { deleted_indices.push_back(oi); oi++; } // old only → deleted
+            else { added_strings.push_back(new_strs[ni]); ni++; } // new only → added
+        }
+        while (oi < old_strs.size()) { deleted_indices.push_back(oi); oi++; }
+        while (ni < new_strs.size()) { added_strings.push_back(new_strs[ni]); ni++; }
+
+        // Serialize: marker, n_added, n_deleted, added_string_data, deleted_indices
+        uint32_t str_diff_marker = 0xFFFFFFF7;
+        uint32_t n_added = static_cast<uint32_t>(added_strings.size());
+        uint32_t n_deleted = static_cast<uint32_t>(deleted_indices.size());
+        wval(patch, &str_diff_marker, 4);
+        wval(patch, &n_added, 4);
+        wval(patch, &n_deleted, 4);
+        for (auto& s : added_strings) {
+            patch.insert(patch.end(), s.begin(), s.end());
+            patch.push_back('\0');
+        }
+        for (auto idx : deleted_indices) wval(patch, &idx, 4);
+
+        size_t str_diff_size = 12 + (n_added > 0 ? new_strings.size() - old_strings.size() + n_deleted * 16 : 0);
+        std::cerr << "  strings.bin: +" << n_added << " -" << n_deleted << " strings" << std::endl;
     }
 
     // addr_points.bin
