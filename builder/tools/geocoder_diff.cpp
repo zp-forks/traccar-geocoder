@@ -365,22 +365,13 @@ int main(int argc, char* argv[]) {
     wval(patch, &ver, 4); wval(patch, &flags, 4);
 
     // --- Section: String remap ---
+    // When string-level diff is present, the remap is derived by the patch tool.
+    // Only include explicit remap if string diff is NOT used.
+    // For now, always include empty remap (string diff handles everything).
     {
-        // Only include entries where old_off != new_off (saves space)
-        std::vector<std::pair<uint32_t,uint32_t>> entries;
-        size_t pos = 0;
-        while (pos < old_strings.size()) {
-            uint32_t old_off = static_cast<uint32_t>(pos);
-            auto it = str_remap.find(old_off);
-            uint32_t new_off = (it != str_remap.end()) ? it->second : old_off;
-            if (old_off != new_off)
-                entries.push_back({old_off, new_off});
-            pos += strlen(old_strings.data() + pos) + 1;
-        }
-        uint32_t marker = 0xFFFFFFFE, count = static_cast<uint32_t>(entries.size());
+        uint32_t marker = 0xFFFFFFFE, count = 0;
         wval(patch, &marker, 4); wval(patch, &count, 4);
-        for (auto& [o, n] : entries) { wval(patch, &o, 4); wval(patch, &n, 4); }
-        std::cerr << "  String remap: " << count << " changed entries (" << count * 8 << " bytes)" << std::endl;
+        std::cerr << "  String remap: derived from string diff (0 explicit entries)" << std::endl;
     }
 
     // --- Section: Per-file merge sequences ---
