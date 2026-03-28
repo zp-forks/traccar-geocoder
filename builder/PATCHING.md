@@ -1,213 +1,219 @@
 # Geocoder Incremental Patch System
 
-## Overview
+## Goal
 
-A system for producing small daily patch files so users can update their geocoder
-index (~7 GiB for Europe) without re-downloading the full dataset. Users apply
-patches in sequence: day1 + patch_1→2 → day2, day2 + patch_2→3 → day3, etc.
+Produce small patch files nightly so users can update their geocoder index without
+re-downloading the full dataset. A user starting from any build can apply patches
+in sequence and arrive at output **byte-identical** to a fresh build.
+
+## Current Status
+
+### What Works
+- **Deterministic builds**: Same PBF always produces byte-identical output
+- **Single-patch application**: Verified on both Europe and Planet — all 14 files byte-identical
+- **Sequential patching**: Verified on planet (Mar 9 → Mar 16 → Mar 23) — **IN PROGRESS, awaiting results**
+- **Custom patch format**: Merge sequences, cell corrections, flag corrections — no external tools for diff/apply logic (only zstd for transport compression)
+
+### What Needs Work
+- **Sequential planet test**: Running, results pending
+- **Oversized merge sequences**: `street_nodes` (33%) and `admin_vertices` (210%) produce merge data larger than the files themselves at planet scale — the sequential merge algorithm's 200-record lookahead fails for large coordinate shifts
+- **Patch size optimization**: Planet 7-day patches are 852 MiB; target is much smaller
+- **Build determinism audit**: Need to verify there are no remaining non-deterministic paths (struct padding was one; there may be others)
+- **Code cleanup**: Prototype files, dead code blocks, inconsistent patterns
+
+## Tested Patch Sizes
+
+### Europe (7 GiB dataset)
+
+| Gap | Patch Size | Per Day | All Match? |
+|-----|-----------|---------|------------|
+| 2 days (Mar 25→27) | 78 MiB | ~39 MiB | YES (14/14) |
+| 6 days (Mar 21→27) | 187 MiB | ~31 MiB | YES (14/14) |
+
+### Planet (17 GiB dataset)
+
+| Gap | Patch Size | Per Day | All Match? |
+|-----|-----------|---------|------------|
+| 7 days (Mar 9→16) | ~850 MiB (est) | ~121 MiB | PENDING |
+| 7 days (Mar 16→23) | 852 MiB | ~122 MiB | YES (14/14) |
+| 11 days (Mar 9→20)* | 56 MiB | ~5 MiB | YES but INVALID — same PBF |
+
+\* The planet.osm.pbf we had was actually the 260309 (Mar 9) release downloaded on Mar 20, not a Mar 16/20 snapshot. The 56 MiB patch was essentially self-patching.
+
+### Per-File Breakdown (Planet 7-day gap, Mar 16→23)
+
+| File | Size | Merge Seq | % | Issue |
+|------|------|-----------|---|-------|
+| strings.bin | 205 MiB | full replacement | — | Could merge at string level |
+| addr_points.bin | 2.4 GiB | 7.9 MiB | 0.31% | Excellent |
+| street_ways.bin | 547 MiB | 5.2 MiB | 0.90% | Excellent |
+| **street_nodes.bin** | **3.8 GiB** | **1.3 GiB** | **33.36%** | **BAD — sequential merge fails at scale** |
+| interp_ways.bin | 1.7 MiB | 2.6 KB | 0.15% | Excellent |
+| interp_nodes.bin | 3.3 MiB | 3.5 KB | 0.10% | Excellent |
+| admin_polygons.bin | 22.7 MiB | 205 KB | 0.90% | Good |
+| **admin_vertices.bin** | **716 MiB** | **1.5 GiB** | **209.84%** | **BAD — merge larger than file** |
+| Cell corrections | — | ~47 MiB | — | Working |
+| String remap | — | 95 MiB | — | Fixed overhead |
+| Fixup tables | — | ~49 MiB | — | Way/admin offset fixes |
+
+**Key observation**: `street_nodes` and `admin_vertices` are coordinate files (8 bytes: lat+lng). The merge algorithm uses a sequential 200-record lookahead which fails when record insertions/deletions shift large blocks of coordinates. These two files account for ~80% of the planet patch size.
+
+### Per-File Breakdown (Europe 6-day gap, Mar 21→27)
+
+| File | Size | Merge Seq | % | Notes |
+|------|------|-----------|---|-------|
+| strings.bin | 83 MiB | full | — | |
+| addr_points.bin | 1.3 GiB | 4.4 MiB | 0.32% | Excellent |
+| street_ways.bin | 223 MiB | 2.7 MiB | 1.16% | Excellent |
+| street_nodes.bin | 1.4 GiB | 406 MiB | 28.11% | Large |
+| admin_polygons.bin | 11 MiB | 95 KB | 0.88% | Good |
+| admin_vertices.bin | 278 MiB | 83 MiB | 28.48% | Large |
 
 ## Architecture
 
 ```
 build-index (deterministic) → geocoder-diff old/ new/ → patch.gcpatch
-geocoder-patch old/ patch.gcpatch → new/  (byte-identical to fresh build)
+geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh build)
 ```
 
 ### Tools
-- **build-index**: Modified to produce deterministic output (canonical sort order)
-- **geocoder-diff**: Compares two deterministic builds, produces .gcpatch file
-- **geocoder-patch**: Applies .gcpatch to old build, produces new build
+- **build-index** (`src/build_index.cpp`): Builder with deterministic ordering
+- **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
+- **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build
+- **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
 
-### Key Design Decisions
-1. **Deterministic builds**: Same PBF → byte-identical output (verified)
-2. **Custom patch format**: Merge sequences at record level, not raw binary diff
-3. **String remapping**: Old string offsets mapped to new (alphabetical sort differs between builds)
-4. **zstd transport compression**: Whole patch compressed for download
+### How Patching Works
 
-## Current State (2026-03-27)
+**Diff tool:**
+1. Build string remap (old string pool offsets → new string pool offsets)
+2. For each data file: apply string remap to old, match records by content hash (for ways/admin: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride)
+3. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
+4. Rebuild entry files from derived ID remaps + cell changes
+5. Compare derived entries with new entries cell by cell — include differing cells as corrections
+6. Compare cell flags (has_street/has_addr/has_interp) between old and new — include differences
+7. Package everything, compress whole patch with zstd for transport
 
-### What Works
-- Deterministic builds: verified byte-identical across runs
-- Data files: all 8 data files produce byte-identical output after patching
-- Entry files: corrected via zstd deltas against derived rebuild
-- admin_cells: corrected via zstd delta
-- **13 of 14 files match** — only geo_cells.bin remains
+**Patch tool:**
+1. Decompress zstd, read string remap
+2. For each data file: apply string remap + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
+3. Read cell changes (added/removed cell IDs) and flag corrections
+4. Rebuild entry files from tracked ID mappings + cell changes
+5. Apply cell-level entry corrections (replace specific cells' data)
+6. Rebuild geo_cells/admin_cells from corrected entries + flag corrections
 
-### Patch Size: 2-Day Europe Gap (Mar 25 → Mar 27)
+## Known Issues
 
-| Component | Uncompressed | In Patch |
-|-----------|-------------|----------|
-| String remap (5M entries) | 40 MiB | ~12 MiB |
-| Way offset fixups (19.4M) | 155 MiB | ~43 MiB |
-| Admin offset fixups (449K) | 3.6 MiB | ~1 MiB |
-| strings.bin (full replacement) | 83 MiB | ~15 MiB |
-| addr_points merge (0.04%) | 517 KB | <1 MiB |
-| street_ways merge (0.15%) | 356 KB | <1 MiB |
-| street_nodes merge (2.24%) | 32 MiB | ~3 MiB |
-| admin_vertices merge (0.65%) | 1.9 MiB | <1 MiB |
-| admin_polygons merge (0.17%) | 18 KB | <1 MiB |
-| interp files | <1 KB | <1 MiB |
-| Cell changes (9K added, 2K removed) | 85 KB | <1 MiB |
-| Entry corrections (4 files) | 1.2 MiB | <1 MiB |
-| **geo_cells.bin correction** | **396 MiB** | **~370 MiB** |
-| admin_cells correction | 500 KB | <1 MiB |
-| **Total** | | **~452 MiB** |
+### 1. Coordinate file merge inefficiency (BIGGEST ISSUE)
 
-Without geo_cells: **~78 MiB**. Estimated 1-day gap: **~40 MiB**.
+**Files affected**: `street_nodes.bin`, `admin_vertices.bin`, `interp_nodes.bin`
+
+**Problem**: These files contain 8-byte coordinate records (float lat, float lng). The merge algorithm uses sequential comparison with a 200-record lookahead. When records are inserted/deleted, all subsequent records shift. With planet-scale data (500M+ nodes), the lookahead fails to find matches beyond the shift distance, causing DELETE+INSERT for huge ranges.
+
+**Why it happens**: Coordinate records are grouped by their parent record (ways/polygons). When the parent sort order changes (due to new/deleted parents), entire blocks of coordinates shift by thousands of positions. The sequential scan can't bridge these gaps.
+
+**Impact**: street_nodes at 33% = 1.3 GiB of merge data for planet. admin_vertices at 210% = 1.5 GiB (more data than the file itself, due to INSERT overhead).
+
+**Potential fixes**:
+- **Parent-aware merging**: Match coordinate blocks by their parent record instead of individual coordinates. If a way is matched, copy its entire node block. Only INSERT nodes for unmatched (new) ways.
+- **Increased lookahead with hash verification**: Use content hashing for coordinate files, but with collision detection (same coordinates can appear at many positions).
+- **File format change**: Store node data inline with way records instead of in a separate flat array. This would eliminate the cascade problem but requires server format changes.
+
+### 2. String pool as full replacement
+
+**Impact**: 95-215 MiB per patch (depending on dataset size).
+
+**Problem**: The string pool is alphabetically sorted. Any new/removed string shifts all subsequent offsets. Including the full pool is simpler than trying to merge it.
+
+**Potential fix**: String-level merge (variable stride, compare by string content). Since both pools are sorted alphabetically, most strings are at similar positions. A string-aware merge would be very efficient.
+
+### 3. Large cell correction sets
+
+**Impact**: 689K-1.9M cell corrections for 6-7 day gaps.
+
+**Problem**: The merge-derived ID remap doesn't capture all record matches (173K unmatched ways on planet). Unmatched records cause cells to have wrong entry IDs, requiring correction.
+
+**Root cause**: The merge matches records by byte equality. If even one byte differs (e.g., node_offset not matched by fixup), the record is unmatched. The hash-based fixup matches ~99.6% of records, but the 0.4% unmatched cascade to many cells.
+
+**Potential fix**: Improve the fixup matching to cover more records, or accept the corrections as a cost of the approach.
+
+### 4. Struct padding non-determinism (FIXED)
+
+**Status**: Fixed by adding explicit padding fields to `AdminPolygon` and `InterpWay` structs in `types.h`, plus zeroing padding in diff/patch tools for old builds.
+
+**Root cause**: Compiler-inserted padding between struct fields contained uninitialized memory values that differed between builds, causing 0% match rate for admin polygons on planet.
 
 ## Patch Format (.gcpatch, version 2)
 
-Whole file is zstd-compressed for transport. Uncompressed structure:
+Whole file is zstd-compressed for transport. Internal structure:
 
 ```
-Header: "GCPATCH\0" (8) + version (u32) + flags (u32)
+Header: "GCPATCH\0" (8) + version=2 (u32) + flags=0 (u32)
 
-Section: String Remap
-  marker: 0xFFFFFFFE (u32)
-  count: u32
-  entries: [(old_offset: u32, new_offset: u32)] × count
+String Remap: marker 0xFFFFFFFE (u32) + count (u32) + [(old_off, new_off)] × count
 
-Section: Per-file merge sequences
-  file_id: u32 (PatchFileId enum, 0-13)
-  stride: u32 (record size, 0=full replacement, 0xFE=correction)
-  old_size: u64, new_size: u64
-  n_fixups: u32
-  fixups: [(record_index: u32, new_offset_value: u32)] × n_fixups
-  seq_size: u64
-  ops: MATCH_RUN(count) | INSERT_RUN(count, data) | DELETE_RUN(count)
+Per-file merge: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
+  + n_fixups (u32) + [(record_idx, new_offset_value)] × n_fixups
+  + seq_size (u64) + merge_ops
+  Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
+  stride=0: full replacement (no fixups, data follows directly)
 
-Section: Cell Changes
-  marker: 0xFFFFFFFB/0xFFFFFFFA (geo/admin)
-  n_added: u32, n_removed: u32
-  added_cells: [cell_id: u64] × n_added
-  removed_cells: [cell_id: u64] × n_removed
+Cell Changes: marker 0xFFFFFFFB/0xFFFFFFFA (u32) + n_added (u32) + n_removed (u32)
+  + [cell_id:u64] × n_added + [cell_id:u64] × n_removed
 
-Section: Correction deltas (stride=0xFE)
-  file_id: u32, stride: 0xFE
-  derived_size: u64, new_size: u64
-  n_fixups: u32 (always 0)
-  delta_size: u64
-  delta: zstd frame (derived → new via --patch-from)
+Cell Flag Corrections: marker 0xFFFFFFF9 (u32) + count (u32)
+  + [(cell_id:u64, flags:u8)] × count
+  flags: bit0=has_street, bit1=has_addr, bit2=has_interp
+
+Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
+  + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count
 
 End marker: 0xFFFFFFFF (u32)
 ```
 
-## How Patching Works
+## Performance
 
-### Diff Tool (geocoder-diff)
-1. Build string remap (old string pool → new string pool offsets)
-2. For each data file:
-   a. Apply string remap to old file
-   b. For ways/interps/admin: hash-match records by content, fix node_offset/vertex_offset
-   c. Build merge sequence (MATCH/INSERT/DELETE at record stride)
-   d. Record offset fixups for matched records
-3. Derive ID remaps by replaying merge sequences (same as patch tool)
-4. Rebuild entries from derived ID remaps + cell changes
-5. Compute entry corrections: zstd(derived_entries → new_entries)
-6. Compute cell index corrections: zstd(derived_cells → new_cells)
-7. Package everything, compress with zstd
+| Operation | Europe | Planet |
+|-----------|--------|--------|
+| Build (deterministic) | ~12 min | ~14 min |
+| Diff generation | ~5 min | ~42 min |
+| Patch application | ~3 min | ~20 min |
+| Verification | ~1 min | ~5 min |
 
-### Patch Tool (geocoder-patch)
-1. Decompress zstd transport layer
-2. Read string remap, detect strides
-3. For each merge section:
-   a. Apply string remap to old file
-   b. Apply offset fixups (node_offset/vertex_offset)
-   c. Replay merge sequence → output file
-   d. Track old→new ID mapping from MATCH ops
-4. Read cell changes (added/removed cells)
-5. Rebuild entry files from derived ID remaps + cell changes
-6. Rebuild admin files similarly
-7. Apply entry corrections (zstd deltas)
-8. Rebuild geo_cells from corrected entries
-9. Apply cell index corrections (zstd deltas)
+## TODO (Priority Order)
 
-## Approaches Tried
+### Must Fix
+1. **Validate sequential planet test** — Running with real weekly gaps (Mar 9 → Mar 16 → Mar 23)
+2. **Verify build determinism thoroughly** — Run same PBF twice on planet, confirm byte-identical output
 
-### 1. Raw zstd --patch-from (baseline)
-**Result**: 1.9 GiB patches (27% of 7 GiB). String offsets and record IDs differ
-between independent builds, causing cascading byte differences in every file.
+### Should Fix (Patch Size)
+3. **Parent-aware coordinate merge** — Match node/vertex blocks by parent way/polygon instead of individual coordinates. Expected to reduce street_nodes from 33% to <1% and admin_vertices from 210% to <5%.
+4. **String-level merge** — Replace full string pool replacement with string-aware merge. Expected saving: ~50-100 MiB per planet patch.
 
-### 2. Canonical ordering in builder
-Added deterministic sorting (string pool alphabetical, records by content).
-**Result**: Same PBF → byte-identical output. But patches between different PBFs
-still 1.7 GiB because string offsets cascade.
+### Nice to Have (Performance)
+5. **Parallel merge building** — Merge sequences are built sequentially; could parallelize across files
+6. **Streaming patch application** — Currently loads entire patch into memory after decompression
+7. **Reduce fixup table size** — 49 MiB of way offset fixups could be delta-encoded
 
-### 3. String remap + zstd --patch-from
-Apply string offset remapping before binary diff.
-**Result**: Data files drop to 0.2-0.7%. But entry/cell files still 24-79%.
-Total: ~941 MiB.
-
-### 4. Record ID remap + entry rebuild
-Match records by content, remap IDs in entry files.
-**Result**: Entry files drop to 0.02-0.07%. Total with compressed tables: ~626 MiB.
-But remap tables are 240 MiB compressed (187 MiB for 86M addr pairs).
-
-### 5. Custom merge sequences (current approach)
-Walk sorted records in parallel, emit MATCH/INSERT/DELETE ops at record level.
-Hash-indexed matching for data files. Sequential scan for coordinate files.
-**Result**: Data files at 0.04-2.24%. Merge sequences implicitly encode ID remaps.
-Eliminates explicit ID remap tables. Total: ~78 MiB without entry/cell files.
-
-### 6. Entry corrections
-Include zstd deltas: derived_entries → new_entries. Tiny corrections (~1 MiB).
-**Result**: All entry files match. geo_cells.bin remains at 396 MiB because derived
-geo_cells has cascading offset differences.
-
-## Remaining Work
-
-### geo_cells.bin (the last bottleneck)
-- **Problem**: 1.6 GiB file with 84M × 20-byte records. Each record has 12 bytes of
-  entry offsets that cascade when any cell's entries change.
-- **Current**: 396 MiB correction delta (derived offsets → correct offsets)
-- **Root cause**: Derived geo_cells is built from pre-correction entries. After corrections,
-  entries are correct, but we need to recompute offsets. The rebuild algorithm in diff
-  and patch tools must produce byte-identical output.
-- **Potential fix**: Share exact rebuild algorithm, or include only the ~9K cells whose
-  has/hasn't flags differ (~100 KB of correction data).
-
-### Sequential patching test
-- Have 3 Europe builds: det-A (Mar 21), det-new (Mar 25), det-today (Mar 27)
-- Need: patch(det-A, p12) → result2, patch(result2, p23) → result3, verify result3 == det-today
-- Blocked by: geo_cells.bin mismatch
-
-### Code cleanup
-- Remove prototype files (full_remap_test.cpp, remap_test.cpp)
-- Remove dead code blocks (if (false) sections)
-- Remove geocoder_canonicalize.cpp (superseded by build_index determinism)
-- Clean up the diff/patch tools (currently ~700 lines each, could be ~400)
+### Future Consideration (Format Changes)
+8. **Inline node storage** — Store way nodes inline with way records instead of in a separate flat array. Eliminates coordinate cascade problem entirely. Requires server format change.
+9. **Content-addressed record IDs** — Use hash-based IDs instead of sequential array indices. Makes entry files stable across builds. Requires server format change (array index → hash lookup).
+10. **Fixed-size cell slots** — Pre-allocate entry space per cell to prevent offset cascading. Analysis showed this wastes 2-6x space due to skewed distribution (74% of cells have 1 street entry, but max is 886 addr entries).
 
 ## File Inventory
 
-### Modified
-- `src/build_index.cpp` — deterministic ordering (sort strings, records, nodes, vertices)
-- `CMakeLists.txt` — new build targets
+### Core files (committed)
+- `src/build_index.cpp` — Deterministic ordering (sort strings, records, nodes, vertices)
+- `src/types.h` — Explicit struct padding for AdminPolygon and InterpWay
+- `src/s2_helpers.cpp` — Zero padding in AdminPolygon creation
+- `tools/geocoder_diff.cpp` — Diff tool (~800 lines)
+- `tools/geocoder_patch.cpp` — Patch tool (~600 lines)
+- `tools/patch_format.h` — Shared format definitions + rebuild functions (~450 lines)
+- `tools/geocoder_canonicalize.cpp` — Standalone canonicalize (testing tool)
+- `CMakeLists.txt` — Build targets
 
-### New (committed)
-- `tools/geocoder_diff.cpp` — diff tool (~700 lines)
-- `tools/geocoder_patch.cpp` — patch tool (~500 lines)
-- `tools/patch_format.h` — shared format definitions + rebuild functions (~400 lines)
-- `tools/geocoder_canonicalize.cpp` — standalone canonicalize (testing tool)
-
-### Prototypes (uncommitted, can be removed)
-- `tools/full_remap_test.cpp` — proved remap approach
-- `tools/remap_test.cpp` — string-only remap test
-
-## Performance
-
-### Build Time Overhead
-- Deterministic sorting: ~100s (string sort 5s, addr sort 55s, way sort 16s)
-- Total build: ~12 min + 100s = ~14 min (+13%)
-
-### Diff Time
-- 2-day Europe gap: ~5 min (dominated by merge building + zstd compression)
-
-### Patch Application Time
-- ~2 min (dominated by merge replay + entry reconstruction + zstd decompression)
-
-## Three Europe Builds Available for Testing
-- `det-A`: March 21 PBF (europe.osm.pbf, 34.0 GiB)
-- `det-new`: March 25 PBF (europe-new.osm.pbf, 34.1 GiB)
-- `det-today`: March 27 PBF (europe-today.osm.pbf, 34.1 GiB)
-
-Node 3: 32 cores, 174 GiB RAM, files at /home/michtest/
+### Test data on Node 3 (/home/michtest/)
+- `planet-old/` — Built from planet-260309 (Mar 9), 17 GiB
+- `planet-B/` — Built from planet-260316 (Mar 16), 17 GiB (building)
+- `planet-new/` — Built from planet-260323 (Mar 23/27), 17 GiB
+- `det-A/` — Europe built from Mar 21 PBF, 7 GiB
+- `det-today/` — Europe built from Mar 27 PBF, 7 GiB
