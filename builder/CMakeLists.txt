@@ -36,14 +36,6 @@ add_executable(geocoder-patch tools/geocoder_patch.cpp)
 target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
 target_include_directories(geocoder-patch PRIVATE tools)
 
-add_executable(remap-test tools/remap_test.cpp)
-target_link_libraries(remap-test PRIVATE Threads::Threads)
-target_include_directories(remap-test PRIVATE tools)
-
-add_executable(full-remap-test tools/full_remap_test.cpp)
-target_link_libraries(full-remap-test PRIVATE Threads::Threads)
-target_include_directories(full-remap-test PRIVATE tools)
-
 if(EXISTS /opt/homebrew/include)
     target_include_directories(build-index PRIVATE /opt/homebrew/include)
 endif()

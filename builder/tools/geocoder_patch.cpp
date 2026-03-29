@@ -672,7 +672,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Rebuilt geo_cells from corrected entries" << std::endl;
         }
     }
-    if (false) { // legacy rebuild code
+    if (false) { // REMOVED: legacy rebuild code — see git history
         auto se = read_file(out_dir + "/street_entries.bin");
         auto ae = read_file(out_dir + "/addr_entries.bin");
         auto ie = read_file(out_dir + "/interp_entries.bin");
