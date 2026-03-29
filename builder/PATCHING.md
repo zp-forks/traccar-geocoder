@@ -25,7 +25,7 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 | Gap | Patch Size | Per Day | All Match? |
 |-----|-----------|---------|------------|
-| 6 days (Mar 21→27) | **68 MiB** | **~11 MiB** | YES — latest approach |
+| 6 days (Mar 21→27) | **34 MiB** | **~5.7 MiB** | YES — all optimizations + delta fixups |
 
 ### Planet (17 GiB dataset)
 
@@ -196,7 +196,8 @@ End marker: 0xFFFFFFFF (u32)
 - **Verify patched planet still serves correct data** — Spot-check geocoding results against fresh build
 
 ### Should Do (Patch Size)
-- **Delta-encode fixup tables** — 364 MiB raw (46% of planet patch). Record indices are sequential, offsets monotonically increasing — delta encoding could reduce to ~10 MiB
+- ~~Delta-encode fixup tables~~ — **DONE** (148 MiB → 39 MiB for Europe, Europe patch 68→34 MiB)
+- **Run planet with delta fixups** — Estimate: 160 MiB → ~80 MiB per weekly patch
 - **Reduce cell correction count** — 2M street cell corrections (31 MiB). Improve fixup matching to reduce unmatched records
 
 ### Nice to Have (Performance)
