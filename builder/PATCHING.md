@@ -31,9 +31,9 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 | Gap | Patch Size | Per Day | All Match? |
 |-----|-----------|---------|------------|
-| 7 days (Mar 9→16) | **160 MiB** | **~23 MiB** | YES — optimized diff + dedup, sequential step 1 |
-| 7 days (Mar 16→23) | **159 MiB** | **~23 MiB** | YES — optimized diff + dedup, sequential step 2 |
-| Sequential (Mar 9→16→23) | N/A | N/A | **PASS** — optimized diff + dedup, both steps byte-identical |
+| 7 days (Mar 16→23) | **77 MiB** | **~11 MiB** | YES — all optimizations + delta fixups |
+| 7 days (Mar 9→16) | 160 MiB | ~23 MiB | YES — without delta fixups |
+| Sequential (Mar 9→16→23) | 160+159 MiB | N/A | **PASS** — both steps byte-identical (without delta fixups) |
 
 ### Per-File Breakdown (Planet 7-day gap, Mar 16→23, latest approach)
 
@@ -197,7 +197,7 @@ End marker: 0xFFFFFFFF (u32)
 
 ### Should Do (Patch Size)
 - ~~Delta-encode fixup tables~~ — **DONE** (148 MiB → 39 MiB for Europe, Europe patch 68→34 MiB)
-- **Run planet with delta fixups** — Estimate: 160 MiB → ~80 MiB per weekly patch
+- ~~Run planet with delta fixups~~ — **DONE** (160 MiB → 77 MiB, all 14 MATCH)
 - **Reduce cell correction count** — 2M street cell corrections (31 MiB). Improve fixup matching to reduce unmatched records
 
 ### Nice to Have (Performance)
