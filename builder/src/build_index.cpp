@@ -1366,8 +1366,27 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
             std::vector<AddrPoint> sorted(n);
             for (uint32_t i = 0; i < n; i++) sorted[i] = data.addr_points[order[i]];
+            // Dedup consecutive identical records (planet has ~4M duplicates)
+            // Map duplicate old IDs to the first occurrence's new ID
+            std::vector<uint32_t> dedup_remap(n);
+            size_t write_pos = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (write_pos == 0 || memcmp(&sorted[i], &sorted[write_pos - 1], sizeof(AddrPoint)) != 0) {
+                    sorted[write_pos] = sorted[i];
+                    dedup_remap[i] = static_cast<uint32_t>(write_pos);
+                    write_pos++;
+                } else {
+                    dedup_remap[i] = static_cast<uint32_t>(write_pos - 1);
+                }
+            }
+            sorted.resize(write_pos);
             data.addr_points = std::move(sorted);
-            for (auto& p : data.sorted_addr_cells) p.item_id = old_to_new[p.item_id];
+            if (write_pos < n)
+                std::cerr << "  Deduped addr_points: " << n << " → " << write_pos
+                          << " (-" << (n - write_pos) << ")" << std::endl;
+            // Remap IDs through both old→new and dedup
+            for (auto& p : data.sorted_addr_cells)
+                p.item_id = dedup_remap[old_to_new[p.item_id]];
             auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
                 return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
             };
