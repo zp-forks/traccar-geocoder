@@ -317,15 +317,24 @@ int main(int argc, char* argv[]) {
         apply_str_remap(old_data, file_id, actual_stride);
 
         // Read and apply fixups (node_offset/vertex_offset fixes)
-        // Read and apply fixups (offset field patches for matched records)
+        // Read and apply delta-encoded fixups
         uint32_t n_fixups = read_u32();
-        for (uint32_t i = 0; i < n_fixups; i++) {
-            uint32_t idx = read_u32(), val = read_u32();
-            size_t byte_pos = (size_t)idx * actual_stride;
-            if (byte_pos + 4 <= old_data.size())
-                memcpy(old_data.data() + byte_pos, &val, 4);
+        if (n_fixups > 0) {
+            uint32_t delta_size = read_u32();
+            uint32_t prev_idx = 0, prev_val = 0;
+            size_t fpos = pos;
+            for (uint32_t i = 0; i < n_fixups; i++) {
+                uint32_t idx = prev_idx + read_varint(patch.data(), fpos);
+                uint32_t val = prev_val + read_varint(patch.data(), fpos);
+                size_t byte_pos = (size_t)idx * actual_stride;
+                if (byte_pos + 4 <= old_data.size())
+                    memcpy(old_data.data() + byte_pos, &val, 4);
+                prev_idx = idx;
+                prev_val = val;
+            }
+            pos = fpos;
+            std::cerr << "    Applied " << n_fixups << " fixups (" << delta_size << " bytes delta)" << std::endl;
         }
-        if (n_fixups > 0) std::cerr << "    Applied " << n_fixups << " fixups" << std::endl;
 
         // Read merge sequence size and replay, tracking old→new ID mapping
         uint64_t seq_size = read_u64();

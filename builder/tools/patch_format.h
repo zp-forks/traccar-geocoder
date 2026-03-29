@@ -445,6 +445,27 @@ inline RebuiltAdmin rebuild_admin_from_remap(
     return result;
 }
 
+// --- Varint encoding for delta-compressed fixup tables ---
+
+inline void write_varint(std::vector<char>& buf, uint32_t value) {
+    while (value >= 128) {
+        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
+        value >>= 7;
+    }
+    buf.push_back(static_cast<char>(value));
+}
+
+inline uint32_t read_varint(const char* data, size_t& pos) {
+    uint32_t result = 0, shift = 0;
+    while (true) {
+        uint8_t byte = static_cast<uint8_t>(data[pos++]);
+        result |= (uint32_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    return result;
+}
+
 // --- Grid coordinate for fingerprinting ---
 
 inline int to_grid(float v) {

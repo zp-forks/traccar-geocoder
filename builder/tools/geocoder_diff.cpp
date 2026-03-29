@@ -397,10 +397,20 @@ int main(int argc, char* argv[]) {
         uint32_t st = static_cast<uint32_t>(stride);
         wval(patch, &st, 4);
         wval(patch, &os, 8); wval(patch, &ns, 8);
-        // Fixup count + data before merge sequence
+        // Fixup count + delta-encoded data before merge sequence
         wval(patch, &n_fixups, 4);
         if (n_fixups > 0) {
-            for (auto& [idx, val] : fit->second) { wval(patch, &idx, 4); wval(patch, &val, 4); }
+            std::vector<char> delta_buf;
+            uint32_t prev_idx = 0, prev_val = 0;
+            for (auto& [idx, val] : fit->second) {
+                write_varint(delta_buf, idx - prev_idx);
+                write_varint(delta_buf, val - prev_val);
+                prev_idx = idx;
+                prev_val = val;
+            }
+            uint32_t delta_size = static_cast<uint32_t>(delta_buf.size());
+            wval(patch, &delta_size, 4);
+            patch.insert(patch.end(), delta_buf.begin(), delta_buf.end());
         }
         wval(patch, &ss, 8);
         patch.insert(patch.end(), seq.data.begin(), seq.data.end());
