@@ -31,9 +31,9 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 | Gap | Patch Size | Per Day | All Match? |
 |-----|-----------|---------|------------|
-| 7 days (Mar 16→23) | **186 MiB** | **~27 MiB** | YES — latest approach |
-| 7 days (Mar 9→16) | 852 MiB | ~122 MiB | YES — old approach (no parent merges, no string diff) |
-| Sequential (Mar 9→16→23) | N/A | N/A | PASS — both steps byte-identical (old approach) |
+| 7 days (Mar 9→16) | **160 MiB** | **~23 MiB** | YES — optimized diff + dedup, sequential step 1 |
+| 7 days (Mar 16→23) | **159 MiB** | **~23 MiB** | YES — optimized diff + dedup, sequential step 2 |
+| Sequential (Mar 9→16→23) | N/A | N/A | **PASS** — optimized diff + dedup, both steps byte-identical |
 
 ### Per-File Breakdown (Planet 7-day gap, Mar 16→23, latest approach)
 
@@ -192,7 +192,7 @@ End marker: 0xFFFFFFFF (u32)
 8. ~~Addr_points dedup~~ — **DONE** (4.4M duplicates on planet, fixed non-determinism)
 
 ### Must Do
-- **Sequential test with optimized diff on planet** — Re-run with parent merges + string diff + dedup
+- ~~Sequential test with optimized diff on planet~~ — **PASS** (160 MiB + 159 MiB, both steps byte-identical)
 - **Verify patched planet still serves correct data** — Spot-check geocoding results against fresh build
 
 ### Should Do (Patch Size)
