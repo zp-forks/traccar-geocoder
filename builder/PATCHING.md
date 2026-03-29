@@ -182,21 +182,22 @@ End marker: 0xFFFFFFFF (u32)
 ## TODO (Priority Order)
 
 ### Completed
-1. ~~Sequential planet test~~ — **PASS** (3 distinct weekly snapshots)
+1. ~~Sequential planet test~~ — **PASS** (3 distinct weekly snapshots, old diff tool)
 2. ~~Parent-aware coordinate merge~~ — **DONE** (street_nodes 33%→7%, admin_vertices 210%→2.4%)
 3. ~~String-level merge~~ — **DONE** (83 MiB → ~100 KB)
 4. ~~Planet test with optimizations~~ — **DONE** (852 MiB → 186 MiB)
-5. ~~Build determinism (Germany)~~ — **PASS**
+5. ~~Build determinism~~ — **PASS** (Germany, Europe, Planet — all verified)
 6. ~~Eliminate explicit string remap~~ — **DONE** (derived from string diff)
 7. ~~Struct padding fix~~ — **DONE** (explicit padding in AdminPolygon/InterpWay)
+8. ~~Addr_points dedup~~ — **DONE** (4.4M duplicates on planet, fixed non-determinism)
 
 ### Must Do
-- **Verify build determinism on Europe and Planet** — Germany passes; need to confirm at scale
-- **Sequential test with optimized diff** — Re-run with parent merges + string diff on planet
+- **Sequential test with optimized diff on planet** — Re-run with parent merges + string diff + dedup
+- **Verify patched planet still serves correct data** — Spot-check geocoding results against fresh build
 
 ### Should Do (Patch Size)
-- **Delta-encode fixup tables** — 48 MiB of way fixups could compress to ~10 MiB with delta encoding
-- **Reduce cell correction count** — Improve fixup matching to reduce unmatched records
+- **Delta-encode fixup tables** — 364 MiB raw (46% of planet patch). Record indices are sequential, offsets monotonically increasing — delta encoding could reduce to ~10 MiB
+- **Reduce cell correction count** — 2M street cell corrections (31 MiB). Improve fixup matching to reduce unmatched records
 
 ### Nice to Have (Performance)
 - **Parallel merge building** — Currently sequential across files
