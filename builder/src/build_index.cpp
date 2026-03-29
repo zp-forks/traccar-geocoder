@@ -1354,13 +1354,13 @@ int main(int argc, char* argv[]) {
             std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
                 const auto& pa = data.addr_points[a];
                 const auto& pb = data.addr_points[b];
-                // Since strings are sorted alphabetically, comparing offsets
-                // gives the same order as strcmp — and it's O(1) not O(n)
                 if (pa.street_id != pb.street_id) return pa.street_id < pb.street_id;
                 if (pa.housenumber_id != pb.housenumber_id) return pa.housenumber_id < pb.housenumber_id;
                 uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
                 if (la != lb) return la < lb;
-                return float_bits(pa.lng) < float_bits(pb.lng);
+                uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
+                if (ga != gb) return ga < gb;
+                return a < b; // stable tiebreaker: original index
             });
             std::vector<uint32_t> old_to_new(n);
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
