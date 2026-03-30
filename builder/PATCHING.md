@@ -188,8 +188,9 @@ End marker: 0xFFFFFFFF (u32)
 |-----------|--------|--------|
 | Build (deterministic) | ~12 min | ~14 min |
 | Diff generation | **3m40s** | **15m22s** |
-| Patch application | **44s** | **3m02s** |
-| Patch peak memory | 641 MiB | 1.8 GiB |
+| Patch application | **33s** | **1m29s** |
+| Patch peak memory | **104 MiB** | **243 MiB** |
+| Patch min cgroup | ~200 MiB | **500 MiB** |
 
 ## TODO (Priority Order)
 
