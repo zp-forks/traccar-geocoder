@@ -117,56 +117,51 @@ int main(int argc, char* argv[]) {
             std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
 
             MappedFile old_pool = mmap_file(cur_dir + "/strings.bin");
-            // Parse old strings as (index, offset, string) — keep only offset+string for remap
-            struct OldStr { uint32_t idx; uint32_t off; const char* str; size_t len; };
-            std::vector<OldStr> old_strs;
-            { size_t sp = 0; uint32_t idx = 0;
-              while (sp < old_pool.size) {
-                  const char* s = old_pool.data + sp; size_t l = strlen(s);
-                  old_strs.push_back({idx++, (uint32_t)sp, s, l});
-                  sp += l + 1;
-              }
-            }
-            // Build merged pool: non-deleted old + added, sorted alphabetically
-            std::vector<const char*> merged;
-            merged.reserve(old_strs.size() + added.size());
-            for (auto& os : old_strs) if (!del_set.count(os.idx)) merged.push_back(os.str);
-            for (auto& s : added) merged.push_back(s.c_str());
-            std::sort(merged.begin(), merged.end(), [](const char* a, const char* b) { return strcmp(a, b) < 0; });
 
-            // Write new pool to file
-            FILE* fp = fopen((out_dir + "/strings.bin").c_str(), "wb");
-            uint32_t wpos = 0;
-            for (const char* s : merged) { size_t l = strlen(s) + 1; fwrite(s, 1, l, fp); wpos += l; }
-            fclose(fp);
+            // Phase A: build merged pool, write to file, free all temporaries
+            {
+                // Parse old strings just for the merge (lightweight: only need idx + str ptr)
+                std::vector<const char*> old_ptrs; // indexed by string index
+                { size_t sp = 0;
+                  while (sp < old_pool.size) { old_ptrs.push_back(old_pool.data + sp); sp += strlen(old_pool.data + sp) + 1; }
+                }
+                std::vector<const char*> merged;
+                merged.reserve(old_ptrs.size() + added.size());
+                for (uint32_t i = 0; i < old_ptrs.size(); i++)
+                    if (!del_set.count(i)) merged.push_back(old_ptrs[i]);
+                for (auto& s : added) merged.push_back(s.c_str());
+                std::sort(merged.begin(), merged.end(), [](const char* a, const char* b) { return strcmp(a, b) < 0; });
+                FILE* fp = fopen((out_dir + "/strings.bin").c_str(), "wb");
+                for (const char* s : merged) { size_t l = strlen(s) + 1; fwrite(s, 1, l, fp); }
+                fclose(fp);
+            } // merged, old_ptrs, added, del_set, del_idx all freed here
+            malloc_trim(0);
 
-            // Build remap by merge-walking old strings vs new pool
-            // Both are sorted alphabetically → O(n+m) with no hash maps
+            // Phase B: build remap by merge-walking old pool vs new pool (both sorted, both mmap'd)
             MappedFile new_pool = mmap_file(out_dir + "/strings.bin");
-            size_t ni = 0; uint32_t new_off = 0;
-            // Walk new pool to build offset list
-            std::vector<std::pair<const char*, uint32_t>> new_strs;
-            { size_t sp = 0;
-              while (sp < new_pool.size) {
-                  new_strs.push_back({new_pool.data + sp, (uint32_t)sp});
-                  sp += strlen(new_pool.data + sp) + 1;
-              }
+            {
+                // Walk both pools simultaneously — no vectors needed, just cursors
+                size_t old_pos = 0, new_pos = 0;
+                while (old_pos < old_pool.size && new_pos < new_pool.size) {
+                    const char* os = old_pool.data + old_pos;
+                    const char* ns = new_pool.data + new_pos;
+                    int c = strcmp(os, ns);
+                    if (c == 0) {
+                        if (old_pos != new_pos) // offset changed
+                            str_remap_vec.push_back({(uint32_t)old_pos, (uint32_t)new_pos});
+                        old_pos += strlen(os) + 1;
+                        new_pos += strlen(ns) + 1;
+                    } else if (c < 0) {
+                        old_pos += strlen(os) + 1; // deleted string
+                    } else {
+                        new_pos += strlen(ns) + 1; // added string
+                    }
+                }
             }
-            // Merge-walk old vs new (both sorted) to build remap
-            size_t oi = 0; ni = 0;
-            while (oi < old_strs.size() && ni < new_strs.size()) {
-                int c = strcmp(old_strs[oi].str, new_strs[ni].first);
-                if (c == 0) {
-                    if (old_strs[oi].off != new_strs[ni].second)
-                        str_remap_vec.push_back({old_strs[oi].off, new_strs[ni].second});
-                    oi++; ni++;
-                } else if (c < 0) { oi++; } // deleted
-                else { ni++; } // added
-            }
-            std::sort(str_remap_vec.begin(), str_remap_vec.end()); // sort by old_offset
+            std::sort(str_remap_vec.begin(), str_remap_vec.end());
             unmap_file(old_pool);
             unmap_file(new_pool);
-            std::cerr << "  Strings: +" << n_added << " -" << n_deleted << " → " << merged.size()
+            std::cerr << "  Strings: +" << n_added << " -" << n_deleted
                       << ", " << str_remap_vec.size() << " remapped (" << str_remap_vec.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
             marker = ru32();
         }
