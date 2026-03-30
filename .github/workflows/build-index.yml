@@ -2,21 +2,26 @@ name: Build Geocoder Index
 
 on:
   schedule:
-    # Weekly on Monday at 06:00 UTC (after OSM planet dump is ready on Friday)
-    - cron: '0 6 * * 1'
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       pbf_url:
-        description: 'Override PBF URL (leave empty for latest planet)'
+        description: 'Override PBF URL (leave empty to use replication diffs)'
         required: false
         type: string
+      force_fresh_download:
+        description: 'Force fresh planet PBF download (skip replication diffs)'
+        required: false
+        type: boolean
+        default: false
       skip_patch:
         description: 'Skip patch generation'
         required: false
         type: boolean
         default: false
       runner:
-        description: 'Runner label (default: self-hosted)'
+        description: 'Runner label'
         required: false
         type: string
         default: 'self-hosted'
@@ -24,12 +29,12 @@ on:
 env:
   S3_BUCKET: ${{ secrets.GEOCODER_S3_BUCKET }}
   S3_REGION: ${{ secrets.GEOCODER_S3_REGION }}
-  S3_PREFIX: geocoder  # s3://bucket/geocoder/builds/..., s3://bucket/geocoder/patches/...
+  S3_PREFIX: geocoder
 
 jobs:
   build:
     runs-on: ${{ inputs.runner || 'self-hosted' }}
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - uses: actions/checkout@v4
@@ -37,100 +42,136 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev aria2 awscli jq
+          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev aria2 jq python3-pip
+          pip install --break-system-packages osmium || pip install --user osmium
+          # Ensure pyosmium is on PATH
+          export PATH="$HOME/.local/bin:$PATH"
+          pyosmium-up-to-date --version || true
 
       - name: Configure AWS
-        run: |
-          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          aws configure set region "${{ secrets.GEOCODER_S3_REGION }}"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.GEOCODER_S3_REGION }}
 
-      - name: Determine PBF URL and date
-        id: pbf
-        run: |
-          if [ -n "${{ inputs.pbf_url }}" ]; then
-            PBF_URL="${{ inputs.pbf_url }}"
-          else
-            # Follow the redirect from planet-latest to get the actual dated URL
-            PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
-          fi
-          echo "url=$PBF_URL" >> "$GITHUB_OUTPUT"
-
-          # Extract date from URL (e.g., planet-260323.osm.pbf → 2026-03-23)
-          FILENAME=$(basename "$PBF_URL")
-          DATE_RAW=$(echo "$FILENAME" | sed -n 's/planet-\([0-9]*\)\.osm\.pbf/\1/p')
-          if [ -n "$DATE_RAW" ]; then
-            BUILD_DATE="20${DATE_RAW:0:2}-${DATE_RAW:2:2}-${DATE_RAW:4:2}"
-          else
-            BUILD_DATE=$(date -u +%Y-%m-%d)
-          fi
-          echo "date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "PBF: $PBF_URL"
-          echo "Date: $BUILD_DATE"
-
-      - name: Check if build already exists
-        id: check
-        run: |
-          EXISTS=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/${{ steps.pbf.outputs.date }}/" 2>/dev/null | wc -l)
-          if [ "$EXISTS" -gt 0 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Build for ${{ steps.pbf.outputs.date }} already exists in S3, skipping"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download PBF
-        if: steps.check.outputs.skip != 'true'
-        run: |
-          echo "Downloading ${{ steps.pbf.outputs.url }}..."
-          aria2c -x 8 -s 8 --max-tries=3 --retry-wait=30 \
-            -d /tmp -o planet.osm.pbf \
-            "${{ steps.pbf.outputs.url }}"
-          ls -lh /tmp/planet.osm.pbf
-
-      - name: Build index
-        if: steps.check.outputs.skip != 'true'
+      - name: Build tools
         run: |
           cd builder
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc) build-index geocoder-diff geocoder-patch
 
-          echo "Building index..."
-          mkdir -p /tmp/index-output
-          time ./build-index /tmp/index-output/ /tmp/planet.osm.pbf \
-            --simplify-epsilon --epsilon-scale 1 2>&1 | tail -10
-
-          echo "Build complete:"
-          ls -lh /tmp/index-output/
-
-          # Free disk space — PBF no longer needed
-          rm -f /tmp/planet.osm.pbf
-
-      - name: Upload build to S3
-        if: steps.check.outputs.skip != 'true'
+      - name: Determine build date
+        id: meta
         run: |
-          BUILD_DATE="${{ steps.pbf.outputs.date }}"
-          S3_PATH="s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE"
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+          echo "date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+          echo "Build date: $BUILD_DATE"
 
-          echo "Uploading build to $S3_PATH..."
-          aws s3 sync /tmp/index-output/ "$S3_PATH/" \
+          # Check if this date already exists
+          EXISTS=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" 2>/dev/null | wc -l)
+          if [ "$EXISTS" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Build for $BUILD_DATE already exists"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Obtain PBF
+        if: steps.meta.outputs.skip != 'true'
+        id: pbf
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          WORKDIR="${{ runner.temp }}/geocoder-build"
+          mkdir -p "$WORKDIR"
+          echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
+
+          FORCE_FRESH="${{ inputs.force_fresh_download }}"
+          OVERRIDE_URL="${{ inputs.pbf_url }}"
+
+          if [ -n "$OVERRIDE_URL" ]; then
+            # Manual URL override
+            echo "Downloading from override URL..."
+            aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$OVERRIDE_URL"
+            echo "method=download" >> "$GITHUB_OUTPUT"
+
+          elif [ "$FORCE_FRESH" = "true" ]; then
+            # Force fresh download
+            echo "Downloading fresh planet PBF..."
+            PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
+            aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$PBF_URL"
+            echo "method=download" >> "$GITHUB_OUTPUT"
+
+          else
+            # Try to use replication diffs on the stored PBF
+            echo "Checking for stored PBF in S3..."
+            STORED_PBF="s3://$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf"
+            if aws s3 ls "$STORED_PBF" 2>/dev/null | grep -q 'planet-current'; then
+              echo "Downloading stored PBF..."
+              aws s3 cp "$STORED_PBF" "$WORKDIR/planet.osm.pbf" --no-progress --only-show-errors
+
+              echo "Applying replication diffs..."
+              time pyosmium-up-to-date -v \
+                --server https://planet.openstreetmap.org/replication/day \
+                -s 2000 \
+                "$WORKDIR/planet.osm.pbf" 2>&1
+              echo "method=diff" >> "$GITHUB_OUTPUT"
+            else
+              echo "No stored PBF found — downloading fresh planet..."
+              PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+                | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
+              aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$PBF_URL"
+              echo "method=download" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          ls -lh "$WORKDIR/planet.osm.pbf"
+
+      - name: Build index
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
+          echo "Building geocoder index..."
+          time builder/build/build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
+            --simplify-epsilon --epsilon-scale 1 2>&1 | tail -10
+          echo ""
+          echo "Build output:"
+          ls -lh "$WORKDIR/output/"
+
+      - name: Upload PBF to S3 for next run
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
+          echo "Uploading updated PBF for next run's replication diffs..."
+          aws s3 cp "$WORKDIR/planet.osm.pbf" \
+            "s3://$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
             --no-progress --only-show-errors
 
-          # Also update the "latest" pointer
-          echo "$BUILD_DATE" | aws s3 cp - "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.txt" \
+          # Free disk — PBF no longer needed
+          rm -f "$WORKDIR/planet.osm.pbf"
+
+      - name: Upload build to S3
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
+          BUILD_DATE="${{ steps.meta.outputs.date }}"
+          S3_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE"
+
+          echo "Uploading build to $S3_BUILD..."
+          aws s3 sync "$WORKDIR/output/" "$S3_BUILD/" \
+            --no-progress --only-show-errors
+
+          echo "$BUILD_DATE" | aws s3 cp - \
+            "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.txt" \
             --content-type text/plain
 
-          echo "Upload complete"
-
-      - name: Find previous build for patching
-        if: steps.check.outputs.skip != 'true' && inputs.skip_patch != true
+      - name: Find previous build
+        if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
         id: prev
         run: |
-          # List all builds, find the most recent one before the current date
-          CURRENT="${{ steps.pbf.outputs.date }}"
+          CURRENT="${{ steps.meta.outputs.date }}"
           PREV=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
             | grep 'PRE' | awk '{print $2}' | tr -d '/' \
             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
@@ -142,44 +183,38 @@ jobs:
             echo "Previous build: $PREV"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No previous build found for patching"
+            echo "No previous build found"
           fi
 
-      - name: Download previous build for patching
+      - name: Generate and verify patch
         if: steps.prev.outputs.found == 'true'
         run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
           PREV="${{ steps.prev.outputs.date }}"
-          mkdir -p /tmp/prev-build
-          echo "Downloading previous build ($PREV)..."
-          aws s3 sync "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/" /tmp/prev-build/ \
-            --no-progress --only-show-errors
-          ls -lh /tmp/prev-build/
-
-      - name: Generate patch
-        if: steps.prev.outputs.found == 'true'
-        run: |
-          PREV="${{ steps.prev.outputs.date }}"
-          CURRENT="${{ steps.pbf.outputs.date }}"
+          CURRENT="${{ steps.meta.outputs.date }}"
           PATCH_NAME="${PREV}-to-${CURRENT}.gcpatch"
 
+          # Download previous build
+          mkdir -p "$WORKDIR/prev-build"
+          aws s3 sync "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/" "$WORKDIR/prev-build/" \
+            --no-progress --only-show-errors
+
+          # Generate patch
           echo "Generating patch: $PATCH_NAME"
-          cd builder/build
-          time ./geocoder-diff /tmp/prev-build/ /tmp/index-output/ \
-            -o "/tmp/$PATCH_NAME" 2>&1 | tail -10
+          time builder/build/geocoder-diff "$WORKDIR/prev-build/" "$WORKDIR/output/" \
+            -o "$WORKDIR/$PATCH_NAME" 2>&1 | tail -5
+          ls -lh "$WORKDIR/$PATCH_NAME"
 
-          ls -lh "/tmp/$PATCH_NAME"
-
-          # Verify patch produces correct output
+          # Verify patch
           echo "Verifying patch..."
-          mkdir -p /tmp/patch-verify
-          time ./geocoder-patch /tmp/prev-build/ "/tmp/$PATCH_NAME" \
-            -o /tmp/patch-verify/ 2>&1 | tail -5
+          mkdir -p "$WORKDIR/verify"
+          time builder/build/geocoder-patch "$WORKDIR/prev-build/" "$WORKDIR/$PATCH_NAME" \
+            -o "$WORKDIR/verify/" 2>&1 | tail -3
 
-          echo "Comparing patched output with fresh build..."
           FAIL=0
-          for f in /tmp/index-output/*.bin; do
+          for f in "$WORKDIR/output/"*.bin; do
             b=$(basename "$f")
-            if ! cmp -s "/tmp/patch-verify/$b" "/tmp/index-output/$b"; then
+            if ! cmp -s "$WORKDIR/verify/$b" "$WORKDIR/output/$b"; then
               echo "MISMATCH: $b"
               FAIL=1
             fi
@@ -187,28 +222,19 @@ jobs:
           if [ $FAIL -eq 0 ]; then
             echo "Patch verification: ALL FILES MATCH"
           else
-            echo "::error::Patch verification FAILED — some files don't match"
+            echo "::error::Patch verification FAILED"
             exit 1
           fi
 
-          rm -rf /tmp/patch-verify /tmp/prev-build
-
-      - name: Upload patch to S3
-        if: steps.prev.outputs.found == 'true'
-        run: |
-          PREV="${{ steps.prev.outputs.date }}"
-          CURRENT="${{ steps.pbf.outputs.date }}"
-          PATCH_NAME="${PREV}-to-${CURRENT}.gcpatch"
-
-          echo "Uploading patch..."
-          aws s3 cp "/tmp/$PATCH_NAME" \
+          # Upload patch
+          aws s3 cp "$WORKDIR/$PATCH_NAME" \
             "s3://$S3_BUCKET/$S3_PREFIX/patches/$PATCH_NAME" \
             --no-progress --only-show-errors
+          echo "Patch uploaded"
 
       - name: Clean up old builds (keep last 2)
-        if: steps.check.outputs.skip != 'true'
+        if: steps.meta.outputs.skip != 'true'
         run: |
-          echo "Checking for old builds to clean up..."
           BUILDS=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
             | grep 'PRE' | awk '{print $2}' | tr -d '/' \
             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
@@ -221,78 +247,78 @@ jobs:
               echo "Deleting old build: $build"
               aws s3 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$build/" --recursive \
                 --no-progress --only-show-errors
-            else
-              echo "Keeping build: $build"
             fi
           done <<< "$BUILDS"
 
       - name: Update index.json
-        if: steps.check.outputs.skip != 'true'
+        if: steps.meta.outputs.skip != 'true'
         run: |
-          CURRENT="${{ steps.pbf.outputs.date }}"
+          BUILD_DATE="${{ steps.meta.outputs.date }}"
 
-          # List all builds
-          BUILDS=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
+          # Collect build info
+          BUILDS_JSON=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
             | grep 'PRE' | awk '{print $2}' | tr -d '/' \
             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
-            | sort -r)
+            | sort -r \
+            | while read -r b; do
+                SIZE=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$b/" --summarize --recursive \
+                  | grep 'Total Size' | awk '{print $3}')
+                echo "{\"date\":\"$b\",\"path\":\"builds/$b/\",\"total_bytes\":${SIZE:-0}}"
+              done | paste -sd',' -)
 
-          # List all patches
-          PATCHES=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/patches/" \
-            | awk '{print $4}' | grep '\.gcpatch$' | sort -r)
+          # Collect patch info
+          PATCHES_JSON=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/patches/" 2>/dev/null \
+            | awk '{print $4}' | grep '\.gcpatch$' | sort -r \
+            | while read -r p; do
+                SIZE=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/patches/$p" | awk '{print $3}')
+                FROM=$(echo "$p" | sed 's/\(.*\)-to-.*/\1/')
+                TO=$(echo "$p" | sed 's/.*-to-\(.*\)\.gcpatch/\1/')
+                echo "{\"from\":\"$FROM\",\"to\":\"$TO\",\"file\":\"patches/$p\",\"bytes\":${SIZE:-0}}"
+              done | paste -sd',' -)
 
-          # Get file sizes for current build
-          BUILD_FILES=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$CURRENT/" \
-            | awk '{printf "{\"name\":\"%s\",\"size\":%d},", $4, $3}' | sed 's/,$//')
+          # Collect file list for latest build
+          FILES_JSON=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" \
+            | awk '{printf "{\"name\":\"%s\",\"bytes\":%d}\n", $4, $3}' \
+            | paste -sd',' -)
 
-          # Build JSON
-          cat > /tmp/index.json << INDEXEOF
+          # Build index.json
+          cat > /tmp/index.json << EOF
           {
             "updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "latest_build": "$CURRENT",
-            "builds": [
-          $(echo "$BUILDS" | while read -r b; do
-            SIZE=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$b/" --summarize --recursive \
-              | grep 'Total Size' | awk '{print $3}')
-            echo "    {\"date\": \"$b\", \"path\": \"builds/$b/\", \"total_bytes\": $SIZE},"
-          done | sed '$ s/,$//')
-            ],
-            "patches": [
-          $(echo "$PATCHES" | while read -r p; do
-            SIZE=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/patches/$p" | awk '{print $3}')
-            FROM=$(echo "$p" | sed 's/\(.*\)-to-.*/\1/')
-            TO=$(echo "$p" | sed 's/.*-to-\(.*\)\.gcpatch/\1/')
-            echo "    {\"from\": \"$FROM\", \"to\": \"$TO\", \"file\": \"patches/$p\", \"bytes\": $SIZE},"
-          done | sed '$ s/,$//')
-            ],
-            "files": [$BUILD_FILES]
+            "latest_build": "$BUILD_DATE",
+            "base_url": "s3://$S3_BUCKET/$S3_PREFIX/",
+            "builds": [$BUILDS_JSON],
+            "patches": [$PATCHES_JSON],
+            "files": [$FILES_JSON]
           }
-          INDEXEOF
+          EOF
 
-          # Pretty-print and upload
           python3 -m json.tool /tmp/index.json > /tmp/index-pretty.json 2>/dev/null \
             || cp /tmp/index.json /tmp/index-pretty.json
-          cat /tmp/index-pretty.json
 
           aws s3 cp /tmp/index-pretty.json \
             "s3://$S3_BUCKET/$S3_PREFIX/index.json" \
             --content-type application/json \
             --no-progress --only-show-errors
 
-          echo "Index updated"
+          echo "Index updated:"
+          cat /tmp/index-pretty.json
 
       - name: Summary
         if: always()
         run: |
-          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          BUILD_DATE="${{ steps.meta.outputs.date }}"
+          echo "## Geocoder Index Build" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Date**: ${{ steps.pbf.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **PBF**: ${{ steps.pbf.outputs.filename }}" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.check.outputs.skip }}" = "true" ]; then
-            echo "- **Status**: Skipped (already exists)" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Date** | $BUILD_DATE |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **PBF method** | ${{ steps.pbf.outputs.method || 'skipped' }} |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.meta.outputs.skip }}" = "true" ]; then
+            echo "| **Status** | Skipped (already exists) |" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "- **Status**: Built and uploaded" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **Status** | Built and uploaded |" >> "$GITHUB_STEP_SUMMARY"
             if [ "${{ steps.prev.outputs.found }}" = "true" ]; then
-              echo "- **Patch**: ${{ steps.prev.outputs.date }} → ${{ steps.pbf.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
+              echo "| **Patch** | ${{ steps.prev.outputs.date }} → $BUILD_DATE |" >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
