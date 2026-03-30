@@ -86,7 +86,9 @@ int main(int argc, char* argv[]) {
     }
     MappedFile patch_map = mmap_file(raw_path);
     if (!patch_map.data) { std::cerr << "Failed to mmap patch" << std::endl; return 1; }
-    remove(raw_path.c_str());
+    // Don't remove temp file yet (mmap needs backing file for page eviction under memory pressure)
+    // madvise random — we access sections non-sequentially but release pages after each section
+    madvise(const_cast<char*>(patch_map.data), patch_map.size, MADV_RANDOM);
     const char* P = patch_map.data;
     size_t patch_size = patch_map.size;
     std::cerr << "Patch: " << patch_size << " bytes" << std::endl;
@@ -118,23 +120,45 @@ int main(int argc, char* argv[]) {
 
             MappedFile old_pool = mmap_file(cur_dir + "/strings.bin");
 
-            // Phase A: build merged pool, write to file, free all temporaries
+            // Phase A: merge old (minus deleted) + added strings, write directly to file.
+            // Both old pool and added are sorted alphabetically → merge-write with no sort.
+            // Memory: only the added strings vector (~small) + del_set (~small).
             {
-                // Parse old strings just for the merge (lightweight: only need idx + str ptr)
-                std::vector<const char*> old_ptrs; // indexed by string index
-                { size_t sp = 0;
-                  while (sp < old_pool.size) { old_ptrs.push_back(old_pool.data + sp); sp += strlen(old_pool.data + sp) + 1; }
-                }
-                std::vector<const char*> merged;
-                merged.reserve(old_ptrs.size() + added.size());
-                for (uint32_t i = 0; i < old_ptrs.size(); i++)
-                    if (!del_set.count(i)) merged.push_back(old_ptrs[i]);
-                for (auto& s : added) merged.push_back(s.c_str());
-                std::sort(merged.begin(), merged.end(), [](const char* a, const char* b) { return strcmp(a, b) < 0; });
                 FILE* fp = fopen((out_dir + "/strings.bin").c_str(), "wb");
-                for (const char* s : merged) { size_t l = strlen(s) + 1; fwrite(s, 1, l, fp); }
+                size_t sp = 0; uint32_t idx = 0; size_t ai = 0;
+                // Sort added strings (they should already be sorted from diff tool, but ensure)
+                std::sort(added.begin(), added.end());
+                while (sp < old_pool.size || ai < added.size()) {
+                    const char* old_s = nullptr;
+                    // Skip deleted strings
+                    while (sp < old_pool.size) {
+                        if (!del_set.count(idx)) { old_s = old_pool.data + sp; break; }
+                        sp += strlen(old_pool.data + sp) + 1; idx++;
+                    }
+                    const char* add_s = ai < added.size() ? added[ai].c_str() : nullptr;
+                    // Merge: pick the smaller string
+                    if (old_s && add_s) {
+                        int c = strcmp(old_s, add_s);
+                        if (c <= 0) {
+                            size_t l = strlen(old_s) + 1; fwrite(old_s, 1, l, fp);
+                            sp += l; idx++;
+                            if (c == 0) ai++; // duplicate — skip added
+                        } else {
+                            size_t l = added[ai].size() + 1; fwrite(add_s, 1, l, fp);
+                            ai++;
+                        }
+                    } else if (old_s) {
+                        size_t l = strlen(old_s) + 1; fwrite(old_s, 1, l, fp);
+                        sp += l; idx++;
+                    } else if (add_s) {
+                        size_t l = added[ai].size() + 1; fwrite(add_s, 1, l, fp);
+                        ai++;
+                    } else break;
+                }
                 fclose(fp);
-            } // merged, old_ptrs, added, del_set, del_idx all freed here
+            }
+            { std::vector<std::string>().swap(added); std::unordered_set<uint32_t>().swap(del_set);
+              std::vector<uint32_t>().swap(del_idx); }
             malloc_trim(0);
 
             // Phase B: build remap by merge-walking old pool vs new pool (both sorted, both mmap'd)
@@ -171,6 +195,8 @@ int main(int argc, char* argv[]) {
             std::sort(str_remap_vec.begin(), str_remap_vec.end());
         } else pos -= 4;
     }
+    // Release patch pages read so far (string section)
+    madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
     log_phase("Strings", t_start);
 
     // Detect strides
@@ -469,12 +495,15 @@ int main(int argc, char* argv[]) {
         } else {
             std::cerr << "  " << fname << ": " << written << " bytes" << std::endl;
         }
+        // Release patch pages used by this section
+        madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
         malloc_trim(0);
     }
     log_phase("Merge replays", t_start);
 
-    // Free string remap (no longer needed)
+    // Free string remap + release all processed patch pages
     { std::vector<std::pair<uint32_t,uint32_t>>().swap(str_remap_vec); }
+    madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
     malloc_trim(0);
 
     // --- Phase 4: Streaming entry pipeline ---
@@ -697,6 +726,7 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     unmap_file(patch_map);
+    remove(raw_path.c_str());
     { std::string cmd = "rm -rf '" + tmpdir + "'"; system(cmd.c_str()); }
     log_phase("Total", t_start);
     std::cerr << "Patch applied. Output in " << out_dir << std::endl;
