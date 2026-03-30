@@ -103,7 +103,9 @@ int main(int argc, char* argv[]) {
     ru32(); // flags
 
     // --- Phase 2: String rebuild ---
-    std::unordered_map<uint32_t, uint32_t> str_remap;
+    // Sorted vector remap: (old_offset, new_offset) pairs sorted by old_offset.
+    // Uses 96 MiB for 12M entries vs 672 MiB for unordered_map.
+    std::vector<std::pair<uint32_t, uint32_t>> str_remap_vec;
     {
         uint32_t marker = ru32();
         if (marker == 0xFFFFFFF7) {
@@ -115,39 +117,64 @@ int main(int argc, char* argv[]) {
             std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
 
             MappedFile old_pool = mmap_file(cur_dir + "/strings.bin");
-            std::vector<std::pair<uint32_t, std::string>> old_strs;
-            size_t sp = 0;
-            while (sp < old_pool.size) {
-                old_strs.push_back({(uint32_t)sp, std::string(old_pool.data + sp)});
-                sp += strlen(old_pool.data + sp) + 1;
+            // Parse old strings as (index, offset, string) — keep only offset+string for remap
+            struct OldStr { uint32_t idx; uint32_t off; const char* str; size_t len; };
+            std::vector<OldStr> old_strs;
+            { size_t sp = 0; uint32_t idx = 0;
+              while (sp < old_pool.size) {
+                  const char* s = old_pool.data + sp; size_t l = strlen(s);
+                  old_strs.push_back({idx++, (uint32_t)sp, s, l});
+                  sp += l + 1;
+              }
             }
-            std::vector<std::string> merged;
-            for (size_t i = 0; i < old_strs.size(); i++)
-                if (!del_set.count(i)) merged.push_back(old_strs[i].second);
-            for (auto& s : added) merged.push_back(s);
-            std::sort(merged.begin(), merged.end());
+            // Build merged pool: non-deleted old + added, sorted alphabetically
+            std::vector<const char*> merged;
+            merged.reserve(old_strs.size() + added.size());
+            for (auto& os : old_strs) if (!del_set.count(os.idx)) merged.push_back(os.str);
+            for (auto& s : added) merged.push_back(s.c_str());
+            std::sort(merged.begin(), merged.end(), [](const char* a, const char* b) { return strcmp(a, b) < 0; });
 
-            // Write new pool and build remap
+            // Write new pool to file
             FILE* fp = fopen((out_dir + "/strings.bin").c_str(), "wb");
-            std::unordered_map<std::string, uint32_t> new_offs;
             uint32_t wpos = 0;
-            for (auto& s : merged) {
-                new_offs[s] = wpos;
-                fwrite(s.c_str(), 1, s.size() + 1, fp);
-                wpos += s.size() + 1;
-            }
+            for (const char* s : merged) { size_t l = strlen(s) + 1; fwrite(s, 1, l, fp); wpos += l; }
             fclose(fp);
-            for (auto& [old_off, s] : old_strs) {
-                auto it = new_offs.find(s);
-                if (it != new_offs.end() && it->second != old_off) str_remap[old_off] = it->second;
+
+            // Build remap by merge-walking old strings vs new pool
+            // Both are sorted alphabetically → O(n+m) with no hash maps
+            MappedFile new_pool = mmap_file(out_dir + "/strings.bin");
+            size_t ni = 0; uint32_t new_off = 0;
+            // Walk new pool to build offset list
+            std::vector<std::pair<const char*, uint32_t>> new_strs;
+            { size_t sp = 0;
+              while (sp < new_pool.size) {
+                  new_strs.push_back({new_pool.data + sp, (uint32_t)sp});
+                  sp += strlen(new_pool.data + sp) + 1;
+              }
             }
+            // Merge-walk old vs new (both sorted) to build remap
+            size_t oi = 0; ni = 0;
+            while (oi < old_strs.size() && ni < new_strs.size()) {
+                int c = strcmp(old_strs[oi].str, new_strs[ni].first);
+                if (c == 0) {
+                    if (old_strs[oi].off != new_strs[ni].second)
+                        str_remap_vec.push_back({old_strs[oi].off, new_strs[ni].second});
+                    oi++; ni++;
+                } else if (c < 0) { oi++; } // deleted
+                else { ni++; } // added
+            }
+            std::sort(str_remap_vec.begin(), str_remap_vec.end()); // sort by old_offset
             unmap_file(old_pool);
+            unmap_file(new_pool);
             std::cerr << "  Strings: +" << n_added << " -" << n_deleted << " → " << merged.size()
-                      << ", " << str_remap.size() << " remapped" << std::endl;
+                      << ", " << str_remap_vec.size() << " remapped (" << str_remap_vec.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
             marker = ru32();
         }
-        if (marker == 0xFFFFFFFE) { uint32_t c = ru32(); for (uint32_t i = 0; i < c; i++) { uint32_t a = ru32(), b = ru32(); str_remap[a] = b; } }
-        else pos -= 4;
+        if (marker == 0xFFFFFFFE) {
+            uint32_t c = ru32();
+            for (uint32_t i = 0; i < c; i++) { uint32_t a = ru32(), b = ru32(); str_remap_vec.push_back({a, b}); }
+            std::sort(str_remap_vec.begin(), str_remap_vec.end());
+        } else pos -= 4;
     }
     log_phase("Strings", t_start);
 
@@ -156,17 +183,12 @@ int main(int argc, char* argv[]) {
     size_t interp_stride = detect_stride(cur_dir + "/interp_ways.bin", {24, 20, 18});
     size_t admin_stride = detect_stride(cur_dir + "/admin_polygons.bin", {24, 20, 19});
 
-    // String remap applier (works on mutable copy)
-    auto apply_str_remap = [&](std::vector<char>& data, uint32_t fid, size_t stride) {
-        if (str_remap.empty()) return;
-        std::vector<size_t> offs;
-        if (fid == (uint32_t)PatchFileId::ADDR_POINTS) offs = {8, 12};
-        else if (fid == (uint32_t)PatchFileId::STREET_WAYS) offs = {(stride == 12) ? 8ul : 5ul};
-        else if (fid == (uint32_t)PatchFileId::INTERP_WAYS) offs = {(stride >= 20) ? 8ul : 5ul};
-        else if (fid == (uint32_t)PatchFileId::ADMIN_POLYGONS) offs = {8};
-        else return;
-        for (size_t i = 0; i + stride <= data.size(); i += stride)
-            for (size_t o : offs) { uint32_t v; memcpy(&v, data.data()+i+o, 4); auto it = str_remap.find(v); if (it != str_remap.end()) memcpy(data.data()+i+o, &it->second, 4); }
+    // String remap lookup via sorted vector + binary search
+    auto str_remap_lookup = [&](uint32_t old_off) -> uint32_t {
+        auto it = std::lower_bound(str_remap_vec.begin(), str_remap_vec.end(),
+            std::make_pair(old_off, (uint32_t)0));
+        if (it != str_remap_vec.end() && it->first == old_off) return it->second;
+        return old_off; // no remap
     };
 
     // --- Phase 3: Merge replays (streaming output) ---
@@ -183,7 +205,7 @@ int main(int argc, char* argv[]) {
 
         // --- Metadata sections ---
         if (file_id == 0xFFFFFFF7) {
-            // String diff in main loop — process it (may be the only occurrence)
+            // String diff in main loop — same memory-efficient approach as Phase 2
             uint32_t n_added = ru32(), n_deleted = ru32();
             std::vector<std::string> added;
             for (uint32_t i = 0; i < n_added; i++) { const char* s = P+pos; added.push_back(s); pos += strlen(s)+1; }
@@ -191,21 +213,38 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
             std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
             MappedFile old_pool = mmap_file(cur_dir + "/strings.bin");
-            std::vector<std::pair<uint32_t, std::string>> old_strs;
-            size_t sp = 0;
-            while (sp < old_pool.size) { old_strs.push_back({(uint32_t)sp, std::string(old_pool.data+sp)}); sp += strlen(old_pool.data+sp)+1; }
-            std::vector<std::string> merged;
-            for (size_t i = 0; i < old_strs.size(); i++) if (!del_set.count(i)) merged.push_back(old_strs[i].second);
-            for (auto& s : added) merged.push_back(s);
-            std::sort(merged.begin(), merged.end());
+            struct OS { uint32_t idx; uint32_t off; const char* str; };
+            std::vector<OS> old_strs;
+            { size_t sp = 0; uint32_t ix = 0;
+              while (sp < old_pool.size) { old_strs.push_back({ix++, (uint32_t)sp, old_pool.data+sp}); sp += strlen(old_pool.data+sp)+1; }
+            }
+            std::vector<const char*> merged;
+            for (auto& os : old_strs) if (!del_set.count(os.idx)) merged.push_back(os.str);
+            for (auto& s : added) merged.push_back(s.c_str());
+            std::sort(merged.begin(), merged.end(), [](const char* a, const char* b) { return strcmp(a,b) < 0; });
             FILE* fp = fopen((out_dir + "/strings.bin").c_str(), "wb");
-            std::unordered_map<std::string, uint32_t> new_offs;
             uint32_t wpos = 0;
-            for (auto& s : merged) { new_offs[s] = wpos; fwrite(s.c_str(), 1, s.size()+1, fp); wpos += s.size()+1; }
+            for (const char* s : merged) { size_t l = strlen(s)+1; fwrite(s, 1, l, fp); wpos += l; }
             fclose(fp);
-            for (auto& [old_off, s] : old_strs) { auto it = new_offs.find(s); if (it != new_offs.end() && it->second != old_off) str_remap[old_off] = it->second; }
-            unmap_file(old_pool);
-            std::cerr << "  Strings (loop): +" << n_added << " -" << n_deleted << " → " << merged.size() << std::endl;
+            // Build remap via merge-walk
+            MappedFile new_pool = mmap_file(out_dir + "/strings.bin");
+            std::vector<std::pair<const char*, uint32_t>> new_strs;
+            { size_t sp = 0;
+              while (sp < new_pool.size) { new_strs.push_back({new_pool.data+sp, (uint32_t)sp}); sp += strlen(new_pool.data+sp)+1; }
+            }
+            size_t oi2 = 0, ni2 = 0;
+            while (oi2 < old_strs.size() && ni2 < new_strs.size()) {
+                int c = strcmp(old_strs[oi2].str, new_strs[ni2].first);
+                if (c == 0) {
+                    if (old_strs[oi2].off != new_strs[ni2].second)
+                        str_remap_vec.push_back({old_strs[oi2].off, new_strs[ni2].second});
+                    oi2++; ni2++;
+                } else if (c < 0) { oi2++; } else { ni2++; }
+            }
+            std::sort(str_remap_vec.begin(), str_remap_vec.end());
+            unmap_file(old_pool); unmap_file(new_pool);
+            std::cerr << "  Strings (loop): +" << n_added << " -" << n_deleted << " → " << merged.size()
+                      << ", " << str_remap_vec.size() << " remapped" << std::endl;
             continue;
         }
         if (file_id == CELL_CHANGES_GEO_MARKER) {
@@ -246,7 +285,7 @@ int main(int argc, char* argv[]) {
                     size_t remap_count = remap_size / 4;
                     for (uint32_t i = 0; i < np; i++) {
                         uint32_t o = ru32(), n = ru32();
-                        if (o < remap_count) remap_data[o] = n;
+                        if (o < remap_count) remap_data[o] = n + 1; // +1 encoding
                     }
                     munmap(remap_data, remap_size);
                     close(rfd);
@@ -325,7 +364,7 @@ int main(int argc, char* argv[]) {
 
         // Get string remap field offsets for this file type
         std::vector<size_t> remap_offs;
-        if (!str_remap.empty() && needs_remap) {
+        if (!str_remap_vec.empty() && needs_remap) {
             if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = {8, 12};
             else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? 8ul : 5ul};
@@ -343,8 +382,20 @@ int main(int argc, char* argv[]) {
         FILE* outf = fopen((out_dir + "/" + fname).c_str(), "wb");
 
         bool track = needs_remap; // track ID remap only for data files
-        std::vector<uint32_t> id_map;
-        if (track) id_map.assign(n_old_records, 0xFFFFFFFF);
+        // File-backed id_map: create temp file, fill with 0xFF, mmap read-write
+        int remap_fd = -1;
+        uint32_t* id_map_ptr = nullptr;
+        std::string remap_path;
+        if (track) {
+            remap_path = tmpdir + "/remap_" + std::to_string(file_id) + ".bin";
+            remap_fd = open(remap_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            size_t remap_bytes = n_old_records * 4;
+            ftruncate(remap_fd, remap_bytes); // zero-filled by OS (sparse)
+            id_map_ptr = static_cast<uint32_t*>(
+                mmap(nullptr, remap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, remap_fd, 0));
+            // File is zero-filled. We store new_index+1 so that 0 means "unmapped".
+            // The entry pipeline reads these and subtracts 1.
+        }
 
         // Per-record buffer for applying remap/fixups inline (avoid copying entire file)
         std::vector<char> rec_buf(actual_stride);
@@ -384,8 +435,8 @@ int main(int argc, char* argv[]) {
                         // Apply string remap
                         for (size_t off : remap_offs) {
                             uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
-                            auto it = str_remap.find(v);
-                            if (it != str_remap.end()) memcpy(rec_buf.data() + off, &it->second, 4);
+                            uint32_t nv = str_remap_lookup(v);
+                            if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
                         }
                         // Apply fixup (node_offset/vertex_offset at byte 0)
                         if (has_fixup)
@@ -395,7 +446,7 @@ int main(int argc, char* argv[]) {
                         // No modification needed — write directly from mmap
                         fwrite(old_mmap.data + rec_off, 1, actual_stride, outf);
                     }
-                    if (track && old_rec + k < id_map.size()) id_map[old_rec + k] = new_rec + k;
+                    if (track && old_rec + k < n_old_records) id_map_ptr[old_rec + k] = (uint32_t)(new_rec + k) + 1; // +1 so 0 means unmapped
                 }
                 written += count * actual_stride;
                 old_rec += count; new_rec += count; old_bytes += count * actual_stride;
@@ -412,16 +463,14 @@ int main(int argc, char* argv[]) {
         fixups_sorted.clear(); fixups_sorted.shrink_to_fit();
 
         if (track) {
-            // Write id_map to temp file to avoid keeping all remaps in memory simultaneously
-            std::string remap_path = tmpdir + "/remap_" + std::to_string(file_id) + ".bin";
-            FILE* rf = fopen(remap_path.c_str(), "wb");
-            fwrite(id_map.data(), 4, id_map.size(), rf);
-            fclose(rf);
-            id_remaps[file_id] = {}; // store empty placeholder (will mmap from disk later)
-            size_t matched = 0;
-            for (auto v : id_map) if (v != 0xFFFFFFFF) matched++;
-            std::cerr << "  " << fname << ": " << written << " bytes (mapped " << matched << "/" << id_map.size()
-                      << ", remap saved to disk)" << std::endl;
+            // Sync and munmap the file-backed remap (data is already on disk)
+            size_t remap_bytes = n_old_records * 4;
+            msync(id_map_ptr, remap_bytes, MS_SYNC);
+            munmap(id_map_ptr, remap_bytes);
+            close(remap_fd);
+            id_map_ptr = nullptr;
+            id_remaps[file_id] = {}; // empty placeholder
+            std::cerr << "  " << fname << ": " << written << " bytes (remap " << n_old_records << " records to disk)" << std::endl;
         } else {
             std::cerr << "  " << fname << ": " << written << " bytes" << std::endl;
         }
@@ -430,7 +479,7 @@ int main(int argc, char* argv[]) {
     log_phase("Merge replays", t_start);
 
     // Free string remap (no longer needed)
-    { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
+    { std::vector<std::pair<uint32_t,uint32_t>>().swap(str_remap_vec); }
     malloc_trim(0);
 
     // --- Phase 4: Streaming entry pipeline ---
@@ -447,10 +496,15 @@ int main(int argc, char* argv[]) {
             return m;
         };
         // Helper: look up remap value from mmap'd file
+        // Remap values stored as new_index+1 (0 means unmapped)
         struct RemapRef {
             const uint32_t* data;
             size_t count;
-            uint32_t operator[](size_t i) const { return i < count ? data[i] : 0xFFFFFFFF; }
+            uint32_t operator[](size_t i) const {
+                if (i >= count) return 0xFFFFFFFF;
+                uint32_t v = data[i];
+                return v == 0 ? 0xFFFFFFFF : v - 1;
+            }
             size_t size() const { return count; }
         };
         MappedFile m_w_rm = mmap_remap(PatchFileId::STREET_WAYS);
@@ -597,7 +651,7 @@ int main(int argc, char* argv[]) {
                 const uint32_t* ad_vec = (const uint32_t*)m_ad_rm.data;
                 size_t ad_count = m_ad_rm.size / 4;
                 for (uint32_t i = 0; i < ad_count; i++)
-                    if (ad_vec[i] != 0xFFFFFFFF) ad_rm[i] = ad_vec[i];
+                    if (ad_vec[i] != 0) ad_rm[i] = ad_vec[i] - 1; // decode +1 encoding
                 unmap_file(m_ad_rm);
             }
             auto old_ac = read_file(cur_dir + "/admin_cells.bin");
