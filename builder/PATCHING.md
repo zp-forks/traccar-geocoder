@@ -187,8 +187,9 @@ End marker: 0xFFFFFFFF (u32)
 | Operation | Europe | Planet |
 |-----------|--------|--------|
 | Build (deterministic) | ~12 min | ~14 min |
-| Diff generation | ~8 min | ~38 min |
-| Patch application | ~5 min | ~20 min |
+| Diff generation | **3m40s** | **15m22s** |
+| Patch application | **44s** | **3m02s** |
+| Patch peak memory | 641 MiB | 1.8 GiB |
 
 ## TODO (Priority Order)
 
