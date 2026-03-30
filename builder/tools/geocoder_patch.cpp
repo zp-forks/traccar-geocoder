@@ -360,7 +360,7 @@ int main(int argc, char* argv[]) {
     // Walk old geo_cells, remap IDs, apply corrections, write output directly to files.
     {
         double t_entry = now_ms();
-        std::cerr << "Entry pipeline (proven rebuild approach)..." << std::endl;
+        std::cerr << "Entry pipeline (lean streaming)..." << std::endl;
 
         auto get_rm = [&](PatchFileId fid) -> const std::vector<uint32_t>& {
             static std::vector<uint32_t> empty;
@@ -370,120 +370,131 @@ int main(int argc, char* argv[]) {
         auto& a_rm = get_rm(PatchFileId::ADDR_POINTS);
         auto& i_rm = get_rm(PatchFileId::INTERP_WAYS);
 
-        // Rebuild entries using proven rebuild_geo_from_remap_vec
-        auto old_geo_data = read_file(cur_dir + "/geo_cells.bin");
-        auto old_se = read_file(cur_dir + "/street_entries.bin");
-        auto old_ae = read_file(cur_dir + "/addr_entries.bin");
-        auto old_ie = read_file(cur_dir + "/interp_entries.bin");
-        auto geo = rebuild_geo_from_remap_vec(old_geo_data, old_se, old_ae, old_ie,
-                                                w_rm, a_rm, i_rm, geo_added, geo_removed);
-        // Free inputs
-        { std::vector<char>().swap(old_se); std::vector<char>().swap(old_ae); std::vector<char>().swap(old_ie); }
-        log_phase("  Geo rebuild", t_entry);
+        // mmap old files (zero RSS until pages are accessed, then only working set)
+        MappedFile m_geo = mmap_file(cur_dir + "/geo_cells.bin");
+        MappedFile m_se = mmap_file(cur_dir + "/street_entries.bin");
+        MappedFile m_ae = mmap_file(cur_dir + "/addr_entries.bin");
+        MappedFile m_ie = mmap_file(cur_dir + "/interp_entries.bin");
+        madvise(const_cast<char*>(m_se.data), m_se.size, MADV_SEQUENTIAL);
+        madvise(const_cast<char*>(m_ae.data), m_ae.size, MADV_SEQUENTIAL);
+        madvise(const_cast<char*>(m_ie.data), m_ie.size, MADV_SEQUENTIAL);
+        size_t n_old = m_geo.size / 20;
 
-        // Apply corrections sequentially (one file at a time to limit memory)
-        // Build correction maps
-        auto apply_corrections = [&](uint32_t fid, const std::string& fname,
-                                      std::vector<char>& derived_entries,
-                                      const std::vector<char>& derived_cells, size_t cell_stride,
-                                      size_t off_pos) {
-            auto ecit = entry_corrections.find(fid);
-            if (ecit == entry_corrections.end() || ecit->second.empty()) {
-                write_file(out_dir + "/" + fname, derived_entries);
-                return;
-            }
-            std::unordered_map<uint64_t, const std::vector<uint32_t>*> cm;
-            for (auto& c : ecit->second) cm[c.cell_id] = &c.ids;
+        // Build correction maps + removed set (small memory)
+        std::unordered_set<uint64_t> rm_set(geo_removed.begin(), geo_removed.end());
+        std::unordered_map<uint64_t, const std::vector<uint32_t>*> cs, ca, ci_map;
+        for (auto& [fid, list] : entry_corrections) {
+            auto* m = (fid == (uint32_t)PatchFileId::STREET_ENTRIES) ? &cs :
+                      (fid == (uint32_t)PatchFileId::ADDR_ENTRIES) ? &ca :
+                      (fid == (uint32_t)PatchFileId::INTERP_ENTRIES) ? &ci_map : nullptr;
+            if (m) for (auto& c : list) (*m)[c.cell_id] = &c.ids;
+        }
+        // Added cells sorted
+        std::sort(geo_added.begin(), geo_added.end());
+        log_phase("  Setup", t_entry);
 
-            // Walk cells, apply corrections, write output via FILE*
-            size_t n = derived_cells.size() / cell_stride;
-            FILE* fe = fopen((out_dir + "/" + fname).c_str(), "wb");
-            FILE* fc_out = nullptr;
-            std::vector<char> new_cells;
-            uint32_t no_data_v = 0xFFFFFFFF;
-            uint32_t fe_pos = 0;
+        // Open 4 output files
+        FILE* f_geo = fopen((out_dir + "/geo_cells.bin").c_str(), "wb");
+        FILE* f_se = fopen((out_dir + "/street_entries.bin").c_str(), "wb");
+        FILE* f_ae = fopen((out_dir + "/addr_entries.bin").c_str(), "wb");
+        FILE* f_ie = fopen((out_dir + "/interp_entries.bin").c_str(), "wb");
+        constexpr uint32_t NO = 0xFFFFFFFF;
 
-            for (size_t i = 0; i < n; i++) {
-                uint64_t cid; memcpy(&cid, derived_cells.data() + i * cell_stride, 8);
-                uint32_t off; memcpy(&off, derived_cells.data() + i * cell_stride + off_pos, 4);
+        // Reusable buffer (one per entry type to avoid aliasing issues)
+        std::vector<uint32_t> buf;
+        buf.reserve(4096);
 
-                auto cit = cm.find(cid);
-                if (cit != cm.end()) {
-                    // Use correction data
-                    uint32_t new_off = cit->second->empty() ? no_data_v : fe_pos;
-                    if (!cit->second->empty()) {
-                        uint16_t c = cit->second->size();
-                        fwrite(&c, 2, 1, fe);
-                        fwrite(cit->second->data(), 4, c, fe);
-                        fe_pos += 2 + c * 4;
-                    }
-                    // Update offset in cells data (in memory)
-                    memcpy(const_cast<char*>(derived_cells.data()) + i * cell_stride + off_pos, &new_off, 4);
-                } else if (off != no_data_v) {
-                    // Copy original entry data
-                    if (off + 2 <= derived_entries.size()) {
-                        uint16_t c; memcpy(&c, derived_entries.data() + off, 2);
-                        uint32_t new_off = fe_pos;
-                        fwrite(derived_entries.data() + off, 1, 2 + c * 4, fe);
-                        fe_pos += 2 + c * 4;
-                        memcpy(const_cast<char*>(derived_cells.data()) + i * cell_stride + off_pos, &new_off, 4);
-                    }
-                }
-            }
-            fclose(fe);
-            std::cerr << "  " << fname << ": " << cm.size() << " corrections applied" << std::endl;
+        // Helper: parse IDs from mmap'd entry file
+        auto parse = [&buf](const MappedFile& f, uint32_t off) {
+            buf.clear();
+            if (off == NO || off + 2 > f.size) return;
+            uint16_t c; memcpy(&c, f.data + off, 2);
+            if (off + 2 + (size_t)c * 4 > f.size) return;
+            buf.resize(c);
+            memcpy(buf.data(), f.data + off + 2, c * 4);
+        };
+        auto remap = [](std::vector<uint32_t>& ids, const std::vector<uint32_t>& rm) {
+            for (auto& id : ids) if (id < rm.size() && rm[id] != NO) id = rm[id];
+            std::sort(ids.begin(), ids.end());
+        };
+        // Write entry and return offset, or NO if empty
+        auto emit = [&NO](FILE* f, const uint32_t* ids, size_t n) -> uint32_t {
+            if (n == 0) return NO;
+            uint32_t off = (uint32_t)ftell(f);
+            uint16_t c = (uint16_t)n;
+            fwrite(&c, 2, 1, f); fwrite(ids, 4, n, f);
+            return off;
         };
 
-        // Apply corrections for each geo entry type
-        apply_corrections((uint32_t)PatchFileId::STREET_ENTRIES, "street_entries.bin",
-                         geo.street_entries_data, geo.geo_cells_data, 20, 8);
-        apply_corrections((uint32_t)PatchFileId::ADDR_ENTRIES, "addr_entries.bin",
-                         geo.addr_entries_data, geo.geo_cells_data, 20, 12);
-        apply_corrections((uint32_t)PatchFileId::INTERP_ENTRIES, "interp_entries.bin",
-                         geo.interp_entries_data, geo.geo_cells_data, 20, 16);
+        // Merge-walk: old cells + added cells in sorted order
+        // Both are sorted by cell_id. Merge them, skip removed.
+        size_t old_i = 0, add_i = 0;
+        size_t cells_written = 0;
 
-        // Write the corrected geo_cells (offsets updated in-place by apply_corrections)
-        // Rebuild offsets using flag corrections
-        {
-            size_t n = geo.geo_cells_data.size() / 20;
-            FILE* fg = fopen((out_dir + "/geo_cells.bin").c_str(), "wb");
-            // Scan corrected entry files to build offset arrays
-            auto scan_offsets = [](const std::string& path) -> std::vector<uint32_t> {
-                auto data = read_file(path);
-                std::vector<uint32_t> offsets;
-                uint32_t pos = 0;
-                while (pos + 2 <= data.size()) {
-                    offsets.push_back(pos);
-                    uint16_t c; memcpy(&c, data.data() + pos, 2);
-                    pos += 2 + c * 4;
+        auto process_cell = [&](uint64_t cid, int32_t oi) {
+            // For each entry type: check correction → remap old → write
+            auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const std::vector<uint32_t>& rm,
+                                const std::unordered_map<uint64_t, const std::vector<uint32_t>*>& corr,
+                                FILE* outf, uint8_t flag_bit) -> uint32_t {
+                // Check flag
+                bool has = false;
+                if (oi >= 0 && (size_t)oi * 20 + geo_off + 4 <= m_geo.size) {
+                    uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
+                    has = (off != NO);
+                } else if (oi >= 0) {
+                    std::cerr << "OOB: oi=" << oi << " geo_off=" << geo_off << " m_geo.size=" << m_geo.size << std::endl;
+                    return NO;
                 }
-                return offsets;
-            };
-            auto s_offs = scan_offsets(out_dir + "/street_entries.bin");
-            auto a_offs = scan_offsets(out_dir + "/addr_entries.bin");
-            auto i_offs = scan_offsets(out_dir + "/interp_entries.bin");
-
-            uint32_t no_data_v = 0xFFFFFFFF;
-            size_t si = 0, ai = 0, ii = 0;
-            for (size_t c = 0; c < n; c++) {
-                uint64_t cid; memcpy(&cid, geo.geo_cells_data.data() + c*20, 8);
-                uint32_t old_s, old_a, old_i;
-                memcpy(&old_s, geo.geo_cells_data.data()+c*20+8, 4);
-                memcpy(&old_a, geo.geo_cells_data.data()+c*20+12, 4);
-                memcpy(&old_i, geo.geo_cells_data.data()+c*20+16, 4);
-                bool hs = (old_s != no_data_v), ha = (old_a != no_data_v), hi = (old_i != no_data_v);
                 auto fc = flag_corrections.find(cid);
-                if (fc != flag_corrections.end()) { hs = fc->second & 1; ha = fc->second & 2; hi = fc->second & 4; }
-                uint32_t ns = (hs && si < s_offs.size()) ? s_offs[si++] : no_data_v;
-                uint32_t na = (ha && ai < a_offs.size()) ? a_offs[ai++] : no_data_v;
-                uint32_t ni = (hi && ii < i_offs.size()) ? i_offs[ii++] : no_data_v;
-                fwrite(&cid, 8, 1, fg); fwrite(&ns, 4, 1, fg); fwrite(&na, 4, 1, fg); fwrite(&ni, 4, 1, fg);
+                if (fc != flag_corrections.end()) has = (fc->second & flag_bit) != 0;
+                if (corr.count(cid)) has = true;
+                if (!has) return NO;
+
+                auto cit = corr.find(cid);
+                if (cit != corr.end()) return emit(outf, cit->second->data(), cit->second->size());
+
+                if (oi < 0) return NO;
+                if ((size_t)oi * 20 + geo_off + 4 > m_geo.size) return NO;
+                uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
+                parse(old_e, off);
+                if (buf.empty()) return NO;
+                remap(buf, rm);
+                return emit(outf, buf.data(), buf.size());
+            };
+
+            uint32_t so = do_entry(m_se, 8, w_rm, cs, f_se, 1);
+            uint32_t ao = do_entry(m_ae, 12, a_rm, ca, f_ae, 2);
+            uint32_t io = do_entry(m_ie, 16, i_rm, ci_map, f_ie, 4);
+            fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
+            cells_written++;
+        };
+
+        while (old_i < n_old || add_i < geo_added.size()) {
+            uint64_t old_cid = UINT64_MAX, add_cid = UINT64_MAX;
+            if (old_i < n_old) memcpy(&old_cid, m_geo.data + old_i * 20, 8);
+            if (add_i < geo_added.size()) add_cid = geo_added[add_i];
+
+            if (old_cid <= add_cid) {
+                if (!rm_set.count(old_cid))
+                    process_cell(old_cid, (int32_t)old_i);
+                old_i++;
+                if (old_cid == add_cid) add_i++; // skip duplicate add
+            } else {
+                process_cell(add_cid, -1);
+                add_i++;
             }
-            fclose(fg);
+
+            if (cells_written % 10000000 == 0 && cells_written > 0) {
+                std::cerr << "    " << cells_written << " cells, se=" << ftell(f_se)/1024/1024
+                          << "M ae=" << ftell(f_ae)/1024/1024 << "M rss=" << get_rss_mb() << "M" << std::endl;
+            }
         }
-        geo = RebuiltGeo{}; // free
+
+        fclose(f_geo); fclose(f_se); fclose(f_ae); fclose(f_ie);
+        unmap_file(m_geo); unmap_file(m_se); unmap_file(m_ae); unmap_file(m_ie);
+        std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
         malloc_trim(0);
-        log_phase("  Geo entries + corrections", t_entry);
+        log_phase("  Geo entries complete", t_entry);
 
         // Admin: small, use existing rebuild + corrections
         {
