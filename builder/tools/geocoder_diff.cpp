@@ -13,11 +13,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -52,6 +55,41 @@ struct MergeSequence {
         data.insert(data.end(), records, records + count * stride);
     }
 };
+
+// Build merge sequence for sorted data files (no hash table needed).
+// Both old (after string remap) and new are in deterministic sort order.
+// cmp(a, b) returns <0 if a sorts before b, >0 if after, 0 if same key.
+// When cmp returns 0 but bytes differ, the record was modified (DELETE+INSERT).
+template<typename CmpFn>
+static MergeSequence build_merge_seq_sorted(
+    const std::vector<char>& old_data, const std::vector<char>& new_data,
+    size_t stride, CmpFn cmp)
+{
+    size_t old_n = old_data.size() / stride;
+    size_t new_n = new_data.size() / stride;
+    size_t oi = 0, ni = 0;
+    MergeSequence seq;
+    uint32_t match_run = 0, del_run = 0;
+    auto flush_match = [&]() { if (match_run > 0) { seq.add_match(match_run); match_run = 0; } };
+    auto flush_del = [&]() { if (del_run > 0) { seq.add_delete(del_run); del_run = 0; } };
+
+    while (oi < old_n && ni < new_n) {
+        const char* op = old_data.data() + oi * stride;
+        const char* np = new_data.data() + ni * stride;
+        if (memcmp(op, np, stride) == 0) {
+            flush_del(); match_run++; oi++; ni++;
+        } else {
+            int c = cmp(op, np);
+            if (c < 0) { flush_match(); del_run++; oi++; }               // old-only → deleted
+            else if (c > 0) { flush_match(); flush_del(); seq.add_insert(np, 1, stride); ni++; } // new-only → inserted
+            else { flush_match(); del_run++; oi++; flush_del(); seq.add_insert(np, 1, stride); ni++; } // same key, different bytes → modified
+        }
+    }
+    flush_match(); flush_del();
+    if (oi < old_n) seq.add_delete(old_n - oi);
+    if (ni < new_n) seq.add_insert(new_data.data() + ni * stride, new_n - ni, stride);
+    return seq;
+}
 
 // Build merge sequence for a data file.
 // old_data has string remap already applied.
@@ -236,7 +274,7 @@ static void fixup_admin_offsets(std::vector<char>& old_polys, const std::vector<
     auto poly_hash = [&](const char* p, const char* verts, size_t max_v) -> uint64_t {
         uint32_t vert_offset, vert_count, name_id;
         memcpy(&vert_offset, p, 4); memcpy(&vert_count, p + 4, 4); memcpy(&name_id, p + 8, 4);
-        uint8_t level = (uint8_t)p[12]; uint16_t cc; memcpy(&cc, p + stride - 2, 2);
+        uint8_t level = (uint8_t)p[12]; uint16_t cc; memcpy(&cc, p + 20, 2);
         uint64_t h = 14695981039346656037ULL;
         h = fnv_mix(h, name_id); h = fnv_mix(h, level); h = fnv_mix(h, cc); h = fnv_mix(h, vert_count);
         for (uint32_t j = 0; j < std::min(vert_count, 10u) && (vert_offset + j) < max_v; j++) {
@@ -304,6 +342,65 @@ static void fixup_interp_offsets(std::vector<char>& old_data, const std::vector<
     }
 }
 
+// --- Secondary matching for modified records ---
+// After the merge sequence is built, match DELETE'd and INSERT'd records by a
+// relaxed key to recover ID mappings for records that changed (e.g. geometry edit)
+// but represent the same logical entity. Only matches when the key group has
+// equal counts on both sides to avoid mismatches.
+template<typename KeyFn>
+static std::unordered_map<uint32_t, uint32_t> secondary_match_from_merge(
+    const MergeSequence& seq,
+    const std::vector<char>& old_data,
+    const std::vector<char>& new_data,
+    size_t stride,
+    KeyFn key_fn)
+{
+    std::vector<uint32_t> del_indices, ins_indices;
+    size_t pos = 0, old_rec = 0, new_rec = 0;
+    while (pos < seq.data.size()) {
+        uint8_t op = static_cast<uint8_t>(seq.data[pos]); pos++;
+        uint32_t count; memcpy(&count, seq.data.data() + pos, 4); pos += 4;
+        if (op == OP_MATCH_RUN) {
+            old_rec += count; new_rec += count;
+        } else if (op == OP_INSERT_RUN) {
+            for (uint32_t k = 0; k < count; k++)
+                ins_indices.push_back(static_cast<uint32_t>(new_rec + k));
+            pos += count * stride;
+            new_rec += count;
+        } else if (op == OP_DELETE_RUN) {
+            for (uint32_t k = 0; k < count; k++)
+                del_indices.push_back(static_cast<uint32_t>(old_rec + k));
+            old_rec += count;
+        }
+    }
+
+    // Group by key
+    std::unordered_map<uint64_t, std::vector<uint32_t>> del_by_key, ins_by_key;
+    for (uint32_t di : del_indices) {
+        if ((size_t)(di + 1) * stride > old_data.size()) continue;
+        del_by_key[key_fn(old_data.data() + di * stride)].push_back(di);
+    }
+    for (uint32_t ii : ins_indices) {
+        if ((size_t)(ii + 1) * stride > new_data.size()) continue;
+        ins_by_key[key_fn(new_data.data() + ii * stride)].push_back(ii);
+    }
+
+    // Match only when equal counts per key (safe pairwise match in index order)
+    std::unordered_map<uint32_t, uint32_t> remap;
+    for (auto& [key, del_vec] : del_by_key) {
+        auto it = ins_by_key.find(key);
+        if (it == ins_by_key.end()) continue;
+        auto& ins_vec = it->second;
+        if (del_vec.size() == ins_vec.size()) {
+            std::sort(del_vec.begin(), del_vec.end());
+            std::sort(ins_vec.begin(), ins_vec.end());
+            for (size_t i = 0; i < del_vec.size(); i++)
+                remap[del_vec[i]] = ins_vec[i];
+        }
+    }
+    return remap;
+}
+
 // --- Derive ID remap from merge sequence (same logic as patch tool) ---
 static std::vector<uint32_t> derive_id_remap_from_merge(
     const MergeSequence& seq, size_t old_count, size_t stride)
@@ -326,6 +423,54 @@ static std::vector<uint32_t> derive_id_remap_from_merge(
         }
     }
     return id_map;
+}
+
+// --- Per-file merge result (computed in parallel, serialized sequentially) ---
+struct FileMergeResult {
+    PatchFileId id;
+    std::string name;
+    size_t stride;
+    uint64_t old_size, new_size;
+    MergeSequence seq;
+    std::vector<std::pair<uint32_t,uint32_t>> fixups; // (record_idx, new_offset)
+    std::unordered_map<uint32_t,uint32_t> secondary_matches; // soft old→new ID map
+    std::vector<uint32_t> id_remap; // derived old→new ID remap (with secondary merged in)
+};
+
+// Serialize a pre-computed merge result into the patch buffer
+static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r) {
+    auto wv = [&](const void* data, size_t size) {
+        patch.insert(patch.end(), (const char*)data, (const char*)data + size);
+    };
+    uint32_t fid = static_cast<uint32_t>(r.id);
+    uint32_t st = static_cast<uint32_t>(r.stride);
+    uint32_t n_fixups = static_cast<uint32_t>(r.fixups.size());
+    wv(&fid, 4); wv(&st, 4); wv(&r.old_size, 8); wv(&r.new_size, 8);
+    wv(&n_fixups, 4);
+    if (n_fixups > 0) {
+        std::vector<char> delta_buf;
+        uint32_t prev_idx = 0, prev_val = 0;
+        for (auto& [idx, val] : r.fixups) {
+            write_varint(delta_buf, idx - prev_idx);
+            write_varint(delta_buf, val - prev_val);
+            prev_idx = idx; prev_val = val;
+        }
+        uint32_t delta_size = static_cast<uint32_t>(delta_buf.size());
+        wv(&delta_size, 4);
+        patch.insert(patch.end(), delta_buf.begin(), delta_buf.end());
+    }
+    uint64_t ss = r.seq.data.size();
+    wv(&ss, 8);
+    patch.insert(patch.end(), r.seq.data.begin(), r.seq.data.end());
+}
+
+static std::mutex log_mutex;
+static void log_merge(const FileMergeResult& r) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cerr << "  " << r.name << ": seq=" << r.seq.data.size()
+              << " fixups=" << r.fixups.size()
+              << " (" << std::fixed << std::setprecision(2)
+              << (r.new_size > 0 ? r.seq.data.size() * 100.0 / r.new_size : 0) << "%)" << std::endl;
 }
 
 // --- Write helpers ---
@@ -374,304 +519,217 @@ int main(int argc, char* argv[]) {
         std::cerr << "  String remap: derived from string diff (0 explicit entries)" << std::endl;
     }
 
-    // --- Section: Per-file merge sequences ---
-    // Track fixups per file (applied before merge, included in patch for patch tool)
-    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t,uint32_t>>> file_fixups;
-
+    // --- Section: Per-file merge sequences (computed in parallel) ---
     // Stored merge sequences for ID remap derivation
     std::unordered_map<uint32_t, MergeSequence> stored_merges;
 
-    auto write_merge = [&](PatchFileId id, const std::string& name,
-                             const std::vector<char>& old_data, const std::vector<char>& new_data,
-                             size_t stride) {
-        auto seq = build_merge_seq(old_data, new_data, stride);
-        stored_merges[static_cast<uint32_t>(id)] = seq; // store for entry rebuild
-        uint32_t fid = static_cast<uint32_t>(id);
-        uint64_t os = old_data.size(), ns = new_data.size(), ss = seq.data.size();
-
-        // Check for fixups
-        auto fit = file_fixups.find(fid);
-        uint32_t n_fixups = fit != file_fixups.end() ? static_cast<uint32_t>(fit->second.size()) : 0;
-
-        wval(patch, &fid, 4);
-        uint32_t st = static_cast<uint32_t>(stride);
-        wval(patch, &st, 4);
-        wval(patch, &os, 8); wval(patch, &ns, 8);
-        // Fixup count + delta-encoded data before merge sequence
-        wval(patch, &n_fixups, 4);
-        if (n_fixups > 0) {
-            std::vector<char> delta_buf;
-            uint32_t prev_idx = 0, prev_val = 0;
-            for (auto& [idx, val] : fit->second) {
-                write_varint(delta_buf, idx - prev_idx);
-                write_varint(delta_buf, val - prev_val);
-                prev_idx = idx;
-                prev_val = val;
-            }
-            uint32_t delta_size = static_cast<uint32_t>(delta_buf.size());
-            wval(patch, &delta_size, 4);
-            patch.insert(patch.end(), delta_buf.begin(), delta_buf.end());
-        }
-        wval(patch, &ss, 8);
-        patch.insert(patch.end(), seq.data.begin(), seq.data.end());
-        std::cerr << "  " << name << ": seq=" << ss << " fixups=" << n_fixups
-                  << " (" << std::fixed << std::setprecision(2)
-                  << (ns > 0 ? ss * 100.0 / ns : 0) << "%)" << std::endl;
-    };
-
     // strings.bin: string-level diff (both pools are sorted alphabetically)
-    // Walk both pools, emit new strings to insert and indices of deleted strings.
-    // The patch tool merges new strings into old pool alphabetically.
     {
-        // Parse both pools into string lists
         std::vector<std::string> old_strs, new_strs;
-        {
-            size_t p = 0;
-            while (p < old_strings.size()) {
-                const char* s = old_strings.data() + p;
-                old_strs.push_back(s);
-                p += strlen(s) + 1;
-            }
-        }
-        {
-            size_t p = 0;
-            while (p < new_strings.size()) {
-                const char* s = new_strings.data() + p;
-                new_strs.push_back(s);
-                p += strlen(s) + 1;
-            }
-        }
-
-        // Merge-walk to find insertions and deletions
+        { size_t p = 0; while (p < old_strings.size()) { old_strs.push_back(old_strings.data()+p); p += strlen(old_strings.data()+p)+1; } }
+        { size_t p = 0; while (p < new_strings.size()) { new_strs.push_back(new_strings.data()+p); p += strlen(new_strings.data()+p)+1; } }
         std::vector<std::string> added_strings;
         std::vector<uint32_t> deleted_indices;
         size_t oi = 0, ni = 0;
         while (oi < old_strs.size() && ni < new_strs.size()) {
             int c = old_strs[oi].compare(new_strs[ni]);
-            if (c == 0) { oi++; ni++; } // same string
-            else if (c < 0) { deleted_indices.push_back(oi); oi++; } // old only → deleted
-            else { added_strings.push_back(new_strs[ni]); ni++; } // new only → added
+            if (c == 0) { oi++; ni++; }
+            else if (c < 0) { deleted_indices.push_back(oi); oi++; }
+            else { added_strings.push_back(new_strs[ni]); ni++; }
         }
         while (oi < old_strs.size()) { deleted_indices.push_back(oi); oi++; }
         while (ni < new_strs.size()) { added_strings.push_back(new_strs[ni]); ni++; }
-
-        // Serialize: marker, n_added, n_deleted, added_string_data, deleted_indices
         uint32_t str_diff_marker = 0xFFFFFFF7;
-        uint32_t n_added = static_cast<uint32_t>(added_strings.size());
-        uint32_t n_deleted = static_cast<uint32_t>(deleted_indices.size());
-        wval(patch, &str_diff_marker, 4);
-        wval(patch, &n_added, 4);
-        wval(patch, &n_deleted, 4);
-        for (auto& s : added_strings) {
-            patch.insert(patch.end(), s.begin(), s.end());
-            patch.push_back('\0');
-        }
+        uint32_t n_added = added_strings.size(), n_deleted = deleted_indices.size();
+        wval(patch, &str_diff_marker, 4); wval(patch, &n_added, 4); wval(patch, &n_deleted, 4);
+        for (auto& s : added_strings) { patch.insert(patch.end(), s.begin(), s.end()); patch.push_back('\0'); }
         for (auto idx : deleted_indices) wval(patch, &idx, 4);
-
-        size_t str_diff_size = 12 + (n_added > 0 ? new_strings.size() - old_strings.size() + n_deleted * 16 : 0);
         std::cerr << "  strings.bin: +" << n_added << " -" << n_deleted << " strings" << std::endl;
     }
 
-    // addr_points.bin
-    {
+    // Build merge sequences for all data files in parallel (4 groups)
+    // Group 1: addr_points (independent)
+    // Group 2: street_ways → street_nodes (sequential within group)
+    // Group 3: interp_ways → interp_nodes (sequential within group)
+    // Group 4: admin_polygons → admin_vertices (sequential within group)
+    FileMergeResult res_addr, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v;
+
+    // Helper to build parent-aware node merge from a parent way merge
+    // count_u32: true for admin_polygons (vertex_count is uint32_t at offset 4)
+    //            false for street_ways/interp_ways (node_count is uint8_t at offset 4)
+    auto build_child_merge = [](const MergeSequence& parent_seq,
+                                 const std::vector<char>& old_parent, const std::vector<char>& new_parent,
+                                 const std::vector<char>& old_child, const std::vector<char>& new_child,
+                                 size_t parent_stride, bool count_u32) -> MergeSequence {
+        MergeSequence seq;
+        auto read_count = [&](const char* rec) -> uint32_t {
+            if (count_u32) { uint32_t v; memcpy(&v, rec + 4, 4); return v; }
+            return static_cast<uint32_t>(static_cast<uint8_t>(rec[4]));
+        };
+        size_t p_oi = 0, p_ni = 0, ppos = 0;
+        while (ppos < parent_seq.data.size()) {
+            uint8_t op = static_cast<uint8_t>(parent_seq.data[ppos]); ppos++;
+            uint32_t count; memcpy(&count, parent_seq.data.data() + ppos, 4); ppos += 4;
+            if (op == OP_MATCH_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t old_off; memcpy(&old_off, old_parent.data() + (p_oi+k)*parent_stride, 4);
+                    uint32_t vc = read_count(old_parent.data() + (p_oi+k)*parent_stride);
+                    uint32_t new_off; memcpy(&new_off, new_parent.data() + (p_ni+k)*parent_stride, 4);
+                    if (vc > 0) {
+                        bool match = (old_off + vc) * 8 <= old_child.size() &&
+                                    (new_off + vc) * 8 <= new_child.size() &&
+                                    memcmp(old_child.data() + old_off*8, new_child.data() + new_off*8, vc*8) == 0;
+                        if (match) seq.add_match(vc);
+                        else { seq.add_delete(vc); seq.add_insert(new_child.data() + new_off*8, vc, 8); }
+                    }
+                }
+                p_oi += count; p_ni += count;
+            } else if (op == OP_INSERT_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    const char* rec = parent_seq.data.data() + ppos + k * parent_stride;
+                    uint32_t off; memcpy(&off, rec, 4);
+                    uint32_t vc = read_count(rec);
+                    if (vc > 0 && (off + vc) * 8 <= new_child.size())
+                        seq.add_insert(new_child.data() + off*8, vc, 8);
+                }
+                ppos += count * parent_stride;
+                p_ni += count;
+            } else if (op == OP_DELETE_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t vc = read_count(old_parent.data() + (p_oi+k)*parent_stride);
+                    if (vc > 0) seq.add_delete(vc);
+                }
+                p_oi += count;
+            }
+        }
+        return seq;
+    };
+
+    // --- Timing helper ---
+    auto now_ms = []() -> double {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+    };
+    auto log_time = [&](const char* label, double start) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        std::cerr << "  [" << std::fixed << std::setprecision(1) << (now_ms() - start) / 1000.0 << "s] " << label << std::endl;
+    };
+
+    double merge_start = now_ms();
+    std::cerr << "Building merge sequences (parallel)..." << std::endl;
+
+    // Group 1: addr_points
+    std::thread t_addr([&]() {
+        double gs = now_ms();
         auto old_data = read_file(old_dir + "/addr_points.bin");
         remap_addr_points(old_data, str_remap);
         auto new_data = read_file(new_dir + "/addr_points.bin");
-        write_merge(PatchFileId::ADDR_POINTS, "addr_points.bin", old_data, new_data, 16);
-    }
+        auto seq = build_merge_seq(old_data, new_data, 16);
+        auto soft = secondary_match_from_merge(seq, old_data, new_data, 16,
+            [](const char* rec) -> uint64_t {
+                uint32_t hn_id, st_id;
+                memcpy(&hn_id, rec + 8, 4); memcpy(&st_id, rec + 12, 4);
+                return ((uint64_t)st_id << 32) | hn_id;
+            });
+        auto id_rm = derive_id_remap_from_merge(seq, old_data.size() / 16, 16);
+        for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
+        res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", 16,
+                    old_data.size(), new_data.size(), std::move(seq), {}, std::move(soft), std::move(id_rm)};
+        log_merge(res_addr);
+        log_time("  group:addr_points", gs);
+    });
 
-    // street_ways.bin (string remap + offset fixup for node_offset)
-    {
+    // Group 2: street_ways → street_nodes
+    std::thread t_street([&]() {
+        double gs = now_ms();
         auto old_w = read_file(old_dir + "/street_ways.bin");
         remap_field(old_w, way_stride, way_stride == 12 ? 8 : 5, str_remap);
         auto new_w = read_file(new_dir + "/street_ways.bin");
         auto old_n = read_file(old_dir + "/street_nodes.bin");
         auto new_n = read_file(new_dir + "/street_nodes.bin");
-        // Record fixups: (record_index, new_node_offset)
-        auto& fixups = file_fixups[static_cast<uint32_t>(PatchFileId::STREET_WAYS)];
-        // Save old offsets, apply fixups, then record changes
+        // Fixup node_offsets
         size_t wn = old_w.size() / way_stride;
         std::vector<uint32_t> old_offsets(wn);
         for (size_t i = 0; i < wn; i++) memcpy(&old_offsets[i], old_w.data() + i * way_stride, 4);
         fixup_way_offsets(old_w, old_n, new_w, new_n, way_stride);
+        std::vector<std::pair<uint32_t,uint32_t>> fixups;
         for (size_t i = 0; i < wn; i++) {
             uint32_t new_off; memcpy(&new_off, old_w.data() + i * way_stride, 4);
             if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
         }
-        write_merge(PatchFileId::STREET_WAYS, "street_ways.bin", old_w, new_w, way_stride);
-    }
+        auto way_seq = build_merge_seq(old_w, new_w, way_stride);
+        size_t way_name_off = (way_stride == 12) ? 8 : 5;
+        auto soft = secondary_match_from_merge(way_seq, old_w, new_w, way_stride,
+            [way_name_off](const char* rec) -> uint64_t {
+                uint32_t name_id; memcpy(&name_id, rec + way_name_off, 4);
+                uint8_t nc = static_cast<uint8_t>(rec[4]);
+                return ((uint64_t)name_id << 8) | nc;
+            });
+        auto id_rm = derive_id_remap_from_merge(way_seq, old_w.size() / way_stride, way_stride);
+        for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
+        res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
+                    old_w.size(), new_w.size(), way_seq, std::move(fixups), std::move(soft), std::move(id_rm)};
+        log_merge(res_ways);
+        // Now build parent-aware node merge from way merge
+        // Restore original node_offsets (before fixup) — avoids re-reading the file
+        for (size_t i = 0; i < wn; i++) memcpy(old_w.data() + i * way_stride, &old_offsets[i], 4);
+        auto node_seq = build_child_merge(way_seq, old_w, new_w, old_n, new_n, way_stride, false);
+        res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
+                     old_n.size(), new_n.size(), std::move(node_seq), {}};
+        log_merge(res_nodes);
+        log_time("  group:streets", gs);
+    });
 
-    // street_nodes.bin — derive from street_ways merge (parent-aware)
-    // Instead of merging 8-byte records independently (fails at scale),
-    // use the way merge to determine which node blocks to COPY vs INSERT.
-    {
-        auto& way_seq = stored_merges[static_cast<uint32_t>(PatchFileId::STREET_WAYS)];
-        // Read ORIGINAL old ways (before fixup) to get correct old node offsets
-        auto old_w_orig = read_file(old_dir + "/street_ways.bin");
-        auto new_w = read_file(new_dir + "/street_ways.bin");
-        auto old_n = read_file(old_dir + "/street_nodes.bin");
-        auto new_n = read_file(new_dir + "/street_nodes.bin");
-        // For MATCH: use original old node_offsets (not the fixup'd ones)
-        // For INSERT: read from new node file using new way's node_offset
-        auto& old_w = old_w_orig; // original offsets
-
-        // Walk the way merge to build a node merge
-        MergeSequence node_seq;
-        size_t way_oi = 0, way_ni = 0;
-        size_t wpos = 0;
-        while (wpos < way_seq.data.size()) {
-            uint8_t op = static_cast<uint8_t>(way_seq.data[wpos]); wpos++;
-            uint32_t count; memcpy(&count, way_seq.data.data() + wpos, 4); wpos += 4;
-
-            if (op == OP_MATCH_RUN) {
-                // Matched ways: verify node blocks are actually identical
-                for (uint32_t k = 0; k < count; k++) {
-                    uint32_t old_no; memcpy(&old_no, old_w.data() + (way_oi + k) * way_stride, 4);
-                    uint8_t nc = static_cast<uint8_t>(old_w[(way_oi + k) * way_stride + 4]);
-                    // Get new way's node_offset (from new_w at way_ni + k)
-                    uint32_t new_no; memcpy(&new_no, new_w.data() + (way_ni + k) * way_stride, 4);
-                    if (nc > 0) {
-                        // Check if node data is actually identical
-                        bool nodes_match = (old_no + nc) * 8 <= old_n.size() &&
-                                          (new_no + nc) * 8 <= new_n.size() &&
-                                          memcmp(old_n.data() + old_no * 8,
-                                                 new_n.data() + new_no * 8, nc * 8) == 0;
-                        if (nodes_match) {
-                            node_seq.add_match(nc);
-                        } else {
-                            // Way matched but nodes differ → INSERT new nodes
-                            node_seq.add_delete(nc);
-                            node_seq.add_insert(new_n.data() + new_no * 8, nc, 8);
-                        }
-                    }
-                }
-                way_oi += count; way_ni += count;
-            } else if (op == OP_INSERT_RUN) {
-                // New ways: their nodes are new data → INSERT from new
-                for (uint32_t k = 0; k < count; k++) {
-                    const char* new_way = way_seq.data.data() + wpos + k * way_stride;
-                    uint32_t new_node_off; memcpy(&new_node_off, new_way, 4);
-                    uint8_t nc = static_cast<uint8_t>(new_way[4]);
-                    if (nc > 0 && (new_node_off + nc) * 8 <= new_n.size())
-                        node_seq.add_insert(new_n.data() + new_node_off * 8, nc, 8);
-                }
-                wpos += count * way_stride;
-                way_ni += count;
-            } else if (op == OP_DELETE_RUN) {
-                // Deleted ways: skip their nodes
-                for (uint32_t k = 0; k < count; k++) {
-                    uint8_t nc = static_cast<uint8_t>(old_w[(way_oi + k) * way_stride + 4]);
-                    if (nc > 0) node_seq.add_delete(nc);
-                }
-                way_oi += count;
-            }
-        }
-
-        // Write the derived node merge
-        uint32_t fid = static_cast<uint32_t>(PatchFileId::STREET_NODES);
-        uint64_t os = old_n.size(), ns = new_n.size(), ss = node_seq.data.size();
-        uint32_t st = 8, n_fixups = 0;
-        wval(patch, &fid, 4); wval(patch, &st, 4);
-        wval(patch, &os, 8); wval(patch, &ns, 8);
-        wval(patch, &n_fixups, 4); wval(patch, &ss, 8);
-        patch.insert(patch.end(), node_seq.data.begin(), node_seq.data.end());
-        std::cerr << "  street_nodes.bin: parent-derived seq=" << ss << " bytes ("
-                  << std::fixed << std::setprecision(2) << (ns > 0 ? ss * 100.0 / ns : 0) << "%)" << std::endl;
-    }
-
-    // interp_ways.bin
-    {
+    // Group 3: interp_ways → interp_nodes
+    std::thread t_interp([&]() {
+        double gs = now_ms();
         auto old_data = read_file(old_dir + "/interp_ways.bin");
-        auto new_idata = read_file(new_dir + "/interp_ways.bin");
-        // Zero padding bytes for deterministic comparison
+        auto new_data = read_file(new_dir + "/interp_ways.bin");
         if (interp_stride == 24) {
-            for (size_t i = 0; i + interp_stride <= old_data.size(); i += interp_stride) {
-                memset(old_data.data() + i + 5, 0, 3);  // after node_count
-                memset(old_data.data() + i + 21, 0, 3);  // after interpolation
-            }
-            for (size_t i = 0; i + interp_stride <= new_idata.size(); i += interp_stride) {
-                memset(new_idata.data() + i + 5, 0, 3);
-                memset(new_idata.data() + i + 21, 0, 3);
-            }
+            for (size_t i = 0; i + interp_stride <= old_data.size(); i += interp_stride)
+                { memset(old_data.data()+i+5, 0, 3); memset(old_data.data()+i+21, 0, 3); }
+            for (size_t i = 0; i + interp_stride <= new_data.size(); i += interp_stride)
+                { memset(new_data.data()+i+5, 0, 3); memset(new_data.data()+i+21, 0, 3); }
         }
         remap_field(old_data, interp_stride, interp_stride >= 20 ? 8 : 5, str_remap);
         auto old_n = read_file(old_dir + "/interp_nodes.bin");
-        auto& new_data = new_idata; // use padding-zeroed version
         auto new_n = read_file(new_dir + "/interp_nodes.bin");
-        auto& fixups = file_fixups[static_cast<uint32_t>(PatchFileId::INTERP_WAYS)];
-        size_t in_count = old_data.size() / interp_stride;
-        std::vector<uint32_t> old_offsets(in_count);
-        for (size_t i = 0; i < in_count; i++) memcpy(&old_offsets[i], old_data.data() + i * interp_stride, 4);
+        size_t n = old_data.size() / interp_stride;
+        std::vector<uint32_t> old_offsets(n);
+        for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data() + i * interp_stride, 4);
         fixup_interp_offsets(old_data, old_n, new_data, new_n, interp_stride);
-        for (size_t i = 0; i < in_count; i++) {
+        std::vector<std::pair<uint32_t,uint32_t>> fixups;
+        for (size_t i = 0; i < n; i++) {
             uint32_t new_off; memcpy(&new_off, old_data.data() + i * interp_stride, 4);
             if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
         }
-        write_merge(PatchFileId::INTERP_WAYS, "interp_ways.bin", old_data, new_data, interp_stride);
-    }
+        auto iw_seq = build_merge_seq(old_data, new_data, interp_stride);
+        size_t ist_off = (interp_stride >= 20) ? 8 : 5;
+        auto soft = secondary_match_from_merge(iw_seq, old_data, new_data, interp_stride,
+            [ist_off](const char* rec) -> uint64_t {
+                uint32_t street_id, start;
+                memcpy(&street_id, rec + ist_off, 4);
+                memcpy(&start, rec + ist_off + 4, 4);
+                return ((uint64_t)street_id << 32) | start;
+            });
+        auto id_rm = derive_id_remap_from_merge(iw_seq, old_data.size() / interp_stride, interp_stride);
+        for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
+        res_interp_w = {PatchFileId::INTERP_WAYS, "interp_ways.bin", interp_stride,
+                        old_data.size(), new_data.size(), iw_seq, std::move(fixups), std::move(soft), std::move(id_rm)};
+        log_merge(res_interp_w);
+        for (size_t i = 0; i < n; i++) memcpy(old_data.data() + i * interp_stride, &old_offsets[i], 4);
+        auto in_seq = build_child_merge(iw_seq, old_data, new_data, old_n, new_n, interp_stride, false);
+        res_interp_n = {PatchFileId::INTERP_NODES, "interp_nodes.bin", 8,
+                        old_n.size(), new_n.size(), std::move(in_seq), {}};
+        log_merge(res_interp_n);
+        log_time("  group:interp", gs);
+    });
 
-    // interp_nodes.bin — derive from interp_ways merge (parent-aware)
-    {
-        auto& iw_seq = stored_merges[static_cast<uint32_t>(PatchFileId::INTERP_WAYS)];
-        auto old_iw_data = read_file(old_dir + "/interp_ways.bin");
-        auto new_iw_data = read_file(new_dir + "/interp_ways.bin");
-        auto& old_iw = old_iw_data;
-        auto& new_iw = new_iw_data;
-        auto old_in = read_file(old_dir + "/interp_nodes.bin");
-        auto new_in = read_file(new_dir + "/interp_nodes.bin");
-        MergeSequence in_seq;
-        size_t iw_oi = 0, iw_ni = 0;
-        size_t iwpos = 0;
-        while (iwpos < iw_seq.data.size()) {
-            uint8_t op = static_cast<uint8_t>(iw_seq.data[iwpos]); iwpos++;
-            uint32_t count; memcpy(&count, iw_seq.data.data() + iwpos, 4); iwpos += 4;
-            if (op == OP_MATCH_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    uint32_t old_no; memcpy(&old_no, old_iw.data() + (iw_oi + k) * interp_stride, 4);
-                    uint8_t nc = static_cast<uint8_t>(old_iw[(iw_oi + k) * interp_stride + 4]);
-                    uint32_t new_no; memcpy(&new_no, new_iw.data() + (iw_ni + k) * interp_stride, 4);
-                    if (nc > 0) {
-                        bool match = (old_no + nc) * 8 <= old_in.size() &&
-                                    (new_no + nc) * 8 <= new_in.size() &&
-                                    memcmp(old_in.data() + old_no * 8, new_in.data() + new_no * 8, nc * 8) == 0;
-                        if (match) in_seq.add_match(nc);
-                        else { in_seq.add_delete(nc); in_seq.add_insert(new_in.data() + new_no * 8, nc, 8); }
-                    }
-                }
-                iw_oi += count; iw_ni += count;
-            } else if (op == OP_INSERT_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    const char* rec = iw_seq.data.data() + iwpos + k * interp_stride;
-                    uint32_t no; memcpy(&no, rec, 4);
-                    uint8_t nc = static_cast<uint8_t>(rec[4]);
-                    if (nc > 0 && (no + nc) * 8 <= new_in.size())
-                        in_seq.add_insert(new_in.data() + no * 8, nc, 8);
-                }
-                iwpos += count * interp_stride;
-                iw_ni += count;
-            } else if (op == OP_DELETE_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    uint8_t nc = static_cast<uint8_t>(old_iw[(iw_oi + k) * interp_stride + 4]);
-                    if (nc > 0) in_seq.add_delete(nc);
-                }
-                iw_oi += count;
-            }
-        }
-        uint32_t fid = static_cast<uint32_t>(PatchFileId::INTERP_NODES);
-        uint64_t os = old_in.size(), ns = new_in.size(), ss = in_seq.data.size();
-        uint32_t st = 8, n_fixups = 0;
-        wval(patch, &fid, 4); wval(patch, &st, 4);
-        wval(patch, &os, 8); wval(patch, &ns, 8);
-        wval(patch, &n_fixups, 4); wval(patch, &ss, 8);
-        patch.insert(patch.end(), in_seq.data.begin(), in_seq.data.end());
-        std::cerr << "  interp_nodes.bin: parent-derived seq=" << ss << " bytes" << std::endl;
-    }
-
-    // admin_polygons.bin
-    {
+    // Group 4: admin_polygons → admin_vertices
+    std::thread t_admin([&]() {
+        double gs = now_ms();
         auto old_data = read_file(old_dir + "/admin_polygons.bin");
         auto new_data = read_file(new_dir + "/admin_polygons.bin");
-        // Zero padding bytes (offset 13-15 between admin_level and area) for deterministic comparison
         if (admin_stride == 24) {
             for (size_t i = 0; i + admin_stride <= old_data.size(); i += admin_stride)
                 memset(old_data.data() + i + 13, 0, 3);
@@ -681,306 +739,297 @@ int main(int argc, char* argv[]) {
         remap_field(old_data, admin_stride, 8, str_remap);
         auto old_v = read_file(old_dir + "/admin_vertices.bin");
         auto new_v = read_file(new_dir + "/admin_vertices.bin");
-        auto& fixups = file_fixups[static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS)];
-        size_t an = old_data.size() / admin_stride;
-        std::vector<uint32_t> old_offsets(an);
-        for (size_t i = 0; i < an; i++) memcpy(&old_offsets[i], old_data.data() + i * admin_stride, 4);
+        size_t n = old_data.size() / admin_stride;
+        std::vector<uint32_t> old_offsets(n);
+        for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data() + i * admin_stride, 4);
         fixup_admin_offsets(old_data, old_v, new_data, new_v, admin_stride);
-        for (size_t i = 0; i < an; i++) {
+        std::vector<std::pair<uint32_t,uint32_t>> fixups;
+        for (size_t i = 0; i < n; i++) {
             uint32_t new_off; memcpy(&new_off, old_data.data() + i * admin_stride, 4);
             if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
         }
-        write_merge(PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", old_data, new_data, admin_stride);
+        auto ap_seq = build_merge_seq(old_data, new_data, admin_stride);
+        auto soft = secondary_match_from_merge(ap_seq, old_data, new_data, admin_stride,
+            [](const char* rec) -> uint64_t {
+                uint32_t name_id; memcpy(&name_id, rec + 8, 4);
+                uint8_t level = static_cast<uint8_t>(rec[12]);
+                uint16_t cc; memcpy(&cc, rec + 20, 2);
+                return ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
+            });
+        res_admin_p = {PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", admin_stride,
+                       old_data.size(), new_data.size(), ap_seq, std::move(fixups), std::move(soft), {}};
+        log_merge(res_admin_p);
+        for (size_t i = 0; i < n; i++) memcpy(old_data.data() + i * admin_stride, &old_offsets[i], 4);
+        auto av_seq = build_child_merge(ap_seq, old_data, new_data, old_v, new_v, admin_stride, true);
+        res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 8,
+                       old_v.size(), new_v.size(), std::move(av_seq), {}};
+        log_merge(res_admin_v);
+        log_time("  group:admin", gs);
+    });
+
+    // Group 5: cell changes (independent of merges, runs in parallel with them)
+    // Uses sorted vectors + set_difference instead of unordered_sets — much faster for 15M cells
+    std::vector<uint64_t> g_added, g_removed, a_added, a_removed;
+    std::thread t_cells([&]() {
+        double gs = now_ms();
+        auto diff_cells = [](const std::string& old_path, const std::string& new_path,
+                             size_t stride, std::vector<uint64_t>& added, std::vector<uint64_t>& removed) {
+            auto old_data = read_file(old_path);
+            auto new_data = read_file(new_path);
+            std::vector<uint64_t> old_ids(old_data.size() / stride), new_ids(new_data.size() / stride);
+            for (size_t i = 0; i < old_ids.size(); i++) memcpy(&old_ids[i], old_data.data()+i*stride, 8);
+            for (size_t i = 0; i < new_ids.size(); i++) memcpy(&new_ids[i], new_data.data()+i*stride, 8);
+            std::sort(old_ids.begin(), old_ids.end());
+            std::sort(new_ids.begin(), new_ids.end());
+            std::set_difference(new_ids.begin(), new_ids.end(), old_ids.begin(), old_ids.end(), std::back_inserter(added));
+            std::set_difference(old_ids.begin(), old_ids.end(), new_ids.begin(), new_ids.end(), std::back_inserter(removed));
+        };
+        diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
+        diff_cells(old_dir + "/admin_cells.bin", new_dir + "/admin_cells.bin", 12, a_added, a_removed);
+        log_time("  group:cell_changes", gs);
+    });
+
+    t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_cells.join();
+    log_time("All merge sequences + cell changes built", merge_start);
+
+    // Serialize merge results to patch in canonical order, then free heavy data
+    serialize_merge(patch, res_addr);
+    serialize_merge(patch, res_ways);
+    serialize_merge(patch, res_nodes);
+    { std::vector<char>().swap(res_nodes.seq.data); } // free ~264 MiB node merge sequence
+    serialize_merge(patch, res_interp_w);
+    serialize_merge(patch, res_interp_n);
+    { std::vector<char>().swap(res_interp_n.seq.data); }
+    serialize_merge(patch, res_admin_p);
+    serialize_merge(patch, res_admin_v);
+    { std::vector<char>().swap(res_admin_v.seq.data); }
+    double t0 = now_ms();
+
+    // ID remaps were pre-computed in the parallel merge groups.
+    // Cell changes were computed in parallel with merge groups.
+    // Just need to compute admin remap (small, kept as hash map).
+    auto& w_rm_v = res_ways.id_remap;
+    auto& a_rm_v = res_addr.id_remap;
+    auto& i_rm_v = res_interp_w.id_remap;
+    std::unordered_map<uint32_t,uint32_t> ad_rm_d;
+    {
+        auto vec = derive_id_remap_from_merge(
+            res_admin_p.seq,
+            res_admin_p.old_size / admin_stride, admin_stride);
+        ad_rm_d.reserve(vec.size());
+        for (uint32_t i = 0; i < vec.size(); i++)
+            if (vec[i] != 0xFFFFFFFF) ad_rm_d[i] = vec[i];
+        for (auto& [o,n] : res_admin_p.secondary_matches) ad_rm_d[o] = n;
+    }
+    log_time("Admin remap", t0);
+
+    auto old_geo = read_file(old_dir + "/geo_cells.bin");
+
+    // Emit cell changes
+    { uint32_t marker = CELL_CHANGES_GEO_MARKER, na = g_added.size(), nr = g_removed.size();
+      wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
+      for (auto c : g_added) wval(patch, &c, 8); for (auto c : g_removed) wval(patch, &c, 8);
+      std::cerr << "  Geo cell changes: +" << na << " -" << nr << std::endl; }
+    { uint32_t marker = CELL_CHANGES_ADMIN_MARKER, na = a_added.size(), nr = a_removed.size();
+      wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
+      for (auto c : a_added) wval(patch, &c, 8); for (auto c : a_removed) wval(patch, &c, 8);
+      std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl; }
+
+    // Emit secondary remap section (from merge results, no re-reads)
+    std::cerr << "  Secondary matches: ways=" << res_ways.secondary_matches.size()
+              << " addr=" << res_addr.secondary_matches.size()
+              << " interp=" << res_interp_w.secondary_matches.size()
+              << " admin=" << res_admin_p.secondary_matches.size() << std::endl;
+    { uint32_t marker = SECONDARY_REMAP_MARKER; wval(patch, &marker, 4);
+      auto emit_remap = [&](PatchFileId fid, const std::unordered_map<uint32_t,uint32_t>& rm) {
+          uint32_t file = static_cast<uint32_t>(fid), count = rm.size();
+          wval(patch, &file, 4); wval(patch, &count, 4);
+          for (auto& [o,n] : rm) { wval(patch, &o, 4); wval(patch, &n, 4); }
+      };
+      uint32_t n_files = 4; wval(patch, &n_files, 4);
+      emit_remap(PatchFileId::STREET_WAYS, res_ways.secondary_matches);
+      emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
+      emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
+      emit_remap(PatchFileId::ADMIN_POLYGONS, res_admin_p.secondary_matches);
     }
 
-    // admin_vertices.bin — derive from admin_polygons merge (parent-aware)
-    {
-        auto& ap_seq = stored_merges[static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS)];
-        auto old_ap = read_file(old_dir + "/admin_polygons.bin");
-        auto new_ap = read_file(new_dir + "/admin_polygons.bin");
-        auto old_av = read_file(old_dir + "/admin_vertices.bin");
-        auto new_av = read_file(new_dir + "/admin_vertices.bin");
-        MergeSequence av_seq;
-        size_t ap_oi = 0, ap_ni = 0;
-        size_t appos = 0;
-        while (appos < ap_seq.data.size()) {
-            uint8_t op = static_cast<uint8_t>(ap_seq.data[appos]); appos++;
-            uint32_t count; memcpy(&count, ap_seq.data.data() + appos, 4); appos += 4;
-            if (op == OP_MATCH_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    uint32_t old_vo, vc;
-                    memcpy(&old_vo, old_ap.data() + (ap_oi + k) * admin_stride, 4);
-                    memcpy(&vc, old_ap.data() + (ap_oi + k) * admin_stride + 4, 4);
-                    uint32_t new_vo;
-                    memcpy(&new_vo, new_ap.data() + (ap_ni + k) * admin_stride, 4);
-                    if (vc > 0) {
-                        bool verts_match = (old_vo + vc) * 8 <= old_av.size() &&
-                                          (new_vo + vc) * 8 <= new_av.size() &&
-                                          memcmp(old_av.data() + old_vo * 8,
-                                                 new_av.data() + new_vo * 8, vc * 8) == 0;
-                        if (verts_match) {
-                            av_seq.add_match(vc);
-                        } else {
-                            av_seq.add_delete(vc);
-                            av_seq.add_insert(new_av.data() + new_vo * 8, vc, 8);
-                        }
-                    }
-                }
-                ap_oi += count; ap_ni += count;
-            } else if (op == OP_INSERT_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    const char* rec = ap_seq.data.data() + appos + k * admin_stride;
-                    uint32_t vo, vc; memcpy(&vo, rec, 4); memcpy(&vc, rec + 4, 4);
-                    if (vc > 0 && (vo + vc) * 8 <= new_av.size())
-                        av_seq.add_insert(new_av.data() + vo * 8, vc, 8);
-                }
-                appos += count * admin_stride;
-                ap_ni += count;
-            } else if (op == OP_DELETE_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    uint32_t vc; memcpy(&vc, old_ap.data() + (ap_oi + k) * admin_stride + 4, 4);
-                    if (vc > 0) av_seq.add_delete(vc);
-                }
-                ap_oi += count;
+    // --- Entry rebuild + corrections ---
+    // Use the proven rebuild_geo_from_remap_vec approach, then compare sequentially.
+    // Sequential corrections avoid OOM on planet (parallel used too much memory).
+    double t1 = now_ms();
+
+    // Free merge sequences (already serialized to patch)
+    { std::vector<char>().swap(res_addr.seq.data); std::vector<char>().swap(res_ways.seq.data);
+      std::vector<char>().swap(res_interp_w.seq.data); std::vector<char>().swap(res_admin_p.seq.data);
+      std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
+      std::vector<char>().swap(res_admin_v.seq.data); }
+
+    auto old_se = read_file(old_dir + "/street_entries.bin");
+    auto old_ae = read_file(old_dir + "/addr_entries.bin");
+    auto old_ie = read_file(old_dir + "/interp_entries.bin");
+    auto derived = rebuild_geo_from_remap_vec(old_geo, old_se, old_ae, old_ie,
+                                               w_rm_v, a_rm_v, i_rm_v, g_added, g_removed);
+    // Free inputs no longer needed
+    { std::vector<uint32_t>().swap(w_rm_v); std::vector<uint32_t>().swap(a_rm_v);
+      std::vector<uint32_t>().swap(i_rm_v); }
+    { std::vector<char>().swap(old_se); std::vector<char>().swap(old_ae);
+      std::vector<char>().swap(old_ie); } // keep old_geo for flag corrections
+    log_time("Geo entry rebuild", t1);
+
+    // Compare derived entries with new entries, one file at a time (sequential to save memory)
+    double t2 = now_ms();
+    auto new_geo_data = read_file(new_dir + "/geo_cells.bin");
+    auto parse_ids = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
+        if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
+        uint16_t count; memcpy(&count, data.data() + off, 2);
+        if (off + 2 + count * 4 > data.size()) return {};
+        std::vector<uint32_t> ids(count);
+        memcpy(ids.data(), data.data() + off + 2, count * 4);
+        return ids;
+    };
+    // Pre-parse new entries by cell (shared across parallel correction threads)
+    size_t d_nc = derived.geo_cells_data.size() / 20;
+    size_t n_nc = new_geo_data.size() / 20;
+    auto new_se_data = read_file(new_dir + "/street_entries.bin");
+    auto new_ae_data = read_file(new_dir + "/addr_entries.bin");
+    auto new_ie_data = read_file(new_dir + "/interp_entries.bin");
+
+    // Build shared new cell maps: cell_id → (street_ids, addr_ids, interp_ids)
+    struct NewCellEntries { std::vector<uint32_t> streets, addrs, interps; };
+    std::unordered_map<uint64_t, NewCellEntries> new_cell_map;
+    new_cell_map.reserve(n_nc);
+    for (size_t i = 0; i < n_nc; i++) {
+        uint64_t cid; memcpy(&cid, new_geo_data.data()+i*20, 8);
+        uint32_t so, ao, io;
+        memcpy(&so, new_geo_data.data()+i*20+8, 4);
+        memcpy(&ao, new_geo_data.data()+i*20+12, 4);
+        memcpy(&io, new_geo_data.data()+i*20+16, 4);
+        new_cell_map[cid] = {parse_ids(new_se_data, so), parse_ids(new_ae_data, ao), parse_ids(new_ie_data, io)};
+    }
+    { std::vector<char>().swap(new_se_data); std::vector<char>().swap(new_ae_data);
+      std::vector<char>().swap(new_ie_data); }
+
+    // Build shared derived cell set
+    std::unordered_set<uint64_t> d_set;
+    d_set.reserve(d_nc);
+    for (size_t i = 0; i < d_nc; i++) {
+        uint64_t cid; memcpy(&cid, derived.geo_cells_data.data()+i*20, 8);
+        d_set.insert(cid);
+    }
+    log_time("Pre-parse new entries", t2);
+
+    // Parallel correction: each thread reads derived entries + shared new_cell_map
+    auto compute_geo_correction = [&](PatchFileId fid, const std::string& fname,
+                                       const std::vector<char>& d_entries,
+                                       size_t d_off_pos,
+                                       auto get_new_ids) -> std::vector<char> {
+        std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
+        for (size_t i = 0; i < d_nc; i++) {
+            uint64_t cid; memcpy(&cid, derived.geo_cells_data.data()+i*20, 8);
+            uint32_t off; memcpy(&off, derived.geo_cells_data.data()+i*20+d_off_pos, 4);
+            auto d_ids = parse_ids(d_entries, off);
+            auto nit = new_cell_map.find(cid);
+            const std::vector<uint32_t>* n_ids = nullptr;
+            if (nit != new_cell_map.end()) n_ids = &get_new_ids(nit->second);
+            bool differs = !n_ids ? !d_ids.empty() : (d_ids.size() != n_ids->size()) ||
+                          (!d_ids.empty() && memcmp(d_ids.data(), n_ids->data(), d_ids.size()*4) != 0);
+            if (differs) {
+                wval(buf, &cid, 8); uint16_t c = n_ids ? n_ids->size() : 0; wval(buf, &c, 2);
+                if (n_ids && !n_ids->empty()) buf.insert(buf.end(), (const char*)n_ids->data(), (const char*)n_ids->data()+n_ids->size()*4);
+                dc++;
             }
         }
-        uint32_t fid = static_cast<uint32_t>(PatchFileId::ADMIN_VERTICES);
-        uint64_t os = old_av.size(), ns = new_av.size(), ss = av_seq.data.size();
-        uint32_t st = 8, n_fixups = 0;
-        wval(patch, &fid, 4); wval(patch, &st, 4);
-        wval(patch, &os, 8); wval(patch, &ns, 8);
-        wval(patch, &n_fixups, 4); wval(patch, &ss, 8);
-        patch.insert(patch.end(), av_seq.data.begin(), av_seq.data.end());
-        std::cerr << "  admin_vertices.bin: parent-derived seq=" << ss << " bytes ("
-                  << std::fixed << std::setprecision(2) << (ns > 0 ? ss * 100.0 / ns : 0) << "%)" << std::endl;
-    }
+        for (auto& [cid, ne] : new_cell_map) {
+            if (!d_set.count(cid)) {
+                auto& ids = get_new_ids(ne);
+                if (!ids.empty()) {
+                    wval(buf, &cid, 8); uint16_t c = ids.size(); wval(buf, &c, 2);
+                    buf.insert(buf.end(), (const char*)ids.data(), (const char*)ids.data()+ids.size()*4);
+                    dc++;
+                }
+            }
+        }
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(fid);
+        memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
+        { std::lock_guard<std::mutex> lock(log_mutex);
+          std::cerr << "  " << fname << ": " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl; }
+        return buf;
+    };
 
-    // --- Section: Entry/cell files as full new data ---
-    // These are small relative to data files and rebuilt by patch tool isn't reliable.
-    // Include them as full replacement. zstd transport compression handles the rest.
-    // Entry/cell files: NOT included.
-    // The patch tool reconstructs them from the derived ID remaps
-    // (extracted implicitly from the merge sequences above).
-    // geo_cells.bin, admin_cells.bin, and all entry files are rebuilt.
-    std::cerr << "  (entry/cell files: omitted, rebuilt by patch tool)" << std::endl;
-
-    // Include cell_id changes for entry reconstruction
+    std::vector<char> corr_se, corr_ae, corr_ie;
     {
-        // Geo cell changes
-        auto new_geo = read_file(new_dir + "/geo_cells.bin");
-        auto old_geo = read_file(old_dir + "/geo_cells.bin");
-        std::unordered_set<uint64_t> old_set, new_set;
-        for (size_t i = 0; i < old_geo.size() / 20; i++) {
-            uint64_t c; memcpy(&c, old_geo.data() + i * 20, 8); old_set.insert(c);
-        }
-        for (size_t i = 0; i < new_geo.size() / 20; i++) {
-            uint64_t c; memcpy(&c, new_geo.data() + i * 20, 8); new_set.insert(c);
-        }
-        std::vector<uint64_t> g_added, g_removed;
-        for (auto c : new_set) if (!old_set.count(c)) g_added.push_back(c);
-        for (auto c : old_set) if (!new_set.count(c)) g_removed.push_back(c);
-        std::sort(g_added.begin(), g_added.end());
-        std::sort(g_removed.begin(), g_removed.end());
+        std::thread tc1([&]() { corr_se = compute_geo_correction(PatchFileId::STREET_ENTRIES, "street_entries.bin",
+            derived.street_entries_data, 8, [](const NewCellEntries& e) -> const std::vector<uint32_t>& { return e.streets; }); });
+        std::thread tc2([&]() { corr_ae = compute_geo_correction(PatchFileId::ADDR_ENTRIES, "addr_entries.bin",
+            derived.addr_entries_data, 12, [](const NewCellEntries& e) -> const std::vector<uint32_t>& { return e.addrs; }); });
+        std::thread tc3([&]() { corr_ie = compute_geo_correction(PatchFileId::INTERP_ENTRIES, "interp_entries.bin",
+            derived.interp_entries_data, 16, [](const NewCellEntries& e) -> const std::vector<uint32_t>& { return e.interps; }); });
+        tc1.join(); tc2.join(); tc3.join();
+    }
+    patch.insert(patch.end(), corr_se.begin(), corr_se.end()); { std::vector<char>().swap(corr_se); }
+    patch.insert(patch.end(), corr_ae.begin(), corr_ae.end()); { std::vector<char>().swap(corr_ae); }
+    patch.insert(patch.end(), corr_ie.begin(), corr_ie.end()); { std::vector<char>().swap(corr_ie); }
+    derived = RebuiltGeo{}; new_cell_map.clear(); d_set.clear();
 
-        uint32_t marker = CELL_CHANGES_GEO_MARKER;
-        uint32_t na = g_added.size(), nr = g_removed.size();
-        wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
-        for (auto c : g_added) wval(patch, &c, 8);
-        for (auto c : g_removed) wval(patch, &c, 8);
-        std::cerr << "  Geo cell changes: +" << na << " -" << nr << " ("
-                  << (na + nr) * 8 << " bytes)" << std::endl;
-
-        // Admin cell changes
-        auto new_ac = read_file(new_dir + "/admin_cells.bin");
-        auto old_ac = read_file(old_dir + "/admin_cells.bin");
-        old_set.clear(); new_set.clear();
-        for (size_t i = 0; i < old_ac.size() / 12; i++) {
-            uint64_t c; memcpy(&c, old_ac.data() + i * 12, 8); old_set.insert(c);
-        }
-        for (size_t i = 0; i < new_ac.size() / 12; i++) {
-            uint64_t c; memcpy(&c, new_ac.data() + i * 12, 8); new_set.insert(c);
-        }
-        std::vector<uint64_t> a_added, a_removed;
-        for (auto c : new_set) if (!old_set.count(c)) a_added.push_back(c);
-        for (auto c : old_set) if (!new_set.count(c)) a_removed.push_back(c);
-        std::sort(a_added.begin(), a_added.end());
-        std::sort(a_removed.begin(), a_removed.end());
-
-        marker = CELL_CHANGES_ADMIN_MARKER;
-        na = a_added.size(); nr = a_removed.size();
-        wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
-        for (auto c : a_added) wval(patch, &c, 8);
-        for (auto c : a_removed) wval(patch, &c, 8);
-        std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl;
-
-        // Derive ID remaps from stored merge sequences (same as patch tool does)
-        auto derive_remap = [&](PatchFileId id, size_t old_size, size_t stride) -> std::unordered_map<uint32_t,uint32_t> {
-            auto it = stored_merges.find(static_cast<uint32_t>(id));
-            if (it == stored_merges.end()) return {};
-            auto vec = derive_id_remap_from_merge(it->second, old_size / stride, stride);
-            std::unordered_map<uint32_t,uint32_t> m;
-            for (uint32_t i = 0; i < vec.size(); i++)
-                if (vec[i] != 0xFFFFFFFF) m[i] = vec[i];
-            return m;
-        };
-
-        auto w_rm_d = derive_remap(PatchFileId::STREET_WAYS,
-            read_file(old_dir + "/street_ways.bin").size(), way_stride);
-        auto a_rm_d = derive_remap(PatchFileId::ADDR_POINTS,
-            read_file(old_dir + "/addr_points.bin").size(), 16);
-        auto i_rm_d = derive_remap(PatchFileId::INTERP_WAYS,
-            read_file(old_dir + "/interp_ways.bin").size(), interp_stride);
-        auto ad_rm_d = derive_remap(PatchFileId::ADMIN_POLYGONS,
-            read_file(old_dir + "/admin_polygons.bin").size(), admin_stride);
-
-        // Rebuild entries using derived remaps (same as patch tool)
-        auto old_se2 = read_file(old_dir + "/street_entries.bin");
-        auto old_ae2 = read_file(old_dir + "/addr_entries.bin");
-        auto old_ie2 = read_file(old_dir + "/interp_entries.bin");
-        auto derived = rebuild_geo_from_remap(old_geo, old_se2, old_ae2, old_ie2,
-                                               w_rm_d, a_rm_d, i_rm_d, g_added, g_removed);
+    // Admin corrections
+    {
         auto old_admc = read_file(old_dir + "/admin_cells.bin");
         auto old_adme = read_file(old_dir + "/admin_entries.bin");
         auto admin_derived = rebuild_admin_from_remap(old_admc, old_adme, ad_rm_d, a_added, a_removed);
-
-        // Cell-level entry corrections: compare derived vs new entries cell by cell.
-        // Include only cells whose entry data differs.
-        // This is fully custom — no zstd, no temp files.
-        auto write_entry_correction = [&](PatchFileId fid, const std::string& fname,
-                                           const std::vector<char>& derived_entries,
-                                           const std::vector<char>& derived_cells, size_t cell_stride,
-                                           size_t offset_pos) {
-            auto new_entries = read_file(new_dir + "/" + fname);
-            auto new_cells_data = read_file(new_dir + "/" +
-                (fid == PatchFileId::ADMIN_ENTRIES ? "admin_cells.bin" : "geo_cells.bin"));
-
-            // Parse both derived and new entries by cell
-            auto parse_all = [](const std::vector<char>& cells, size_t stride, size_t off_pos,
-                                 const std::vector<char>& entries)
-                -> std::vector<std::pair<uint64_t, std::vector<uint32_t>>>
-            {
-                size_t n = cells.size() / stride;
-                std::vector<std::pair<uint64_t, std::vector<uint32_t>>> result;
-                result.reserve(n);
-                for (size_t i = 0; i < n; i++) {
-                    uint64_t cid; memcpy(&cid, cells.data() + i * stride, 8);
-                    uint32_t off; memcpy(&off, cells.data() + i * stride + off_pos, 4);
-                    std::vector<uint32_t> ids;
-                    if (off != 0xFFFFFFFF && off + 2 <= entries.size()) {
-                        uint16_t count; memcpy(&count, entries.data() + off, 2);
-                        if (off + 2 + count * 4 <= entries.size()) {
-                            ids.resize(count);
-                            memcpy(ids.data(), entries.data() + off + 2, count * 4);
-                        }
-                    }
-                    result.push_back({cid, std::move(ids)});
-                }
-                return result;
-            };
-
-            auto derived_parsed = parse_all(derived_cells, cell_stride, offset_pos, derived_entries);
-            auto new_parsed = parse_all(new_cells_data,
-                cell_stride == 12 ? 12 : 20,
-                cell_stride == 12 ? 8 : offset_pos,
-                new_entries);
-
-            // Build new cell map for lookup
-            std::unordered_map<uint64_t, const std::vector<uint32_t>*> new_map;
-            for (auto& [cid, ids] : new_parsed) new_map[cid] = &ids;
-
-            // Find differing cells
-            std::vector<char> corr_data;
-            uint32_t diff_count = 0;
-            for (auto& [cid, d_ids] : derived_parsed) {
-                auto it = new_map.find(cid);
-                const std::vector<uint32_t>* n_ids = nullptr;
-                if (it != new_map.end()) n_ids = it->second;
-
-                bool differs = false;
-                if (!n_ids) { differs = !d_ids.empty(); }
-                else if (d_ids.size() != n_ids->size()) { differs = true; }
-                else if (!d_ids.empty() && memcmp(d_ids.data(), n_ids->data(), d_ids.size() * 4) != 0) { differs = true; }
-
-                if (differs) {
-                    wval(corr_data, &cid, 8);
-                    uint16_t count = n_ids ? static_cast<uint16_t>(n_ids->size()) : 0;
-                    wval(corr_data, &count, 2);
-                    if (n_ids && !n_ids->empty())
-                        corr_data.insert(corr_data.end(), (const char*)n_ids->data(),
-                                        (const char*)n_ids->data() + n_ids->size() * 4);
-                    diff_count++;
-                }
+        auto new_admc = read_file(new_dir + "/admin_cells.bin");
+        auto new_adme = read_file(new_dir + "/admin_entries.bin");
+        auto parse_admin = [&](const std::vector<char>& cells, const std::vector<char>& entries)
+            -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
+            std::unordered_map<uint64_t, std::vector<uint32_t>> m;
+            for (size_t i = 0; i < cells.size() / 12; i++) {
+                uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
+                uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
+                m[cid] = parse_ids(entries, off);
             }
-            // Also check for cells only in new (not in derived)
-            std::unordered_set<uint64_t> derived_set;
-            for (auto& [cid, _] : derived_parsed) derived_set.insert(cid);
-            for (auto& [cid, ids] : new_parsed) {
-                if (!derived_set.count(cid) && !ids.empty()) {
-                    wval(corr_data, &cid, 8);
-                    uint16_t count = static_cast<uint16_t>(ids.size());
-                    wval(corr_data, &count, 2);
-                    corr_data.insert(corr_data.end(), (const char*)ids.data(),
-                                    (const char*)ids.data() + ids.size() * 4);
-                    diff_count++;
-                }
-            }
-
-            uint32_t marker = ENTRY_CORRECTION_MARKER;
-            uint32_t file = static_cast<uint32_t>(fid);
-            wval(patch, &marker, 4);
-            wval(patch, &file, 4);
-            wval(patch, &diff_count, 4);
-            patch.insert(patch.end(), corr_data.begin(), corr_data.end());
-            std::cerr << "  " << fname << ": " << diff_count << " cell corrections ("
-                      << corr_data.size() << " bytes)" << std::endl;
+            return m;
         };
-
-        // Geo entries: street, addr, interp
-        write_entry_correction(PatchFileId::STREET_ENTRIES, "street_entries.bin",
-            derived.street_entries_data, derived.geo_cells_data, 20, 8);
-        write_entry_correction(PatchFileId::ADDR_ENTRIES, "addr_entries.bin",
-            derived.addr_entries_data, derived.geo_cells_data, 20, 12);
-        write_entry_correction(PatchFileId::INTERP_ENTRIES, "interp_entries.bin",
-            derived.interp_entries_data, derived.geo_cells_data, 20, 16);
-        // Admin entries
-        write_entry_correction(PatchFileId::ADMIN_ENTRIES, "admin_entries.bin",
-            admin_derived.admin_entries_data, admin_derived.admin_cells_data, 12, 8);
-
-        // Cell flag corrections: identify cells whose has_street/has_addr/has_interp
-        // flags differ between old and new. Only ~3K cells typically.
-        // The patch tool uses these to correctly assign entry offsets during geo_cells rebuild.
-        {
-            auto new_geo_data = read_file(new_dir + "/geo_cells.bin");
-            std::unordered_map<uint64_t, uint8_t> old_cell_flags;
-            for (size_t i = 0; i < old_geo.size() / 20; i++) {
-                uint64_t cid; memcpy(&cid, old_geo.data() + i * 20, 8);
-                uint32_t s, a, ip;
-                memcpy(&s, old_geo.data()+i*20+8, 4); memcpy(&a, old_geo.data()+i*20+12, 4);
-                memcpy(&ip, old_geo.data()+i*20+16, 4);
-                uint8_t flags = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
-                old_cell_flags[cid] = flags;
-            }
-            std::vector<std::pair<uint64_t, uint8_t>> flag_corrections;
-            for (size_t i = 0; i < new_geo_data.size() / 20; i++) {
-                uint64_t cid; memcpy(&cid, new_geo_data.data() + i * 20, 8);
-                uint32_t s, a, ip;
-                memcpy(&s, new_geo_data.data()+i*20+8, 4); memcpy(&a, new_geo_data.data()+i*20+12, 4);
-                memcpy(&ip, new_geo_data.data()+i*20+16, 4);
-                uint8_t new_flags = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
-                auto it = old_cell_flags.find(cid);
-                uint8_t old_f = (it != old_cell_flags.end()) ? it->second : 0;
-                if (new_flags != old_f)
-                    flag_corrections.push_back({cid, new_flags});
-            }
-            uint32_t fm = CELL_FLAGS_MARKER;
-            uint32_t fc = static_cast<uint32_t>(flag_corrections.size());
-            wval(patch, &fm, 4); wval(patch, &fc, 4);
-            for (auto& [cid, flags] : flag_corrections) {
-                wval(patch, &cid, 8); wval(patch, &flags, 1);
-            }
-            std::cerr << "  Cell flag corrections: " << fc << " cells ("
-                      << fc * 9 << " bytes)" << std::endl;
+        auto dm = parse_admin(admin_derived.admin_cells_data, admin_derived.admin_entries_data);
+        auto nm = parse_admin(new_admc, new_adme);
+        std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
+        for (auto& [cid, nids] : nm) {
+            auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
+            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
+                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
+            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
+                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
         }
+        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::ADMIN_ENTRIES);
+        memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
+        patch.insert(patch.end(), buf.begin(), buf.end());
+        std::cerr << "  admin_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
+    }
+    log_time("Entry corrections", t2);
+
+    // Cell flag corrections
+    {
+        auto new_geo_data = read_file(new_dir + "/geo_cells.bin");
+        std::unordered_map<uint64_t, uint8_t> old_cell_flags;
+        for (size_t i = 0; i < old_geo.size() / 20; i++) {
+            uint64_t cid; memcpy(&cid, old_geo.data()+i*20, 8);
+            uint32_t s, a, ip; memcpy(&s, old_geo.data()+i*20+8, 4);
+            memcpy(&a, old_geo.data()+i*20+12, 4); memcpy(&ip, old_geo.data()+i*20+16, 4);
+            old_cell_flags[cid] = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
+        }
+        std::vector<std::pair<uint64_t, uint8_t>> flag_corrections;
+        for (size_t i = 0; i < new_geo_data.size() / 20; i++) {
+            uint64_t cid; memcpy(&cid, new_geo_data.data()+i*20, 8);
+            uint32_t s, a, ip; memcpy(&s, new_geo_data.data()+i*20+8, 4);
+            memcpy(&a, new_geo_data.data()+i*20+12, 4); memcpy(&ip, new_geo_data.data()+i*20+16, 4);
+            uint8_t nf = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
+            auto it = old_cell_flags.find(cid);
+            if (nf != (it != old_cell_flags.end() ? it->second : 0))
+                flag_corrections.push_back({cid, nf});
+        }
+        uint32_t fm = CELL_FLAGS_MARKER, fc = flag_corrections.size();
+        wval(patch, &fm, 4); wval(patch, &fc, 4);
+        for (auto& [cid, flags] : flag_corrections) { wval(patch, &cid, 8); wval(patch, &flags, 1); }
+        std::cerr << "  Cell flag corrections: " << fc << " cells" << std::endl;
     }
 
     // End marker
@@ -992,13 +1041,15 @@ int main(int argc, char* argv[]) {
 
     // Compress whole patch with zstd for transport
     {
+        double tc = now_ms();
         std::string raw_path = tmpdir + "/patch.raw";
         write_file(raw_path, patch);
-        std::string cmd = "zstd -19 '" + raw_path + "' -o '" + patch_path + "' -f --quiet 2>/dev/null";
+        std::string cmd = "zstd -19 -T0 '" + raw_path + "' -o '" + patch_path + "' -f --quiet 2>/dev/null";
         system(cmd.c_str());
         auto compressed = read_file(patch_path);
         std::cerr << "Compressed patch: " << compressed.size() << " bytes ("
                   << compressed.size() / 1024 / 1024 << " MiB)" << std::endl;
+        log_time("zstd -19 -T0 compression", tc);
         remove(raw_path.c_str());
     }
 

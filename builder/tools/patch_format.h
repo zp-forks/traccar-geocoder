@@ -265,6 +265,13 @@ static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
 // flags: bit 0 = has_street, bit 1 = has_addr, bit 2 = has_interp
 static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 
+// Secondary ID remap marker: 0xFFFFFFF6
+// Additional old→new ID mappings for modified records (recovered by relaxed key matching).
+// Both diff and patch tools must apply these to their derived remaps for consistent results.
+// Format: marker(4), n_files(4),
+//   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
+static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
+
 // --- Shared entry rebuild logic ---
 // Used by both diff and patch tools to produce identical rebuilt entries.
 // Takes old geo_cells + old entries + ID remap → produces rebuilt entries + geo_cells.
@@ -374,6 +381,82 @@ inline RebuiltGeo rebuild_geo_from_remap(
         result.geo_cells_data.insert(result.geo_cells_data.end(), (const char*)&iv, (const char*)&iv + 4);
     }
 
+    return result;
+}
+
+// Vector-based overload: much faster for diff tool where IDs are dense sequential indices.
+// remap[old_id] = new_id, or 0xFFFFFFFF if unmapped.
+inline RebuiltGeo rebuild_geo_from_remap_vec(
+    const std::vector<char>& old_geo,
+    const std::vector<char>& old_se, const std::vector<char>& old_ae, const std::vector<char>& old_ie,
+    const std::vector<uint32_t>& way_rm,
+    const std::vector<uint32_t>& addr_rm,
+    const std::vector<uint32_t>& interp_rm,
+    const std::vector<uint64_t>& added_cells = {},
+    const std::vector<uint64_t>& removed_cells = {})
+{
+    size_t n_cells = old_geo.size() / 20;
+    auto parse_entry = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
+        if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
+        uint16_t count; memcpy(&count, data.data() + off, 2);
+        if (off + 2 + count * 4 > data.size()) return {};
+        std::vector<uint32_t> ids(count);
+        memcpy(ids.data(), data.data() + off + 2, count * 4);
+        return ids;
+    };
+    auto remap_ids_vec = [](std::vector<uint32_t>& ids, const std::vector<uint32_t>& rm) {
+        for (auto& id : ids)
+            if (id < rm.size() && rm[id] != 0xFFFFFFFF) id = rm[id];
+        std::sort(ids.begin(), ids.end());
+    };
+    struct CellData { uint64_t cell_id; std::vector<uint32_t> streets, addrs, interps; };
+    std::vector<CellData> cells(n_cells);
+    for (size_t i = 0; i < n_cells; i++) {
+        memcpy(&cells[i].cell_id, old_geo.data() + i * 20, 8);
+        uint32_t s_off, a_off, i_off;
+        memcpy(&s_off, old_geo.data() + i * 20 + 8, 4);
+        memcpy(&a_off, old_geo.data() + i * 20 + 12, 4);
+        memcpy(&i_off, old_geo.data() + i * 20 + 16, 4);
+        cells[i].streets = parse_entry(old_se, s_off);
+        cells[i].addrs = parse_entry(old_ae, a_off);
+        cells[i].interps = parse_entry(old_ie, i_off);
+        remap_ids_vec(cells[i].streets, way_rm);
+        remap_ids_vec(cells[i].addrs, addr_rm);
+        remap_ids_vec(cells[i].interps, interp_rm);
+    }
+    if (!removed_cells.empty()) {
+        std::unordered_set<uint64_t> rs(removed_cells.begin(), removed_cells.end());
+        cells.erase(std::remove_if(cells.begin(), cells.end(), [&](const CellData& c) { return rs.count(c.cell_id); }), cells.end());
+    }
+    if (!added_cells.empty()) {
+        for (uint64_t cid : added_cells) { CellData cd; cd.cell_id = cid; cells.push_back(cd); }
+        std::sort(cells.begin(), cells.end(), [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
+    }
+    RebuiltGeo result;
+    uint32_t no_data = 0xFFFFFFFF;
+    auto write_entries = [&](std::vector<char>& buf, const auto& getter) -> std::unordered_map<uint64_t, uint32_t> {
+        std::unordered_map<uint64_t, uint32_t> offsets;
+        for (auto& c : cells) {
+            const auto& ids = getter(c);
+            if (ids.empty()) continue;
+            offsets[c.cell_id] = static_cast<uint32_t>(buf.size());
+            uint16_t count = static_cast<uint16_t>(ids.size());
+            buf.insert(buf.end(), (const char*)&count, (const char*)&count + 2);
+            buf.insert(buf.end(), (const char*)ids.data(), (const char*)ids.data() + ids.size() * 4);
+        }
+        return offsets;
+    };
+    auto s_off = write_entries(result.street_entries_data, [](const CellData& c) -> const std::vector<uint32_t>& { return c.streets; });
+    auto a_off = write_entries(result.addr_entries_data, [](const CellData& c) -> const std::vector<uint32_t>& { return c.addrs; });
+    auto i_off = write_entries(result.interp_entries_data, [](const CellData& c) -> const std::vector<uint32_t>& { return c.interps; });
+    for (auto& c : cells) {
+        result.geo_cells_data.insert(result.geo_cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
+        auto get = [&](const auto& m) -> uint32_t { auto it = m.find(c.cell_id); return it != m.end() ? it->second : no_data; };
+        uint32_t sv = get(s_off), av = get(a_off), iv = get(i_off);
+        result.geo_cells_data.insert(result.geo_cells_data.end(), (const char*)&sv, (const char*)&sv + 4);
+        result.geo_cells_data.insert(result.geo_cells_data.end(), (const char*)&av, (const char*)&av + 4);
+        result.geo_cells_data.insert(result.geo_cells_data.end(), (const char*)&iv, (const char*)&iv + 4);
+    }
     return result;
 }
 
