@@ -231,11 +231,29 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (file_id == SECONDARY_REMAP_MARKER) {
+            // Apply secondary remaps directly to the temp remap files on disk
             uint32_t nf = ru32();
             for (uint32_t f = 0; f < nf; f++) {
                 uint32_t fid = ru32(), np = ru32();
-                auto& rm = id_remaps[fid];
-                for (uint32_t i = 0; i < np; i++) { uint32_t o = ru32(), n = ru32(); if (o < rm.size()) rm[o] = n; }
+                std::string remap_path = tmpdir + "/remap_" + std::to_string(fid) + ".bin";
+                // Open remap file for read-write
+                int rfd = open(remap_path.c_str(), O_RDWR);
+                if (rfd >= 0) {
+                    struct stat st; fstat(rfd, &st);
+                    size_t remap_size = st.st_size;
+                    uint32_t* remap_data = static_cast<uint32_t*>(
+                        mmap(nullptr, remap_size, PROT_READ | PROT_WRITE, MAP_SHARED, rfd, 0));
+                    size_t remap_count = remap_size / 4;
+                    for (uint32_t i = 0; i < np; i++) {
+                        uint32_t o = ru32(), n = ru32();
+                        if (o < remap_count) remap_data[o] = n;
+                    }
+                    munmap(remap_data, remap_size);
+                    close(rfd);
+                } else {
+                    // Skip data if file doesn't exist
+                    for (uint32_t i = 0; i < np; i++) { ru32(); ru32(); }
+                }
                 std::cerr << "  Secondary remap " << fid << ": " << np << " pairs" << std::endl;
             }
             continue;
@@ -394,10 +412,16 @@ int main(int argc, char* argv[]) {
         fixups_sorted.clear(); fixups_sorted.shrink_to_fit();
 
         if (track) {
-            id_remaps[file_id] = std::move(id_map);
+            // Write id_map to temp file to avoid keeping all remaps in memory simultaneously
+            std::string remap_path = tmpdir + "/remap_" + std::to_string(file_id) + ".bin";
+            FILE* rf = fopen(remap_path.c_str(), "wb");
+            fwrite(id_map.data(), 4, id_map.size(), rf);
+            fclose(rf);
+            id_remaps[file_id] = {}; // store empty placeholder (will mmap from disk later)
             size_t matched = 0;
-            for (auto v : id_remaps[file_id]) if (v != 0xFFFFFFFF) matched++;
-            std::cerr << "  " << fname << ": " << written << " bytes (mapped " << matched << "/" << id_remaps[file_id].size() << ")" << std::endl;
+            for (auto v : id_map) if (v != 0xFFFFFFFF) matched++;
+            std::cerr << "  " << fname << ": " << written << " bytes (mapped " << matched << "/" << id_map.size()
+                      << ", remap saved to disk)" << std::endl;
         } else {
             std::cerr << "  " << fname << ": " << written << " bytes" << std::endl;
         }
@@ -415,13 +439,26 @@ int main(int argc, char* argv[]) {
         double t_entry = now_ms();
         std::cerr << "Entry pipeline (lean streaming)..." << std::endl;
 
-        auto get_rm = [&](PatchFileId fid) -> const std::vector<uint32_t>& {
-            static std::vector<uint32_t> empty;
-            auto it = id_remaps.find((uint32_t)fid); return it != id_remaps.end() ? it->second : empty;
+        // mmap remap files from disk (only pages accessed are in RSS)
+        auto mmap_remap = [&](PatchFileId fid) -> MappedFile {
+            std::string path = tmpdir + "/remap_" + std::to_string((uint32_t)fid) + ".bin";
+            auto m = mmap_file(path);
+            if (m.data) madvise(const_cast<char*>(m.data), m.size, MADV_SEQUENTIAL);
+            return m;
         };
-        auto& w_rm = get_rm(PatchFileId::STREET_WAYS);
-        auto& a_rm = get_rm(PatchFileId::ADDR_POINTS);
-        auto& i_rm = get_rm(PatchFileId::INTERP_WAYS);
+        // Helper: look up remap value from mmap'd file
+        struct RemapRef {
+            const uint32_t* data;
+            size_t count;
+            uint32_t operator[](size_t i) const { return i < count ? data[i] : 0xFFFFFFFF; }
+            size_t size() const { return count; }
+        };
+        MappedFile m_w_rm = mmap_remap(PatchFileId::STREET_WAYS);
+        MappedFile m_a_rm = mmap_remap(PatchFileId::ADDR_POINTS);
+        MappedFile m_i_rm = mmap_remap(PatchFileId::INTERP_WAYS);
+        RemapRef w_rm = {(const uint32_t*)m_w_rm.data, m_w_rm.size / 4};
+        RemapRef a_rm = {(const uint32_t*)m_a_rm.data, m_a_rm.size / 4};
+        RemapRef i_rm = {(const uint32_t*)m_i_rm.data, m_i_rm.size / 4};
 
         // mmap old files (zero RSS until pages are accessed, then only working set)
         MappedFile m_geo = mmap_file(cur_dir + "/geo_cells.bin");
@@ -466,8 +503,9 @@ int main(int argc, char* argv[]) {
             buf.resize(c);
             memcpy(buf.data(), f.data + off + 2, c * 4);
         };
-        auto remap = [](std::vector<uint32_t>& ids, const std::vector<uint32_t>& rm) {
-            for (auto& id : ids) if (id < rm.size() && rm[id] != NO) id = rm[id];
+        auto remap = [](std::vector<uint32_t>& ids, const RemapRef& rm) {
+            constexpr uint32_t NO2 = 0xFFFFFFFF;
+            for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
             std::sort(ids.begin(), ids.end());
         };
         // Write entry and return offset, or NO if empty
@@ -486,7 +524,7 @@ int main(int argc, char* argv[]) {
 
         auto process_cell = [&](uint64_t cid, int32_t oi) {
             // For each entry type: check correction → remap old → write
-            auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const std::vector<uint32_t>& rm,
+            auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RemapRef& rm,
                                 const std::unordered_map<uint64_t, const std::vector<uint32_t>*>& corr,
                                 FILE* outf, uint8_t flag_bit) -> uint32_t {
                 // Check flag
@@ -545,6 +583,7 @@ int main(int argc, char* argv[]) {
 
         fclose(f_geo); fclose(f_se); fclose(f_ae); fclose(f_ie);
         unmap_file(m_geo); unmap_file(m_se); unmap_file(m_ae); unmap_file(m_ie);
+        unmap_file(m_w_rm); unmap_file(m_a_rm); unmap_file(m_i_rm);
         std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
         malloc_trim(0);
         log_phase("  Geo entries complete", t_entry);
@@ -553,10 +592,13 @@ int main(int argc, char* argv[]) {
         {
             uint32_t no_data = 0xFFFFFFFF;
             std::unordered_map<uint32_t,uint32_t> ad_rm;
-            auto ait = id_remaps.find((uint32_t)PatchFileId::ADMIN_POLYGONS);
-            if (ait != id_remaps.end()) {
-                for (uint32_t i = 0; i < ait->second.size(); i++)
-                    if (ait->second[i] != 0xFFFFFFFF) ad_rm[i] = ait->second[i];
+            MappedFile m_ad_rm = mmap_remap(PatchFileId::ADMIN_POLYGONS);
+            if (m_ad_rm.data) {
+                const uint32_t* ad_vec = (const uint32_t*)m_ad_rm.data;
+                size_t ad_count = m_ad_rm.size / 4;
+                for (uint32_t i = 0; i < ad_count; i++)
+                    if (ad_vec[i] != 0xFFFFFFFF) ad_rm[i] = ad_vec[i];
+                unmap_file(m_ad_rm);
             }
             auto old_ac = read_file(cur_dir + "/admin_cells.bin");
             auto old_adme = read_file(cur_dir + "/admin_entries.bin");
