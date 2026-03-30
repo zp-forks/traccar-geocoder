@@ -362,26 +362,39 @@ int main(int argc, char* argv[]) {
         bool needs_padding = (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24) ||
                              (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24);
 
-        // Read fixup data position (applied inline during merge replay)
+        // Read fixup data — decoded lazily during merge replay (zero allocation)
         uint32_t n_fixups = ru32();
-        size_t fixup_data_pos = pos; // position of delta-encoded fixup data in patch
+        size_t fixup_data_pos = pos;
         if (n_fixups > 0) {
             uint32_t delta_size = ru32();
             fixup_data_pos = pos;
-            pos += delta_size; // skip past fixup data
+            pos += delta_size;
         }
-        // Build sorted fixup array (decode delta-encoded, ~2 bytes/entry instead of ~40 bytes/entry in hash map)
-        std::vector<std::pair<uint32_t,uint32_t>> fixups_sorted;
-        if (n_fixups > 0) {
-            fixups_sorted.reserve(n_fixups);
-            uint32_t pi = 0, pv = 0; size_t fp = fixup_data_pos;
-            for (uint32_t i = 0; i < n_fixups; i++) {
-                uint32_t idx = pi + read_varint(P, fp);
-                uint32_t val = pv + read_varint(P, fp);
-                fixups_sorted.push_back({idx, val});
-                pi = idx; pv = val;
+        // Lazy fixup decoder state (reads from patch mmap on demand)
+        struct FixupDecoder {
+            const char* data; size_t read_pos;
+            uint32_t prev_idx = 0, prev_val = 0;
+            uint32_t cur_idx = UINT32_MAX, cur_val = 0;
+            uint32_t remaining;
+            void init(const char* d, size_t p, uint32_t count) {
+                data = d; read_pos = p; remaining = count;
+                if (remaining > 0) advance();
             }
-        }
+            void advance() {
+                if (remaining == 0) { cur_idx = UINT32_MAX; return; }
+                cur_idx = prev_idx + read_varint(data, read_pos);
+                cur_val = prev_val + read_varint(data, read_pos);
+                prev_idx = cur_idx; prev_val = cur_val;
+                remaining--;
+            }
+            // Advance past all fixups with index < target
+            bool lookup(uint32_t target_idx, uint32_t& out_val) {
+                while (cur_idx < target_idx && (remaining > 0 || cur_idx != UINT32_MAX)) advance();
+                if (cur_idx == target_idx) { out_val = cur_val; advance(); return true; }
+                return false;
+            }
+        } fixup_dec;
+        fixup_dec.init(P, fixup_data_pos, n_fixups);
 
         // Get string remap field offsets for this file type
         std::vector<size_t> remap_offs;
@@ -422,7 +435,6 @@ int main(int argc, char* argv[]) {
         std::vector<char> rec_buf(actual_stride);
 
         size_t old_rec = 0, new_rec = 0, old_bytes = 0, written = 0;
-        size_t fixup_cursor = 0; // cursor into fixups_sorted for sequential access
         while (pos < seq_end) {
             uint8_t op = P[pos++];
             uint32_t count; memcpy(&count, P+pos, 4); pos += 4;
@@ -434,15 +446,10 @@ int main(int argc, char* argv[]) {
                     bool modified = false;
                     // Check if this record needs any modification
                     if (!remap_offs.empty() || needs_padding) modified = true;
-                    // Check fixup using sequential cursor (fixups are sorted by record index)
+                    // Check fixup using lazy decoder (reads from patch mmap, zero allocation)
                     uint32_t fixup_val = 0;
-                    bool has_fixup = false;
-                    while (fixup_cursor < fixups_sorted.size() && fixups_sorted[fixup_cursor].first < old_rec + k)
-                        fixup_cursor++;
-                    if (fixup_cursor < fixups_sorted.size() && fixups_sorted[fixup_cursor].first == old_rec + k) {
-                        has_fixup = true; fixup_val = fixups_sorted[fixup_cursor].second;
-                        modified = true; fixup_cursor++;
-                    }
+                    bool has_fixup = fixup_dec.lookup(old_rec + k, fixup_val);
+                    if (has_fixup) modified = true;
 
                     if (modified) {
                         memcpy(rec_buf.data(), old_mmap.data + rec_off, actual_stride);
@@ -481,7 +488,6 @@ int main(int argc, char* argv[]) {
         }
         fclose(outf);
         unmap_file(old_mmap);
-        fixups_sorted.clear(); fixups_sorted.shrink_to_fit();
 
         if (track) {
             // Sync and munmap the file-backed remap (data is already on disk)
@@ -548,15 +554,26 @@ int main(int argc, char* argv[]) {
         madvise(const_cast<char*>(m_ie.data), m_ie.size, MADV_SEQUENTIAL);
         size_t n_old = m_geo.size / 20;
 
-        // Build correction maps + removed set (small memory)
+        // Build sorted correction vectors + removed set (better cache locality than hash maps)
         std::unordered_set<uint64_t> rm_set(geo_removed.begin(), geo_removed.end());
-        std::unordered_map<uint64_t, const std::vector<uint32_t>*> cs, ca, ci_map;
+        struct CorrEntry { uint64_t cid; const std::vector<uint32_t>* ids; };
+        std::vector<CorrEntry> cs, ca, ci_map;
         for (auto& [fid, list] : entry_corrections) {
-            auto* m = (fid == (uint32_t)PatchFileId::STREET_ENTRIES) ? &cs :
+            auto* v = (fid == (uint32_t)PatchFileId::STREET_ENTRIES) ? &cs :
                       (fid == (uint32_t)PatchFileId::ADDR_ENTRIES) ? &ca :
                       (fid == (uint32_t)PatchFileId::INTERP_ENTRIES) ? &ci_map : nullptr;
-            if (m) for (auto& c : list) (*m)[c.cell_id] = &c.ids;
+            if (v) for (auto& c : list) v->push_back({c.cell_id, &c.ids});
         }
+        auto corr_cmp = [](const CorrEntry& a, const CorrEntry& b) { return a.cid < b.cid; };
+        std::sort(cs.begin(), cs.end(), corr_cmp);
+        std::sort(ca.begin(), ca.end(), corr_cmp);
+        std::sort(ci_map.begin(), ci_map.end(), corr_cmp);
+        // Binary search helper
+        auto corr_find = [](const std::vector<CorrEntry>& v, uint64_t cid) -> const std::vector<uint32_t>* {
+            auto it = std::lower_bound(v.begin(), v.end(), CorrEntry{cid, nullptr},
+                [](const CorrEntry& a, const CorrEntry& b) { return a.cid < b.cid; });
+            return (it != v.end() && it->cid == cid) ? it->ids : nullptr;
+        };
         // Added cells sorted
         std::sort(geo_added.begin(), geo_added.end());
         log_phase("  Setup", t_entry);
@@ -603,7 +620,7 @@ int main(int argc, char* argv[]) {
         auto process_cell = [&](uint64_t cid, int32_t oi) {
             // For each entry type: check correction → remap old → write
             auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RemapRef& rm,
-                                const std::unordered_map<uint64_t, const std::vector<uint32_t>*>& corr,
+                                const std::vector<CorrEntry>& corr,
                                 FILE* outf, uint8_t flag_bit) -> uint32_t {
                 // Check flag
                 bool has = false;
@@ -616,11 +633,11 @@ int main(int argc, char* argv[]) {
                 }
                 auto fc = flag_corrections.find(cid);
                 if (fc != flag_corrections.end()) has = (fc->second & flag_bit) != 0;
-                if (corr.count(cid)) has = true;
+                auto* corr_ids = corr_find(corr, cid);
+                if (corr_ids) has = true;
                 if (!has) return NO;
 
-                auto cit = corr.find(cid);
-                if (cit != corr.end()) return emit(outf, cit->second->data(), cit->second->size());
+                if (corr_ids) return emit(outf, corr_ids->data(), corr_ids->size());
 
                 if (oi < 0) return NO;
                 if ((size_t)oi * 20 + geo_off + 4 > m_geo.size) return NO;
