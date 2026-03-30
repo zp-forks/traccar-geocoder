@@ -276,57 +276,111 @@ int main(int argc, char* argv[]) {
         else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) actual_stride = interp_stride;
         else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) actual_stride = admin_stride;
 
-        // Load old file into mutable buffer (need to apply remap + fixups)
-        // For large files (nodes/vertices), this is the peak memory per file.
-        // Files are processed sequentially, so only one is in memory at a time.
-        auto old_data = read_file(cur_dir + "/" + std::string(fname));
+        // Determine if this file needs in-memory modifications
+        bool needs_remap = (file_id == (uint32_t)PatchFileId::ADDR_POINTS ||
+                            file_id == (uint32_t)PatchFileId::STREET_WAYS ||
+                            file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
+                            file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS);
+        bool needs_padding = (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24) ||
+                             (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24);
 
-        // Zero padding
-        if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
-            for (size_t i = 0; i + actual_stride <= old_data.size(); i += actual_stride) memset(old_data.data()+i+13, 0, 3);
-        if (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24)
-            for (size_t i = 0; i + actual_stride <= old_data.size(); i += actual_stride) { memset(old_data.data()+i+5, 0, 3); memset(old_data.data()+i+21, 0, 3); }
-
-        apply_str_remap(old_data, file_id, actual_stride);
-
-        // Apply fixups
+        // Read fixup data position (applied inline during merge replay)
         uint32_t n_fixups = ru32();
+        size_t fixup_data_pos = pos; // position of delta-encoded fixup data in patch
         if (n_fixups > 0) {
             uint32_t delta_size = ru32();
-            uint32_t pi = 0, pv = 0; size_t fp = pos;
+            fixup_data_pos = pos;
+            pos += delta_size; // skip past fixup data
+        }
+        // Build sorted fixup array (decode delta-encoded, ~2 bytes/entry instead of ~40 bytes/entry in hash map)
+        std::vector<std::pair<uint32_t,uint32_t>> fixups_sorted;
+        if (n_fixups > 0) {
+            fixups_sorted.reserve(n_fixups);
+            uint32_t pi = 0, pv = 0; size_t fp = fixup_data_pos;
             for (uint32_t i = 0; i < n_fixups; i++) {
                 uint32_t idx = pi + read_varint(P, fp);
                 uint32_t val = pv + read_varint(P, fp);
-                if ((size_t)idx * actual_stride + 4 <= old_data.size())
-                    memcpy(old_data.data() + (size_t)idx * actual_stride, &val, 4);
+                fixups_sorted.push_back({idx, val});
                 pi = idx; pv = val;
             }
-            pos = fp;
         }
 
-        // Replay merge sequence — stream output directly to file
+        // Get string remap field offsets for this file type
+        std::vector<size_t> remap_offs;
+        if (!str_remap.empty() && needs_remap) {
+            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = {8, 12};
+            else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? 8ul : 5ul};
+            else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? 8ul : 5ul};
+            else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {8};
+        }
+
+        // mmap old file read-only (zero allocation)
+        MappedFile old_mmap = mmap_file(cur_dir + "/" + std::string(fname));
+        madvise(const_cast<char*>(old_mmap.data), old_mmap.size, MADV_SEQUENTIAL);
+        size_t n_old_records = old_mmap.size / actual_stride;
+
+        // Replay merge sequence — stream output, apply remap/fixups per-record inline
         uint64_t seq_size = ru64();
         size_t seq_end = pos + seq_size;
         FILE* outf = fopen((out_dir + "/" + fname).c_str(), "wb");
 
-        // Track ID remap (only for data files that need entry reconstruction)
-        bool track = (file_id == (uint32_t)PatchFileId::ADDR_POINTS ||
-                      file_id == (uint32_t)PatchFileId::STREET_WAYS ||
-                      file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
-                      file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS);
+        bool track = needs_remap; // track ID remap only for data files
         std::vector<uint32_t> id_map;
-        if (track) id_map.assign(old_data.size() / actual_stride, 0xFFFFFFFF);
+        if (track) id_map.assign(n_old_records, 0xFFFFFFFF);
+
+        // Per-record buffer for applying remap/fixups inline (avoid copying entire file)
+        std::vector<char> rec_buf(actual_stride);
 
         size_t old_rec = 0, new_rec = 0, old_bytes = 0, written = 0;
+        size_t fixup_cursor = 0; // cursor into fixups_sorted for sequential access
         while (pos < seq_end) {
             uint8_t op = P[pos++];
             uint32_t count; memcpy(&count, P+pos, 4); pos += 4;
             if (op == OP_MATCH_RUN) {
-                size_t bytes = count * actual_stride;
-                fwrite(old_data.data() + old_bytes, 1, bytes, outf);
-                written += bytes;
-                if (track) for (uint32_t k = 0; k < count; k++) if (old_rec+k < id_map.size()) id_map[old_rec+k] = new_rec+k;
-                old_rec += count; new_rec += count; old_bytes += bytes;
+                for (uint32_t k = 0; k < count; k++) {
+                    size_t rec_off = old_bytes + k * actual_stride;
+                    if (rec_off + actual_stride > old_mmap.size) break;
+
+                    bool modified = false;
+                    // Check if this record needs any modification
+                    if (!remap_offs.empty() || needs_padding) modified = true;
+                    // Check fixup using sequential cursor (fixups are sorted by record index)
+                    uint32_t fixup_val = 0;
+                    bool has_fixup = false;
+                    while (fixup_cursor < fixups_sorted.size() && fixups_sorted[fixup_cursor].first < old_rec + k)
+                        fixup_cursor++;
+                    if (fixup_cursor < fixups_sorted.size() && fixups_sorted[fixup_cursor].first == old_rec + k) {
+                        has_fixup = true; fixup_val = fixups_sorted[fixup_cursor].second;
+                        modified = true; fixup_cursor++;
+                    }
+
+                    if (modified) {
+                        memcpy(rec_buf.data(), old_mmap.data + rec_off, actual_stride);
+                        // Apply padding zeroing
+                        if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
+                            memset(rec_buf.data() + 13, 0, 3);
+                        if (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24) {
+                            memset(rec_buf.data() + 5, 0, 3);
+                            memset(rec_buf.data() + 21, 0, 3);
+                        }
+                        // Apply string remap
+                        for (size_t off : remap_offs) {
+                            uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
+                            auto it = str_remap.find(v);
+                            if (it != str_remap.end()) memcpy(rec_buf.data() + off, &it->second, 4);
+                        }
+                        // Apply fixup (node_offset/vertex_offset at byte 0)
+                        if (has_fixup)
+                            memcpy(rec_buf.data(), &fixup_val, 4);
+                        fwrite(rec_buf.data(), 1, actual_stride, outf);
+                    } else {
+                        // No modification needed — write directly from mmap
+                        fwrite(old_mmap.data + rec_off, 1, actual_stride, outf);
+                    }
+                    if (track && old_rec + k < id_map.size()) id_map[old_rec + k] = new_rec + k;
+                }
+                written += count * actual_stride;
+                old_rec += count; new_rec += count; old_bytes += count * actual_stride;
             } else if (op == OP_INSERT_RUN) {
                 size_t bytes = count * actual_stride;
                 fwrite(P+pos, 1, bytes, outf);
@@ -336,6 +390,8 @@ int main(int argc, char* argv[]) {
             }
         }
         fclose(outf);
+        unmap_file(old_mmap);
+        fixups_sorted.clear(); fixups_sorted.shrink_to_fit();
 
         if (track) {
             id_remaps[file_id] = std::move(id_map);
@@ -345,9 +401,6 @@ int main(int argc, char* argv[]) {
         } else {
             std::cerr << "  " << fname << ": " << written << " bytes" << std::endl;
         }
-
-        // Free old data immediately — don't let glibc hold the pages
-        { std::vector<char>().swap(old_data); }
         malloc_trim(0);
     }
     log_phase("Merge replays", t_start);
