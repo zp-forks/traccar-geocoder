@@ -119,18 +119,18 @@ jobs:
 
           ls -lh "$WORKDIR/planet.osm.pbf"
 
-      - name: Build index with continents
+      - name: Build index with all variants
         if: steps.meta.outputs.skip != 'true'
         run: |
           WORKDIR="${{ steps.pbf.outputs.workdir }}"
-          echo "Building geocoder index with continent extracts..."
+          echo "Building geocoder index (continents + modes + quality variants)..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
-            --simplify-epsilon --epsilon-scale 1 --continents 2>&1 | tail -10
+            --simplify-epsilon --epsilon-scale 1 \
+            --continents --multi-output --multi-quality 2>&1 | tail -10
           echo ""
           echo "Build output:"
-          ls -d "$WORKDIR/output"/*/ 2>/dev/null || true
-          ls "$WORKDIR/output/"*.bin 2>/dev/null | wc -l
-          echo "planet + $(ls -d "$WORKDIR/output"/*/ 2>/dev/null | wc -l) continent extracts"
+          find "$WORKDIR/output" -name "*.bin" | wc -l
+          echo "bin files across all variants"
 
       - name: Upload PBF to S3
         if: steps.meta.outputs.skip != 'true'
@@ -148,28 +148,16 @@ jobs:
           BUILD_DATE="${{ steps.meta.outputs.date }}"
           S3_BUILDS="s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE"
 
-          # Upload planet (root .bin files)
-          echo "Uploading planet..."
-          aws s3 sync "$WORKDIR/output/" "$S3_BUILDS/planet/" \
-            --exclude "*/*" --no-progress --only-show-errors
-
-          # Upload each continent
-          for region in $REGIONS; do
-            [ "$region" = "planet" ] && continue
-            if [ -d "$WORKDIR/output/$region" ]; then
-              echo "Uploading $region..."
-              aws s3 sync "$WORKDIR/output/$region/" "$S3_BUILDS/$region/" \
-                --no-progress --only-show-errors
-            fi
-          done
-
-          # Upload manifest
-          aws s3 cp "$WORKDIR/output/manifest.json" "$S3_BUILDS/manifest.json" \
+          # Upload entire output tree (preserves directory structure)
+          echo "Uploading all variants..."
+          aws s3 sync "$WORKDIR/output/" "$S3_BUILDS/" \
             --no-progress --only-show-errors
 
           echo "$BUILD_DATE" | aws s3 cp - \
             "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.txt" \
             --content-type text/plain
+
+          echo "Upload complete"
 
       - name: Find previous build
         if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
@@ -190,85 +178,87 @@ jobs:
             echo "No previous build found"
           fi
 
-      - name: Generate and verify patches for all regions
+      - name: Generate and verify patches for all variants
         if: steps.prev.outputs.found == 'true'
         run: |
           WORKDIR="${{ steps.pbf.outputs.workdir }}"
           PREV="${{ steps.prev.outputs.date }}"
           CURRENT="${{ steps.meta.outputs.date }}"
-          PATCH_DIR="$WORKDIR/patches"
-          mkdir -p "$PATCH_DIR"
+          S3_PREV_BASE="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV"
 
-          echo "## Patch Generation" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Patch Generation ($PREV → $CURRENT)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Region | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
-          for region in $REGIONS; do
-            if [ "$region" = "planet" ]; then
-              NEW_DIR="$WORKDIR/output"
-              S3_PREV="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/planet"
-            else
-              NEW_DIR="$WORKDIR/output/$region"
-              S3_PREV="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/$region"
-            fi
+          PASS=0; FAIL=0; SKIP=0
 
-            # Check new build exists
-            if [ ! -d "$NEW_DIR" ] || [ $(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l) -lt 14 ]; then
-              echo "  $region: skipped (no new build)"
+          # Find all directories containing .bin files in the new build
+          VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
+
+          for variant in $VARIANTS; do
+            NEW_DIR="$WORKDIR/output/$variant"
+            N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
+            [ "$N_NEW" -lt 2 ] && continue
+
+            # Download matching previous variant from S3
+            PREV_DIR="$WORKDIR/prev-variant"
+            rm -rf "$PREV_DIR"; mkdir -p "$PREV_DIR"
+            aws s3 sync "$S3_PREV_BASE/$variant/" "$PREV_DIR/" \
+              --no-progress --only-show-errors 2>/dev/null
+
+            N_PREV=$(ls "$PREV_DIR"/*.bin 2>/dev/null | wc -l)
+            if [ "$N_PREV" -ne "$N_NEW" ]; then
+              echo "  $variant: skipped (prev=$N_PREV new=$N_NEW files)"
+              SKIP=$((SKIP + 1))
               continue
             fi
-
-            # Check previous build exists in S3
-            PREV_COUNT=$(aws s3 ls "$S3_PREV/" 2>/dev/null | grep '\.bin$' | wc -l)
-            if [ "$PREV_COUNT" -lt 14 ]; then
-              echo "  $region: skipped (no previous build in S3)"
-              continue
-            fi
-
-            # Download previous build
-            PREV_DIR="$WORKDIR/prev-$region"
-            mkdir -p "$PREV_DIR"
-            aws s3 sync "$S3_PREV/" "$PREV_DIR/" --no-progress --only-show-errors
 
             # Generate patch
-            PATCH_FILE="$PATCH_DIR/$region/${PREV}-to-${CURRENT}.gcpatch"
-            mkdir -p "$PATCH_DIR/$region"
+            PATCH_FILE="$WORKDIR/current-patch.gcpatch"
             geocoder-diff "$PREV_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
             PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
             PATCH_KB=$((PATCH_SIZE / 1024))
 
-            # Verify patch
-            VERIFY_DIR="$WORKDIR/verify-$region"
-            mkdir -p "$VERIFY_DIR"
+            # Verify with md5sums
+            VERIFY_DIR="$WORKDIR/verify-variant"
+            rm -rf "$VERIFY_DIR"; mkdir -p "$VERIFY_DIR"
             geocoder-patch "$PREV_DIR" "$PATCH_FILE" -o "$VERIFY_DIR" 2>/dev/null
 
-            FAIL=0
+            MATCH=0
             for f in "$NEW_DIR"/*.bin; do
               b=$(basename "$f")
-              if ! cmp -s "$VERIFY_DIR/$b" "$NEW_DIR/$b"; then
-                echo "::error::$region: $b MISMATCH after patching"
-                FAIL=1
-              fi
+              h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
+              h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
+              [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
             done
 
-            if [ $FAIL -eq 0 ]; then
-              echo "  $region: PASS (${PATCH_KB} KiB)"
-              echo "| $region | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
+            if [ $MATCH -eq $N_NEW ]; then
+              echo "  $variant: PASS ($MATCH/$N_NEW, ${PATCH_KB} KiB)"
+              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
+              PASS=$((PASS + 1))
 
               # Upload verified patch
+              mkdir -p "$(dirname "$WORKDIR/patches/$variant/x")"
               aws s3 cp "$PATCH_FILE" \
-                "s3://$S3_BUCKET/$S3_PREFIX/patches/$region/${PREV}-to-${CURRENT}.gcpatch" \
+                "s3://$S3_BUCKET/$S3_PREFIX/patches/$variant/${PREV}-to-${CURRENT}.gcpatch" \
                 --no-progress --only-show-errors
             else
-              echo "::error::$region: patch verification FAILED"
-              echo "| $region | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
-              exit 1
+              echo "::error::$variant: FAIL ($MATCH/$N_NEW match)"
+              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
+              FAIL=$((FAIL + 1))
             fi
 
-            # Clean up this region's temp data
-            rm -rf "$PREV_DIR" "$VERIFY_DIR"
+            rm -f "$PATCH_FILE"
+            rm -rf "$VERIFY_DIR" "$PREV_DIR"
           done
+
+          echo ""
+          echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
+
+          [ $FAIL -gt 0 ] && exit 1 || true
 
       - name: Clean up old builds (keep last 2)
         if: steps.meta.outputs.skip != 'true'
